@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] — 2026-05-17
+
+### Added
+
+- **Three slash commands** for ops without going through the LLM:
+  - `/oc-list` — pretty table of all tracked agents (agent_id, project,
+    branch, phase, pr, age).
+  - `/oc-attach <agent_id> [--lines N]` — print the last N lines of an
+    agent's transcript (pulled via `client.get_messages`; future SSE-buffer
+    integration noted).
+  - `/oc-questions` — list all pending opencode questions across active
+    agents, formatted with structured options when present.
+- **`hermes oco` CLI subcommand** for shell-level driving outside a chat
+  session: `oco list`, `oco status [agent_id] [--json]`,
+  `oco attach <agent_id> [--lines N]`, `oco kill <agent_id> [--force]`,
+  `oco projects`. Each subcommand instantiates `Runtime` from disk-only
+  state so it works with no in-process event loop.
+- **`config.load_entry_config()`** extracted from `__init__.py` so both
+  `__init__.py` (in-session) and `cli.py` (out-of-session) can read the
+  same `plugins.entries.opencode-orchestrator` config without a circular
+  import.
+
+### Rebased
+
+- Rebased onto `0.4.0` (had originally branched off `0.3.4` and proposed
+  `0.3.5`). Minor bump to `0.5.0` since the new surfaces are user-facing
+  features rather than fixes.
+
 ## [0.4.0] — 2026-05-17
 
 ### Added
