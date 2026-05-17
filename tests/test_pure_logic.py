@@ -628,3 +628,305 @@ class TestSpawnSchemaDispatcherWording:
         td = self._tools_mod.SEND_SCHEMA["parameters"]["properties"]["text"]["description"]
         assert "VERBATIM" in td
         assert "No planning" in td
+
+
+class TestSendIsAsyncFireAndForget:
+    """v0.14.4: oc_send uses send_message_async (fire-and-forget) instead of
+    the blocking send_message. Mirrors the v0.3.1 -> v0.3.2 fix for oc_spawn:
+    sync send_message in a hermes tool dispatcher blocked the hermes main
+    session for up to 600s while opencode streamed the full assistant turn,
+    creating perceived message queuing. AGENTS.md rule: any code path called
+    synchronously by a hermes tool dispatcher must use send_message_async.
+    """
+
+    def setup_method(self):
+        self._tools_mod = sys.modules["_oco_test_pkg.tools"]
+        self._state_mod = sys.modules["_oco_test_pkg.state"]
+
+    def test_send_schema_has_no_timeout_param(self):
+        props = self._tools_mod.SEND_SCHEMA["parameters"]["properties"]
+        assert "timeout_sec" not in props, (
+            "timeout_sec was meaningful only for the blocking send_message "
+            "path; with send_message_async the queue POST itself has a "
+            "30s ceiling inside transport.py and no per-call timeout is exposed."
+        )
+
+    def test_send_schema_documents_async_behavior(self):
+        desc = self._tools_mod.SEND_SCHEMA["description"]
+        for needle in [
+            "queued asynchronously",
+            "returns immediately",
+            "NOT come back in the tool result",
+            "oc_status or oc_wait",
+        ]:
+            assert needle in desc, f"missing async-behavior wording: {needle!r}"
+
+    def test_send_schema_still_carries_dispatcher_discipline(self):
+        desc = self._tools_mod.SEND_SCHEMA["description"]
+        for needle in ["VERBATIM", "dispatcher", "Do NOT plan", "opencode owns the task"]:
+            assert needle in desc, f"v0.14.3 dispatcher wording regressed: {needle!r}"
+
+    def test_make_send_calls_send_message_async_and_returns_queued(self, tmp_path):
+        import asyncio
+        import json
+        import time
+
+        config_mod = sys.modules["_oco_test_pkg.config"]
+        cfg = config_mod.Config(
+            projects_file=tmp_path / "projects.json",
+            agents_file=tmp_path / "agents.json",
+            worktrees_root=tmp_path / "wt",
+            logs_dir=tmp_path / "logs",
+            notifications_file=tmp_path / "notifications.jsonl",
+        )
+        cfg.ensure_dirs()
+        agents = self._state_mod.AgentStore(cfg.agents_file)
+        agent = self._state_mod.Agent(
+            agent_id="bck/fix-discount",
+            project_label="bck",
+            worktree_path=str(tmp_path / "wt-x"),
+            session_id="sess-1",
+            branch="bck/fix-discount",
+            initial_prompt="p",
+            phase="EXECUTING",
+        )
+        agents.add(agent)
+
+        async_calls: list[tuple] = []
+        sync_calls: list[tuple] = []
+
+        class FakeClient:
+            async def send_message_async(self, session_id, directory, text, timeout=30.0):
+                async_calls.append((session_id, str(directory), text))
+                return {"queued": True}
+
+            async def send_message(self, *a, **kw):
+                sync_calls.append((a, kw))
+                return {"info": {"finish": "done"}}
+
+        runtime = self._tools_mod.Runtime(
+            config=cfg, client=FakeClient(), projects=None, agents=agents,
+        )
+        handler = self._tools_mod.make_send(runtime)
+        result_str = asyncio.run(handler({
+            "agent_id": "bck/fix-discount",
+            "text": "see reptiles review on the PR",
+        }))
+        result = json.loads(result_str)
+
+        assert result["ok"] is True, result
+        data = result["data"]
+        assert data["agent_id"] == "bck/fix-discount"
+        assert data["queued"] is True
+        assert "oc_status" in data["note"]
+        assert "assistant_text" not in data, "v0.14.4 dropped assistant_text from oc_send result"
+        assert len(async_calls) == 1
+        assert async_calls[0] == ("sess-1", str(tmp_path / "wt-x"), "see reptiles review on the PR")
+        assert sync_calls == [], "blocking send_message must NOT be called"
+
+    def test_make_send_unknown_agent_returns_error(self, tmp_path):
+        import asyncio
+        import json
+        config_mod = sys.modules["_oco_test_pkg.config"]
+        cfg = config_mod.Config(
+            projects_file=tmp_path / "projects.json",
+            agents_file=tmp_path / "agents.json",
+            worktrees_root=tmp_path / "wt",
+            logs_dir=tmp_path / "logs",
+            notifications_file=tmp_path / "notifications.jsonl",
+        )
+        cfg.ensure_dirs()
+        agents = self._state_mod.AgentStore(cfg.agents_file)
+
+        class FakeClient:
+            async def send_message_async(self, *a, **kw):
+                raise AssertionError("should not be called for unknown agent")
+
+        runtime = self._tools_mod.Runtime(
+            config=cfg, client=FakeClient(), projects=None, agents=agents,
+        )
+        handler = self._tools_mod.make_send(runtime)
+        result = json.loads(asyncio.run(handler({"agent_id": "no/such", "text": "x"})))
+        assert result["ok"] is False
+        assert "unknown agent" in result["error"]
+
+
+class TestAtAgentDirectDispatch:
+    """v0.14.4: `@<agent_id> <body>` shortcut in pre_gateway_dispatch routes
+    a message directly to a live agent's opencode session, bypassing the
+    hermes chat LLM. Eliminates both paraphrasing (no chat LLM in path) and
+    queuing (uses send_message_async fire-and-forget).
+    """
+
+    def setup_method(self):
+        self._tools_mod = sys.modules["_oco_test_pkg.tools"]
+        self._state_mod = sys.modules["_oco_test_pkg.state"]
+        self._config_mod = sys.modules["_oco_test_pkg.config"]
+        self._saved_runtime = plugin_mod._runtime
+
+    def teardown_method(self):
+        plugin_mod._runtime = self._saved_runtime
+
+    def _make_runtime(self, tmp_path, agents_to_add):
+        cfg = self._config_mod.Config(
+            projects_file=tmp_path / "projects.json",
+            agents_file=tmp_path / "agents.json",
+            worktrees_root=tmp_path / "wt",
+            logs_dir=tmp_path / "logs",
+            notifications_file=tmp_path / "notifications.jsonl",
+        )
+        cfg.ensure_dirs()
+        store = self._state_mod.AgentStore(cfg.agents_file)
+        for a in agents_to_add:
+            store.add(a)
+
+        captured: list = []
+
+        class FakeClient:
+            async def send_message_async(self, session_id, directory, text, timeout=30.0):
+                captured.append({
+                    "session_id": session_id,
+                    "directory": str(directory),
+                    "text": text,
+                })
+                return {"queued": True}
+
+        runtime = self._tools_mod.Runtime(
+            config=cfg, client=FakeClient(), projects=None, agents=store,
+        )
+        plugin_mod._runtime = runtime
+        return runtime, captured
+
+    def _fake_event_gateway(self, text: str):
+        sent: list[str] = []
+        class Source:
+            platform = "test"
+            chat_id = "c1"
+            thread_id = None
+        class Event:
+            pass
+        ev = Event()
+        ev.text = text
+        ev.source = Source()
+        gw = object()
+        return ev, gw, sent
+
+    def test_regex_matches_simple_id(self):
+        m = plugin_mod._AT_AGENT_RE.match("@bck/fix-discount see reptiles review on the PR")
+        assert m is not None
+        assert m.group(1) == "bck/fix-discount"
+        assert m.group(2) == "see reptiles review on the PR"
+
+    def test_regex_matches_mixed_case_abbrev(self):
+        m = plugin_mod._AT_AGENT_RE.match("@BCK/fix-discount hello")
+        assert m is not None and m.group(1) == "BCK/fix-discount"
+
+    def test_regex_matches_multiline_body(self):
+        m = plugin_mod._AT_AGENT_RE.match("@bck/fix-discount line1\nline2\nline3")
+        assert m is not None
+        assert m.group(2) == "line1\nline2\nline3"
+
+    def test_regex_rejects_no_slash(self):
+        assert plugin_mod._AT_AGENT_RE.match("@username hi") is None
+
+    def test_regex_rejects_not_at_start(self):
+        assert plugin_mod._AT_AGENT_RE.match("hey @bck/fix-discount hi") is None
+
+    def test_no_runtime_returns_none(self, tmp_path):
+        plugin_mod._runtime = None
+        ev, gw, _ = self._fake_event_gateway("@bck/fix-discount hi")
+        assert plugin_mod._handle_at_agent_dispatch(ev, gw, ev.text) is None
+
+    def test_non_at_message_falls_through(self, tmp_path):
+        self._make_runtime(tmp_path, [])
+        ev, gw, _ = self._fake_event_gateway("hello world")
+        assert plugin_mod._handle_at_agent_dispatch(ev, gw, ev.text) is None
+
+    def test_unknown_agent_falls_through_silently(self, tmp_path):
+        self._make_runtime(tmp_path, [])
+        ev, gw, _ = self._fake_event_gateway("@nobody/here hi")
+        assert plugin_mod._handle_at_agent_dispatch(ev, gw, ev.text) is None, (
+            "unresolvable agent_id must fall through to chat LLM so unrelated "
+            "@mentions in group chats are not eaten by the orchestrator"
+        )
+
+    def test_terminal_phase_rejected_with_skip(self, tmp_path, monkeypatch):
+        agent = self._state_mod.Agent(
+            agent_id="bck/done", project_label="bck",
+            worktree_path=str(tmp_path / "wt"), session_id="s1",
+            branch="bck/done", initial_prompt="p", phase="DONE",
+        )
+        rt, captured = self._make_runtime(tmp_path, [agent])
+        echoed = []
+        monkeypatch.setattr(plugin_mod, "_gateway_send", lambda gw, ev, msg: echoed.append(msg))
+        ev, gw, _ = self._fake_event_gateway("@bck/done try again")
+        result = plugin_mod._handle_at_agent_dispatch(ev, gw, ev.text)
+        assert result == {"action": "skip", "reason": "@bck/done terminal phase"}
+        assert captured == []
+        assert any("phase=DONE" in m for m in echoed)
+
+    def test_empty_body_rejected_with_skip(self, tmp_path, monkeypatch):
+        agent = self._state_mod.Agent(
+            agent_id="bck/live", project_label="bck",
+            worktree_path=str(tmp_path / "wt"), session_id="s1",
+            branch="bck/live", initial_prompt="p", phase="EXECUTING",
+        )
+        rt, captured = self._make_runtime(tmp_path, [agent])
+        echoed = []
+        monkeypatch.setattr(plugin_mod, "_gateway_send", lambda gw, ev, msg: echoed.append(msg))
+        ev, gw, _ = self._fake_event_gateway("@bck/live")
+        result = plugin_mod._handle_at_agent_dispatch(ev, gw, ev.text)
+        assert result == {"action": "skip", "reason": "@bck/live empty body"}
+        assert captured == []
+        assert any("empty message" in m for m in echoed)
+
+    def test_valid_dispatch_calls_send_message_async_and_short_circuits(self, tmp_path, monkeypatch):
+        agent = self._state_mod.Agent(
+            agent_id="bck/fix-discount", project_label="bck",
+            worktree_path=str(tmp_path / "wt-x"), session_id="sess-42",
+            branch="bck/fix-discount", initial_prompt="p", phase="EXECUTING",
+        )
+        rt, captured = self._make_runtime(tmp_path, [agent])
+        echoed = []
+        monkeypatch.setattr(plugin_mod, "_gateway_send", lambda gw, ev, msg: echoed.append(msg))
+        ev, gw, _ = self._fake_event_gateway(
+            "@bck/fix-discount see reptiles review on the PR"
+        )
+        result = plugin_mod._handle_at_agent_dispatch(ev, gw, ev.text)
+        assert result == {
+            "action": "skip",
+            "reason": "@bck/fix-discount dispatched",
+        }
+        assert len(captured) == 1
+        assert captured[0]["session_id"] == "sess-42"
+        assert captured[0]["text"] == "see reptiles review on the PR"
+        assert captured[0]["directory"] == str(tmp_path / "wt-x")
+        assert any("-> @bck/fix-discount" in m for m in echoed)
+
+    def test_hook_dispatches_at_agent_before_slash_oc(self, tmp_path, monkeypatch):
+        agent = self._state_mod.Agent(
+            agent_id="bck/live", project_label="bck",
+            worktree_path=str(tmp_path / "wt"), session_id="s1",
+            branch="bck/live", initial_prompt="p", phase="EXECUTING",
+        )
+        rt, captured = self._make_runtime(tmp_path, [agent])
+        monkeypatch.setattr(plugin_mod, "_gateway_send", lambda gw, ev, msg: None)
+        monkeypatch.setattr(plugin_mod, "_oc_dispatcher_cache", lambda _raw: "should-not-run")
+        ev, gw, _ = self._fake_event_gateway("@bck/live hi there")
+        result = plugin_mod._pre_gateway_dispatch_hook(event=ev, gateway=gw)
+        assert result == {"action": "skip", "reason": "@bck/live dispatched"}
+        assert len(captured) == 1, "valid @ dispatch must take precedence over /oc parser"
+
+    def test_hook_falls_back_to_slash_oc_when_no_at_match(self, tmp_path, monkeypatch):
+        rt, captured = self._make_runtime(tmp_path, [])
+        monkeypatch.setattr(plugin_mod, "_gateway_send", lambda gw, ev, msg: None)
+        slash_called: list[str] = []
+        def fake_dispatcher(raw):
+            slash_called.append(raw)
+            return "ok"
+        monkeypatch.setattr(plugin_mod, "_oc_dispatcher_cache", fake_dispatcher)
+        ev, gw, _ = self._fake_event_gateway("/oc list")
+        result = plugin_mod._pre_gateway_dispatch_hook(event=ev, gateway=gw)
+        assert result == {"action": "skip", "reason": "/oc handled inline"}
+        assert slash_called == ["list"]
+        assert captured == [], "send_message_async must NOT be called for /oc"

@@ -5,6 +5,87 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.4] - 2026-05-17
+
+### Fixed
+
+- **`oc_send` no longer blocks the hermes main session.** Same anti-pattern
+  the v0.3.1 → v0.3.2 release fixed for `oc_spawn`, just on a different
+  surface: `make_send`'s handler was awaiting `rt.client.send_message(...)`
+  (the blocking `/session/:id/message` endpoint) with a default
+  `timeout_sec=600`, so any chat-side `oc_send` froze the hermes main
+  session for the full duration of opencode's reply stream. Users
+  perceived this as "the message got queued" — subsequent messages
+  couldn't be processed until the prior `oc_send` returned.
+
+  Fix: `make_send` now awaits `rt.client.send_message_async(...)` (the
+  `/session/:id/prompt_async` endpoint, ~30 ms POST) and returns
+  `{"agent_id": ..., "queued": True, "note": ...}` immediately. The tool
+  result no longer carries the agent's reply text. The bg event loop
+  picks up the assistant reply via the SSE buffer + `get_messages`
+  exactly as it does for `oc_spawn`, and the existing awaiting-input /
+  pending-question notifications surface progress to the user.
+
+  Schema change: `SEND_SCHEMA` dropped the `timeout_sec` parameter
+  (it has no effect on the async queue endpoint, and the queue POST has
+  its own 30 s ceiling inside `transport.py`). Description and `text`
+  param description updated to make the async behaviour explicit.
+
+  This brings `oc_send` into compliance with the `AGENTS.md` rule that
+  has been load-bearing since v0.3.2: *any code path called synchronously
+  by a hermes tool dispatcher must use `send_message_async`*.
+
+### Added
+
+- **`@<agent_id> <body>` direct gateway dispatch.** New shortcut in
+  `_pre_gateway_dispatch_hook` (sibling to the existing `/oc` parser)
+  forwards a message to a live agent's opencode session VERBATIM via
+  `send_message_async`, fully bypassing the hermes chat LLM. Zero
+  paraphrasing surface (chat LLM never sees the message), zero blocking
+  on opencode's reply.
+
+  Resolution semantics:
+  - Message must start with `@`; agent_id must match the
+    `[A-Za-z0-9][A-Za-z0-9_-]*/[A-Za-z0-9][A-Za-z0-9_-]*` charset (the
+    `worktree.compose_agent_id` shape).
+  - The agent_id must resolve to a known live agent. Unresolved
+    `@user` mentions fall through silently so unrelated `@mentions` in
+    group chats still reach the chat LLM normally.
+  - Terminal-phase agents (`DONE` / `KILLED` / `FAILED` / `CANCELLED`)
+    are rejected with `[hermes-opencode] cannot dispatch to @<id>:
+    phase=<phase>`.
+  - Empty body is rejected with `[hermes-opencode] empty message; use
+    @<id> <text>`.
+  - Valid dispatch echoes `[hermes-opencode] -> @<id>` back to the
+    channel.
+
+  See `AGENTS.md::Gateway @<agent_id> direct dispatch` for the full
+  resolution table.
+
+- **18 new regression tests** in `tests/test_pure_logic.py`:
+  - `TestSendIsAsyncFireAndForget` (5 cases): `SEND_SCHEMA` no longer
+    exposes `timeout_sec`; description documents the async / queued /
+    `oc_status` / `oc_wait` semantics; v0.14.3 dispatcher wording
+    preserved; `make_send` awaits `send_message_async` and never the
+    blocking `send_message`; unknown-agent error path.
+  - `TestAtAgentDirectDispatch` (13 cases): regex matches simple,
+    mixed-case, and multiline bodies; regex rejects no-slash and
+    mid-message `@…`; no-runtime / non-`@` / unknown-agent all fall
+    through silently; terminal-phase and empty-body short-circuit with
+    the documented reason strings; valid dispatch calls
+    `send_message_async` and echoes confirmation; hook integration:
+    `@` dispatch takes precedence over `/oc` and `/oc` continues to
+    work when no `@` match.
+
+  Full suite: 242 passed, 1 skipped (was 224 at v0.14.3).
+
+### Changed
+
+- `AGENTS.md` gained a `Gateway @<agent_id> direct dispatch
+  (LOAD-BEARING)` section pinning the resolution semantics, and the
+  `Sync vs async opencode endpoints` section now records the v0.14.3 →
+  v0.14.4 regression history alongside the older v0.3.1 → v0.3.2 one.
+
 ## [0.14.3] - 2026-05-17
 
 ### Changed

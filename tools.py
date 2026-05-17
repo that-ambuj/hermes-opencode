@@ -209,13 +209,19 @@ SEND_SCHEMA: dict[str, Any] = {
     "name": "oc_send",
     "description": (
         "Send a follow-up message to a live agent's opencode session. Text "
-        "is forwarded VERBATIM. Blocks until the agent responds or timeout "
-        "elapses.\n"
+        "is forwarded VERBATIM, queued asynchronously on the agent's session, "
+        "and the tool returns immediately. The agent's reply does NOT come "
+        "back in the tool result. Use oc_status or oc_wait to track the "
+        "agent's progress, or rely on the plugin's notifications (pending "
+        "questions and awaiting-input DMs).\n"
         "\n"
         "Same authority model as oc_spawn: opencode owns the task. You are "
         "a dispatcher. Forward the human's words literally. Do NOT plan, "
         "analyze, paraphrase, add hints, or inject your own framing. If "
-        "the human's follow-up is unclear, ask THEM, not opencode."
+        "the human's follow-up is unclear, ask THEM, not opencode. Do NOT "
+        "wait for or fabricate the agent's reply in your own response; the "
+        "agent will surface its reply through the orchestrator's normal "
+        "channels."
     ),
     "parameters": {
         "type": "object",
@@ -230,7 +236,6 @@ SEND_SCHEMA: dict[str, Any] = {
                     "Opencode has full authority over how to act on it."
                 ),
             },
-            "timeout_sec": {"type": "number", "default": 600},
         },
         "required": ["agent_id", "text"],
     },
@@ -498,17 +503,15 @@ def make_send(rt: Runtime) -> Callable[..., Awaitable[str]]:
         if not agent:
             return _err(f"unknown agent: {agent_id}")
         worktree_path = Path(agent.worktree_path)
-        timeout = float(args.get("timeout_sec", 600))
         try:
-            resp = await rt.client.send_message(agent.session_id, worktree_path, text, timeout=timeout)
+            await rt.client.send_message_async(agent.session_id, worktree_path, text)
         except OpencodeError as e:
-            return _err(f"send failed: {e}")
+            return _err(f"send_message_async failed: {e}", agent_id=agent_id)
         rt.agents.update(agent_id, last_activity_at=time.time())
-        reply = OpencodeClient.extract_assistant_text(resp)
         return _ok({
             "agent_id": agent_id,
-            "assistant_text": reply[:4000],
-            "finish": (resp.get("info") or {}).get("finish"),
+            "queued": True,
+            "note": "message queued asynchronously; the agent's reply is NOT returned here. Use oc_status or oc_wait to track progress.",
         })
     return handler
 

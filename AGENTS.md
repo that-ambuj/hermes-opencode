@@ -71,6 +71,18 @@ hermes main session for 30 s – several minutes while the executor's first
 turn streamed. Fixed by switching to `send_message_async`; the bg loop
 picks up first-turn completion via `/wait` + question polling.
 
+The 0.14.3 → 0.14.4 regression: the same anti-pattern survived in `oc_send`
+all the way until v0.14.3 — `make_send` was awaiting the blocking
+`send_message` with `timeout_sec=600`, so any chat-side `oc_send` call
+froze the hermes main session for the duration of opencode's reply (users
+perceived this as "the message is queued"). v0.14.4 migrated `oc_send` to
+`send_message_async`, dropped the `timeout_sec` schema param (the queue
+POST has its own 30s ceiling), and the tool result no longer carries the
+agent's reply text — the bg event loop polls for the assistant reply via
+SSE buffer + `get_messages` exactly as it does for `oc_spawn`, and the
+existing awaiting-input / pending-question notifications surface progress
+to the user.
+
 ## State machine
 
 Each agent transitions through phases driven by `event_loop._phase_*`
@@ -434,6 +446,49 @@ worked in CLI, silently failed in iMessage with "Unknown command".
 
 When adding new slash commands in the future, register BOTH ways or
 update `_pre_gateway_dispatch_hook` to match the new prefixes.
+
+## Gateway `@<agent_id>` direct dispatch (LOAD-BEARING)
+
+Sibling to the `/oc` slash-command path. `_handle_at_agent_dispatch` runs
+inside `_pre_gateway_dispatch_hook` BEFORE the `/oc` parser. Pattern:
+
+```
+@<agent_id> <body>
+```
+
+where `agent_id` matches `[A-Za-z0-9][A-Za-z0-9_-]*/[A-Za-z0-9][A-Za-z0-9_-]*`
+(the `worktree.compose_agent_id` charset). When the agent_id resolves to a
+live, non-terminal agent, the body is forwarded VERBATIM to the agent's
+opencode session via `send_message_async` (fire-and-forget) and the gateway
+short-circuits with `{"action": "skip"}`. The hermes chat LLM never sees
+the message: zero paraphrasing surface, zero blocking on opencode's reply.
+
+Resolution semantics (do not change without a CHANGELOG note):
+
+- Message doesn't start with `@` → fall through (None).
+- `@` prefix present but the agent_id doesn't match the regex → fall
+  through (None). Example: `@username hi` from a group chat has no `/`
+  so it never matches; the chat LLM still sees it.
+- Regex matches but the agent_id does not resolve in `rt.agents` → fall
+  through (None) silently. Critical for not eating unrelated `@mentions`
+  in group chats just because their format happens to match.
+- Agent is in a terminal phase (`DONE` / `KILLED` / `FAILED` /
+  `CANCELLED`) → echo `[hermes-opencode] cannot dispatch to @<id>:
+  phase=<phase>` and skip.
+- Body is empty (`@<id>` alone) → echo
+  `[hermes-opencode] empty message; use @<id> <text>` and skip.
+- Valid dispatch → echo `[hermes-opencode] -> @<id>` (or
+  `... failed: <exc>` on transport error) and skip.
+
+Async bridging from this sync hook uses the same dual pattern as
+`_gateway_send`: try `asyncio.get_running_loop()` and schedule via
+`loop.call_soon_threadsafe(asyncio.ensure_future, ...)` when the gateway
+is in an async context; fall back to `asyncio.run` when called from a
+sync test or non-async caller.
+
+Tests in `tests/test_pure_logic.py::TestAtAgentDirectDispatch` pin every
+resolution branch. Add cases there when extending the regex or adding new
+short-circuit reasons.
 
 ## Anti-patterns (BLOCKING — reject in review)
 

@@ -8,6 +8,10 @@ driven recovery.
 """
 from __future__ import annotations
 
+import asyncio
+import logging
+import re
+from pathlib import Path
 from typing import Any
 
 from . import cli as cli_mod
@@ -22,6 +26,13 @@ from .transport import OpencodeClient
 
 
 _runtime: Runtime | None = None
+
+
+_AT_AGENT_RE = re.compile(
+    r"^@([A-Za-z0-9][A-Za-z0-9_-]*/[A-Za-z0-9][A-Za-z0-9_-]*)(?:\s+(.+))?\Z",
+    re.DOTALL,
+)
+_AT_AGENT_TERMINAL_PHASES = frozenset({"DONE", "KILLED", "FAILED", "CANCELLED"})
 
 
 _DISPATCHER_DIRECTIVE = (
@@ -139,12 +150,92 @@ def _gateway_send(gateway: Any, event: Any, message: str) -> None:
             log.warning("asyncio.run send failed: %s", exc)
 
 
+def _handle_at_agent_dispatch(event: Any, gateway: Any, text: str) -> dict[str, Any] | None:
+    """Forward `@<agent_id> <body>` messages to the named agent's opencode
+    session via fire-and-forget async dispatch, bypassing the hermes chat LLM.
+
+    Returns None to let the gateway pipeline continue normally (including
+    the existing `/oc` parser and the chat LLM beyond it) when the message
+    is not `@...` or the agent_id does not resolve. Returns
+    `{"action": "skip", "reason": ...}` after attempting dispatch (success
+    or terminal-phase / empty-body rejection), echoing a `[hermes-opencode]`
+    confirmation back to the user's channel.
+    """
+    if _runtime is None:
+        return None
+    stripped = text.lstrip()
+    if not stripped.startswith("@"):
+        return None
+    m = _AT_AGENT_RE.match(stripped)
+    if not m:
+        return None
+    agent_id = m.group(1)
+    body = (m.group(2) or "").strip()
+    agent = _runtime.agents.get(agent_id)
+    if agent is None:
+        # unknown agent_id; let the chat LLM handle it as a normal message
+        return None
+    log = logging.getLogger("hermes_opencode.gateway_hook")
+    if agent.phase in _AT_AGENT_TERMINAL_PHASES:
+        _gateway_send(
+            gateway, event,
+            f"[hermes-opencode] cannot dispatch to @{agent_id}: phase={agent.phase}",
+        )
+        return {"action": "skip", "reason": f"@{agent_id} terminal phase"}
+    if not body:
+        _gateway_send(
+            gateway, event,
+            f"[hermes-opencode] empty message; use @{agent_id} <text>",
+        )
+        return {"action": "skip", "reason": f"@{agent_id} empty body"}
+
+    runtime = _runtime
+    worktree_path = Path(agent.worktree_path)
+    session_id = agent.session_id
+
+    async def _do_dispatch() -> None:
+        try:
+            await runtime.client.send_message_async(session_id, worktree_path, body)
+            _gateway_send(gateway, event, f"[hermes-opencode] -> @{agent_id}")
+        except Exception as exc:
+            log.exception("@%s dispatch failed", agent_id)
+            _gateway_send(
+                gateway, event,
+                f"[hermes-opencode] -> @{agent_id} failed: {exc}",
+            )
+
+    # Bridge sync hook -> async dispatch. Mirrors _gateway_send's pattern:
+    # use the running loop when present (gateway async context), otherwise
+    # block briefly with asyncio.run (sync test / non-async caller).
+    try:
+        loop = asyncio.get_running_loop()
+        loop.call_soon_threadsafe(asyncio.ensure_future, _do_dispatch())
+    except RuntimeError:
+        try:
+            asyncio.run(_do_dispatch())
+        except Exception as exc:
+            log.exception("@%s asyncio.run dispatch failed", agent_id)
+            _gateway_send(
+                gateway, event,
+                f"[hermes-opencode] -> @{agent_id} failed: {exc}",
+            )
+
+    return {"action": "skip", "reason": f"@{agent_id} dispatched"}
+
+
 def _pre_gateway_dispatch_hook(event: Any = None, gateway: Any = None, **_: Any) -> dict[str, Any] | None:
     if event is None or _runtime is None or _oc_dispatcher_cache is None:
         return None
     text = _event_text(event)
     if not text:
         return None
+
+    # `@<agent_id> <body>` direct dispatch takes precedence. Bypasses the chat
+    # LLM entirely; only intercepts when the agent_id resolves.
+    at_result = _handle_at_agent_dispatch(event, gateway, text)
+    if at_result is not None:
+        return at_result
+
     stripped = text.lstrip()
     parts = stripped.split(None, 1)
     if not parts or parts[0] != "/oc":
@@ -153,7 +244,6 @@ def _pre_gateway_dispatch_hook(event: Any = None, gateway: Any = None, **_: Any)
     try:
         output = _oc_dispatcher_cache(raw_args)
     except Exception as exc:
-        import logging
         logging.getLogger("hermes_opencode.gateway_hook").exception("/oc dispatch failed")
         output = f"/oc error: {exc}"
     if output:
