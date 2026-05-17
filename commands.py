@@ -77,7 +77,7 @@ def _parse_oc_attach_args(raw_args: str) -> tuple[str | None, int, str | None]:
     """
     tokens = (raw_args or "").split()
     if not tokens:
-        return None, DEFAULT_ATTACH_LINES, "usage: /oc-attach <agent_id> [--lines N]"
+        return None, DEFAULT_ATTACH_LINES, "usage: /oc attach <agent_id> [--lines N]"
     agent_id = tokens[0]
     lines = DEFAULT_ATTACH_LINES
     i = 1
@@ -150,4 +150,41 @@ def make_oc_questions(runtime: "Runtime") -> Callable[[str], str]:
                         block.append(f"  - {label!r}: {desc}")
                     blocks.append("\n".join(block))
         return "\n\n".join(blocks)
+    return handler
+
+
+_OC_HELP_TEXT = (
+    "/oc — opencode-orchestrator slash command\n"
+    "\n"
+    "subcommands:\n"
+    "  /oc list                              list tracked agents (id, project, branch, phase, pr, age)\n"
+    "  /oc attach <agent_id> [--lines N]     print the last N (default 80) lines of an agent's transcript\n"
+    "  /oc questions                         list pending opencode questions awaiting a human answer\n"
+    "  /oc help                              show this help\n"
+    "\n"
+    "for richer ops outside an active chat session, use the `hermes oco` CLI subcommand."
+)
+
+
+def make_oc_dispatcher(runtime: "Runtime") -> Callable[[str], str]:
+    list_fn = make_oc_list(runtime)
+    attach_fn = make_oc_attach(runtime)
+    questions_fn = make_oc_questions(runtime)
+    subcommands = {
+        "list": list_fn,
+        "attach": attach_fn,
+        "questions": questions_fn,
+    }
+
+    def handler(raw_args: str) -> str:
+        text = (raw_args or "").strip()
+        if not text or text in {"help", "-h", "--help"}:
+            return _OC_HELP_TEXT
+        head, _, rest = text.partition(" ")
+        sub = head.lower()
+        fn = subcommands.get(sub)
+        if fn is None:
+            return f"unknown /oc subcommand: {head!r}\n\n{_OC_HELP_TEXT}"
+        return fn(rest.strip())
+
     return handler

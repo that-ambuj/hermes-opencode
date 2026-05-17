@@ -100,22 +100,10 @@ def register(ctx: Any) -> None:
     register_cmd = getattr(ctx, "register_command", None)
     if callable(register_cmd):
         register_cmd(
-            "oc-list",
-            handler=commands_mod.make_oc_list(_runtime),
-            description="List tracked opencode-orchestrator agents.",
-            args_hint="",
-        )
-        register_cmd(
-            "oc-attach",
-            handler=commands_mod.make_oc_attach(_runtime),
-            description="Print the last N lines of an agent's transcript.",
-            args_hint="<agent_id> [--lines N]",
-        )
-        register_cmd(
-            "oc-questions",
-            handler=commands_mod.make_oc_questions(_runtime),
-            description="List pending opencode questions awaiting an answer.",
-            args_hint="",
+            "oc",
+            handler=commands_mod.make_oc_dispatcher(_runtime),
+            description="Opencode-orchestrator commands: list / attach / questions. Run /oc for help.",
+            args_hint="[list|attach <agent_id>|questions|help]",
         )
 
     register_cli = getattr(ctx, "register_cli_command", None)

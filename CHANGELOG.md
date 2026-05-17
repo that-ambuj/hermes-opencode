@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] — 2026-05-17
+
+### Changed (breaking)
+
+- **Slash commands consolidated to a single `/oc` with subcommands.** The
+  prior `/oc-list`, `/oc-attach`, `/oc-questions` commands are gone.
+  Equivalents:
+    `/oc-list`         →  `/oc list`
+    `/oc-attach …`     →  `/oc attach …`
+    `/oc-questions`    →  `/oc questions`
+  Running `/oc` with no args (or `/oc help` / `/oc --help`) prints a help
+  message listing all subcommands. Unknown subcommands surface the help
+  inline. Subcommand names are case-insensitive.
+
+  Rationale: the user-facing CLI subcommand is already `hermes oco
+  {list,attach,kill,projects}` and matching the slash-command shape to it
+  is the natural pattern. Single registration also means just one slot in
+  `hermes plugins list`'s slash-command count.
+
 ## [0.6.0] — 2026-05-17
 
 ### Added

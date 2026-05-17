@@ -79,9 +79,10 @@ round-trip — they call into the plugin directly.
 
 | Command | Purpose |
 |---|---|
-| `/oc-list` | Pretty-printed table of all tracked agents (agent_id, project, branch, phase, pr, age). |
-| `/oc-attach <agent_id> [--lines N]` | Print the last N lines (default 80) of an agent's accumulated transcript. |
-| `/oc-questions` | List every pending opencode question, with structured options surfaced inline. |
+| `/oc` | Print help for the `/oc` slash command (lists all subcommands). |
+| `/oc list` | Pretty-printed table of all tracked agents (agent_id, project, branch, phase, pr, age). |
+| `/oc attach <agent_id> [--lines N]` | Print the last N lines (default 80) of an agent's accumulated transcript. |
+| `/oc questions` | List every pending opencode question, with structured options surfaced inline. |
 
 ## CLI subcommand
 

@@ -232,3 +232,60 @@ class TestOcListHandler:
         assert "dp/refunds" in out
         assert "ma/x" in out
         assert "agent_id" in out.splitlines()[0]
+
+
+class TestOcDispatcher:
+    def _stub_runtime(self, tmp_path: Path):
+        state = sys.modules["_oco_test_pkg.state"]
+        store = state.AgentStore(tmp_path / "agents.json")
+        store.add(_agent(agent_id="dp/refunds", project_label="dodo-payments", branch="dp/refunds"))
+
+        class _Stub:
+            agents = store
+            client = None
+
+        return _Stub()
+
+    def test_no_args_prints_help(self, tmp_path: Path):
+        rt = self._stub_runtime(tmp_path)
+        out = commands_mod.make_oc_dispatcher(rt)("")
+        assert out.startswith("/oc")
+        assert "list" in out and "attach" in out and "questions" in out
+
+    def test_help_subcommand_prints_help(self, tmp_path: Path):
+        rt = self._stub_runtime(tmp_path)
+        out = commands_mod.make_oc_dispatcher(rt)("help")
+        assert "subcommands" in out
+
+    def test_dash_help_flag_prints_help(self, tmp_path: Path):
+        rt = self._stub_runtime(tmp_path)
+        out = commands_mod.make_oc_dispatcher(rt)("--help")
+        assert "subcommands" in out
+
+    def test_list_routes_to_oc_list(self, tmp_path: Path):
+        rt = self._stub_runtime(tmp_path)
+        out = commands_mod.make_oc_dispatcher(rt)("list")
+        assert "dp/refunds" in out
+
+    def test_attach_routes_with_remaining_args(self, tmp_path: Path):
+        rt = self._stub_runtime(tmp_path)
+        out = commands_mod.make_oc_dispatcher(rt)("attach")
+        assert "usage:" in out and "/oc attach" in out
+
+    def test_questions_routes_to_oc_questions(self, tmp_path: Path, monkeypatch):
+        event_loop = sys.modules["_oco_test_pkg.event_loop"]
+        monkeypatch.setattr(event_loop, "get_pending_snapshot", lambda: ({}, {}))
+        rt = self._stub_runtime(tmp_path)
+        out = commands_mod.make_oc_dispatcher(rt)("questions")
+        assert out == "no pending questions"
+
+    def test_unknown_subcommand_includes_help(self, tmp_path: Path):
+        rt = self._stub_runtime(tmp_path)
+        out = commands_mod.make_oc_dispatcher(rt)("frobnicate")
+        assert "unknown" in out.lower()
+        assert "subcommands" in out
+
+    def test_subcommand_is_case_insensitive(self, tmp_path: Path):
+        rt = self._stub_runtime(tmp_path)
+        out = commands_mod.make_oc_dispatcher(rt)("LIST")
+        assert "dp/refunds" in out
