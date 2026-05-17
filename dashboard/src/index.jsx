@@ -68,7 +68,7 @@
     );
   }
 
-  function AgentsTable({ agents }) {
+  function AgentsTable({ agents, onSelect }) {
     if (!agents || agents.length === 0) {
       return <div className="oco-empty">No agents tracked.</div>;
     }
@@ -87,14 +87,19 @@
           </thead>
           <tbody>
             {agents.map((a) => (
-              <tr key={a.agent_id}>
-                <td className="oco-mono">{a.agent_id}</td>
+              <tr
+                key={a.agent_id}
+                className="oco-row-clickable"
+                onClick={() => onSelect && onSelect(a.agent_id)}
+                title="click to inspect"
+              >
+                <td className="oco-mono oco-link-cell">{a.agent_id}</td>
                 <td>{a.project_label}</td>
                 <td className="oco-mono">{a.branch}</td>
                 <td>
                   <PhaseCell phase={a.phase} />
                 </td>
-                <td>
+                <td onClick={(e) => e.stopPropagation()}>
                   {a.pr_url ? (
                     <a href={a.pr_url} target="_blank" rel="noopener noreferrer">
                       #{a.pr_number || ""}
@@ -108,6 +113,140 @@
             ))}
           </tbody>
         </table>
+      </div>
+    );
+  }
+
+  function DetailRow({ label, value, mono, children }) {
+    if (!children && (value === null || value === undefined || value === "")) return null;
+    return (
+      <div className="oco-detail-row">
+        <div className="oco-detail-label">{label}</div>
+        <div className={cn("oco-detail-value", mono && "oco-mono")}>
+          {children || value}
+        </div>
+      </div>
+    );
+  }
+
+  function AgentDetailModal({ agent, onClose }) {
+    React.useEffect(() => {
+      function onKey(e) {
+        if (e.key === "Escape") onClose();
+      }
+      window.addEventListener("keydown", onKey);
+      return () => window.removeEventListener("keydown", onKey);
+    }, [onClose]);
+
+    if (!agent) return null;
+    const mergedAt = agent.pr_merged_at
+      ? new Date(agent.pr_merged_at * 1000).toLocaleString()
+      : null;
+    const doneAt = agent.done_at
+      ? new Date(agent.done_at * 1000).toLocaleString()
+      : null;
+    const createdAt = agent.created_at
+      ? new Date(agent.created_at * 1000).toLocaleString()
+      : null;
+
+    return (
+      <div
+        className="oco-modal-backdrop"
+        onClick={onClose}
+        role="presentation"
+      >
+        <div
+          className="oco-modal"
+          role="dialog"
+          aria-modal="true"
+          aria-label={"Agent " + agent.agent_id}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div className="oco-modal-header">
+            <div className="oco-modal-title">
+              <span className="oco-mono">{agent.agent_id}</span>
+              <PhaseCell phase={agent.phase} />
+            </div>
+            <button
+              type="button"
+              className="oco-modal-close"
+              onClick={onClose}
+              aria-label="close"
+            >
+              ✕
+            </button>
+          </div>
+          <div className="oco-modal-body">
+            <DetailRow label="Project" value={agent.project_label} />
+            <DetailRow label="Branch" value={agent.branch} mono />
+            <DetailRow label="Session" value={agent.session_id} mono />
+            <DetailRow label="Worktree" value={agent.worktree_path} mono />
+            {agent.reviewer_session_id && (
+              <DetailRow
+                label="Reviewer session"
+                value={agent.reviewer_session_id}
+                mono
+              />
+            )}
+            {agent.reviewer_worktree_path && (
+              <DetailRow
+                label="Reviewer worktree"
+                value={agent.reviewer_worktree_path}
+                mono
+              />
+            )}
+            {agent.review_cycle_count !== undefined && (
+              <DetailRow
+                label="Review cycles"
+                value={String(agent.review_cycle_count)}
+              />
+            )}
+            <DetailRow label="Created" value={createdAt} />
+            {createdAt && (
+              <DetailRow
+                label="Age"
+                value={formatAge(agent.created_at) + " ago"}
+              />
+            )}
+            <DetailRow
+              label="Last activity"
+              value={formatAge(agent.last_activity_at) + " ago"}
+            />
+            <DetailRow label="PR">
+              {agent.pr_url ? (
+                <a
+                  href={agent.pr_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  {agent.pr_url}
+                </a>
+              ) : (
+                "—"
+              )}
+            </DetailRow>
+            {agent.pr_number && (
+              <DetailRow label="PR number" value={"#" + agent.pr_number} />
+            )}
+            {mergedAt && <DetailRow label="Merged at" value={mergedAt} />}
+            {doneAt && <DetailRow label="Done at" value={doneAt} />}
+            {agent.last_error && (
+              <DetailRow label="Last error">
+                <pre className="oco-detail-error">{agent.last_error}</pre>
+              </DetailRow>
+            )}
+            <DetailRow label="Initial prompt">
+              <pre className="oco-detail-prompt">
+                {agent.initial_prompt || "—"}
+              </pre>
+            </DetailRow>
+          </div>
+          <div className="oco-modal-footer">
+            <span className="oco-modal-hint">
+              press Esc or click outside to close
+            </span>
+          </div>
+        </div>
       </div>
     );
   }
@@ -210,6 +349,11 @@
     const [, setLoading] = React.useState(true);
     const [refreshing, setRefreshing] = React.useState(false);
     const [lastRefreshAt, setLastRefreshAt] = React.useState(null);
+    const [selectedAgentId, setSelectedAgentId] = React.useState(null);
+    const selectedAgent = React.useMemo(
+      () => agents.find((a) => a.agent_id === selectedAgentId) || null,
+      [agents, selectedAgentId]
+    );
 
     const refresh = React.useCallback(async function () {
       setRefreshing(true);
@@ -273,7 +417,7 @@
         </header>
         <section className="oco-section">
           <h2>Agents</h2>
-          <AgentsTable agents={agents} />
+          <AgentsTable agents={agents} onSelect={setSelectedAgentId} />
         </section>
         <section className="oco-section">
           <h2>Projects</h2>
@@ -283,6 +427,12 @@
           <h2>Recent heartbeats</h2>
           <HeartbeatsList items={heartbeats} />
         </section>
+        {selectedAgent && (
+          <AgentDetailModal
+            agent={selectedAgent}
+            onClose={() => setSelectedAgentId(null)}
+          />
+        )}
       </div>
     );
   }

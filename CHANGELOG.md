@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.4] — 2026-05-17
+
+### Added
+
+- **Dashboard agent detail modal.** Click any agent row in the dashboard to
+  open a centered detail view showing project, branch, session id, worktree
+  path, reviewer session/worktree (if applicable), review cycle count, PR
+  url + number + merged-at, done-at, last error, and the initial prompt in
+  a scrollable code block. Dismiss with Esc or by clicking the backdrop.
+  Clickable rows have a hover highlight; the PR link cell stops propagation
+  so clicking the PR link doesn't also open the modal.
+- **`AGENTS.md`** at the repo root: developer notes for AI agents working
+  on the plugin. Covers plugin runtime contract, tool-schema convention
+  (the 0.3.0 → 0.3.1 fix), sync vs async opencode endpoints (the 0.3.1 →
+  0.3.2 fix), reviewer worktree isolation, atomic state writes, dashboard
+  build workflow, CSS variable convention (the 0.3.2 → 0.3.3 fix), and a
+  blocking-anti-patterns section.
+
 ## [0.3.3] — 2026-05-17
 
 ### Fixed

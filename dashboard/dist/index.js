@@ -53,11 +53,112 @@
       const g = PHASE_GLYPH[phase] || "\u2022";
       return /* @__PURE__ */ React.createElement("span", { className: cn("oco-phase", "oco-phase-" + phase) }, /* @__PURE__ */ React.createElement("span", { className: "oco-glyph" }, g), " ", /* @__PURE__ */ React.createElement("span", { className: "oco-phase-label" }, phase));
     }
-    function AgentsTable({ agents }) {
+    function AgentsTable({ agents, onSelect }) {
       if (!agents || agents.length === 0) {
         return /* @__PURE__ */ React.createElement("div", { className: "oco-empty" }, "No agents tracked.");
       }
-      return /* @__PURE__ */ React.createElement("div", { className: "oco-table-wrap" }, /* @__PURE__ */ React.createElement("table", { className: "oco-table" }, /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("th", null, "Agent"), /* @__PURE__ */ React.createElement("th", null, "Project"), /* @__PURE__ */ React.createElement("th", null, "Branch"), /* @__PURE__ */ React.createElement("th", null, "Phase"), /* @__PURE__ */ React.createElement("th", null, "PR"), /* @__PURE__ */ React.createElement("th", null, "Last activity"))), /* @__PURE__ */ React.createElement("tbody", null, agents.map((a) => /* @__PURE__ */ React.createElement("tr", { key: a.agent_id }, /* @__PURE__ */ React.createElement("td", { className: "oco-mono" }, a.agent_id), /* @__PURE__ */ React.createElement("td", null, a.project_label), /* @__PURE__ */ React.createElement("td", { className: "oco-mono" }, a.branch), /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement(PhaseCell, { phase: a.phase })), /* @__PURE__ */ React.createElement("td", null, a.pr_url ? /* @__PURE__ */ React.createElement("a", { href: a.pr_url, target: "_blank", rel: "noopener noreferrer" }, "#", a.pr_number || "") : "\u2014"), /* @__PURE__ */ React.createElement("td", null, formatAge(a.last_activity_at)))))));
+      return /* @__PURE__ */ React.createElement("div", { className: "oco-table-wrap" }, /* @__PURE__ */ React.createElement("table", { className: "oco-table" }, /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("th", null, "Agent"), /* @__PURE__ */ React.createElement("th", null, "Project"), /* @__PURE__ */ React.createElement("th", null, "Branch"), /* @__PURE__ */ React.createElement("th", null, "Phase"), /* @__PURE__ */ React.createElement("th", null, "PR"), /* @__PURE__ */ React.createElement("th", null, "Last activity"))), /* @__PURE__ */ React.createElement("tbody", null, agents.map((a) => /* @__PURE__ */ React.createElement(
+        "tr",
+        {
+          key: a.agent_id,
+          className: "oco-row-clickable",
+          onClick: () => onSelect && onSelect(a.agent_id),
+          title: "click to inspect"
+        },
+        /* @__PURE__ */ React.createElement("td", { className: "oco-mono oco-link-cell" }, a.agent_id),
+        /* @__PURE__ */ React.createElement("td", null, a.project_label),
+        /* @__PURE__ */ React.createElement("td", { className: "oco-mono" }, a.branch),
+        /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement(PhaseCell, { phase: a.phase })),
+        /* @__PURE__ */ React.createElement("td", { onClick: (e) => e.stopPropagation() }, a.pr_url ? /* @__PURE__ */ React.createElement("a", { href: a.pr_url, target: "_blank", rel: "noopener noreferrer" }, "#", a.pr_number || "") : "\u2014"),
+        /* @__PURE__ */ React.createElement("td", null, formatAge(a.last_activity_at))
+      )))));
+    }
+    function DetailRow({ label, value, mono, children }) {
+      if (!children && (value === null || value === void 0 || value === "")) return null;
+      return /* @__PURE__ */ React.createElement("div", { className: "oco-detail-row" }, /* @__PURE__ */ React.createElement("div", { className: "oco-detail-label" }, label), /* @__PURE__ */ React.createElement("div", { className: cn("oco-detail-value", mono && "oco-mono") }, children || value));
+    }
+    function AgentDetailModal({ agent, onClose }) {
+      React.useEffect(() => {
+        function onKey(e) {
+          if (e.key === "Escape") onClose();
+        }
+        window.addEventListener("keydown", onKey);
+        return () => window.removeEventListener("keydown", onKey);
+      }, [onClose]);
+      if (!agent) return null;
+      const mergedAt = agent.pr_merged_at ? new Date(agent.pr_merged_at * 1e3).toLocaleString() : null;
+      const doneAt = agent.done_at ? new Date(agent.done_at * 1e3).toLocaleString() : null;
+      const createdAt = agent.created_at ? new Date(agent.created_at * 1e3).toLocaleString() : null;
+      return /* @__PURE__ */ React.createElement(
+        "div",
+        {
+          className: "oco-modal-backdrop",
+          onClick: onClose,
+          role: "presentation"
+        },
+        /* @__PURE__ */ React.createElement(
+          "div",
+          {
+            className: "oco-modal",
+            role: "dialog",
+            "aria-modal": "true",
+            "aria-label": "Agent " + agent.agent_id,
+            onClick: (e) => e.stopPropagation()
+          },
+          /* @__PURE__ */ React.createElement("div", { className: "oco-modal-header" }, /* @__PURE__ */ React.createElement("div", { className: "oco-modal-title" }, /* @__PURE__ */ React.createElement("span", { className: "oco-mono" }, agent.agent_id), /* @__PURE__ */ React.createElement(PhaseCell, { phase: agent.phase })), /* @__PURE__ */ React.createElement(
+            "button",
+            {
+              type: "button",
+              className: "oco-modal-close",
+              onClick: onClose,
+              "aria-label": "close"
+            },
+            "\u2715"
+          )),
+          /* @__PURE__ */ React.createElement("div", { className: "oco-modal-body" }, /* @__PURE__ */ React.createElement(DetailRow, { label: "Project", value: agent.project_label }), /* @__PURE__ */ React.createElement(DetailRow, { label: "Branch", value: agent.branch, mono: true }), /* @__PURE__ */ React.createElement(DetailRow, { label: "Session", value: agent.session_id, mono: true }), /* @__PURE__ */ React.createElement(DetailRow, { label: "Worktree", value: agent.worktree_path, mono: true }), agent.reviewer_session_id && /* @__PURE__ */ React.createElement(
+            DetailRow,
+            {
+              label: "Reviewer session",
+              value: agent.reviewer_session_id,
+              mono: true
+            }
+          ), agent.reviewer_worktree_path && /* @__PURE__ */ React.createElement(
+            DetailRow,
+            {
+              label: "Reviewer worktree",
+              value: agent.reviewer_worktree_path,
+              mono: true
+            }
+          ), agent.review_cycle_count !== void 0 && /* @__PURE__ */ React.createElement(
+            DetailRow,
+            {
+              label: "Review cycles",
+              value: String(agent.review_cycle_count)
+            }
+          ), /* @__PURE__ */ React.createElement(DetailRow, { label: "Created", value: createdAt }), createdAt && /* @__PURE__ */ React.createElement(
+            DetailRow,
+            {
+              label: "Age",
+              value: formatAge(agent.created_at) + " ago"
+            }
+          ), /* @__PURE__ */ React.createElement(
+            DetailRow,
+            {
+              label: "Last activity",
+              value: formatAge(agent.last_activity_at) + " ago"
+            }
+          ), /* @__PURE__ */ React.createElement(DetailRow, { label: "PR" }, agent.pr_url ? /* @__PURE__ */ React.createElement(
+            "a",
+            {
+              href: agent.pr_url,
+              target: "_blank",
+              rel: "noopener noreferrer"
+            },
+            agent.pr_url
+          ) : "\u2014"), agent.pr_number && /* @__PURE__ */ React.createElement(DetailRow, { label: "PR number", value: "#" + agent.pr_number }), mergedAt && /* @__PURE__ */ React.createElement(DetailRow, { label: "Merged at", value: mergedAt }), doneAt && /* @__PURE__ */ React.createElement(DetailRow, { label: "Done at", value: doneAt }), agent.last_error && /* @__PURE__ */ React.createElement(DetailRow, { label: "Last error" }, /* @__PURE__ */ React.createElement("pre", { className: "oco-detail-error" }, agent.last_error)), /* @__PURE__ */ React.createElement(DetailRow, { label: "Initial prompt" }, /* @__PURE__ */ React.createElement("pre", { className: "oco-detail-prompt" }, agent.initial_prompt || "\u2014"))),
+          /* @__PURE__ */ React.createElement("div", { className: "oco-modal-footer" }, /* @__PURE__ */ React.createElement("span", { className: "oco-modal-hint" }, "press Esc or click outside to close"))
+        )
+      );
     }
     function ProjectsTable({ projects }) {
       if (!projects || projects.length === 0) {
@@ -115,6 +216,11 @@
       const [, setLoading] = React.useState(true);
       const [refreshing, setRefreshing] = React.useState(false);
       const [lastRefreshAt, setLastRefreshAt] = React.useState(null);
+      const [selectedAgentId, setSelectedAgentId] = React.useState(null);
+      const selectedAgent = React.useMemo(
+        () => agents.find((a) => a.agent_id === selectedAgentId) || null,
+        [agents, selectedAgentId]
+      );
       const refresh = React.useCallback(async function() {
         setRefreshing(true);
         try {
@@ -152,7 +258,13 @@
           refreshing,
           lastRefreshAt
         }
-      )), /* @__PURE__ */ React.createElement("div", { className: "oco-stats" }, /* @__PURE__ */ React.createElement("span", null, agents.length, " agent", agents.length === 1 ? "" : "s"), /* @__PURE__ */ React.createElement("span", { className: "oco-sep" }, "\xB7"), /* @__PURE__ */ React.createElement("span", null, projects.length, " project", projects.length === 1 ? "" : "s"), lastRefreshAt && /* @__PURE__ */ React.createElement("span", { className: "oco-sep" }, "\xB7"), lastRefreshAt && /* @__PURE__ */ React.createElement("span", { className: "oco-loading" }, "updated ", formatAge(lastRefreshAt), " ago")), error && /* @__PURE__ */ React.createElement("div", { className: "oco-error" }, error)), /* @__PURE__ */ React.createElement("section", { className: "oco-section" }, /* @__PURE__ */ React.createElement("h2", null, "Agents"), /* @__PURE__ */ React.createElement(AgentsTable, { agents })), /* @__PURE__ */ React.createElement("section", { className: "oco-section" }, /* @__PURE__ */ React.createElement("h2", null, "Projects"), /* @__PURE__ */ React.createElement(ProjectsTable, { projects })), /* @__PURE__ */ React.createElement("section", { className: "oco-section" }, /* @__PURE__ */ React.createElement("h2", null, "Recent heartbeats"), /* @__PURE__ */ React.createElement(HeartbeatsList, { items: heartbeats })));
+      )), /* @__PURE__ */ React.createElement("div", { className: "oco-stats" }, /* @__PURE__ */ React.createElement("span", null, agents.length, " agent", agents.length === 1 ? "" : "s"), /* @__PURE__ */ React.createElement("span", { className: "oco-sep" }, "\xB7"), /* @__PURE__ */ React.createElement("span", null, projects.length, " project", projects.length === 1 ? "" : "s"), lastRefreshAt && /* @__PURE__ */ React.createElement("span", { className: "oco-sep" }, "\xB7"), lastRefreshAt && /* @__PURE__ */ React.createElement("span", { className: "oco-loading" }, "updated ", formatAge(lastRefreshAt), " ago")), error && /* @__PURE__ */ React.createElement("div", { className: "oco-error" }, error)), /* @__PURE__ */ React.createElement("section", { className: "oco-section" }, /* @__PURE__ */ React.createElement("h2", null, "Agents"), /* @__PURE__ */ React.createElement(AgentsTable, { agents, onSelect: setSelectedAgentId })), /* @__PURE__ */ React.createElement("section", { className: "oco-section" }, /* @__PURE__ */ React.createElement("h2", null, "Projects"), /* @__PURE__ */ React.createElement(ProjectsTable, { projects })), /* @__PURE__ */ React.createElement("section", { className: "oco-section" }, /* @__PURE__ */ React.createElement("h2", null, "Recent heartbeats"), /* @__PURE__ */ React.createElement(HeartbeatsList, { items: heartbeats })), selectedAgent && /* @__PURE__ */ React.createElement(
+        AgentDetailModal,
+        {
+          agent: selectedAgent,
+          onClose: () => setSelectedAgentId(null)
+        }
+      ));
     }
     window.__HERMES_PLUGINS__.register("opencode-orchestrator", OpencodeAgentsPage);
   })();
