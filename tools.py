@@ -933,6 +933,7 @@ def make_regen_bootstrap(rt: Runtime) -> Callable[..., Awaitable[str]]:
         if not (repo_path / ".git").exists():
             return _err(f"project repo missing: {repo_path}")
         throwaway = Path(tempfile.mkdtemp(prefix=f"oc-orch-genboot-{project.abbrev}-"))
+        throwaway.rmdir()
         try:
             wt.create_worktree(repo_path, throwaway, branch=f"oc-orch-genboot-{project.abbrev}-{int(time.time())}", base=project.base_branch)
         except wt.GitError as e:
@@ -970,6 +971,7 @@ def make_regen_cleanup(rt: Runtime) -> Callable[..., Awaitable[str]]:
         if not (repo_path / ".git").exists():
             return _err(f"project repo missing: {repo_path}")
         throwaway = Path(tempfile.mkdtemp(prefix=f"oc-orch-gencleanup-{project.abbrev}-"))
+        throwaway.rmdir()
         try:
             wt.create_worktree(repo_path, throwaway, branch=f"oc-orch-gencleanup-{project.abbrev}-{int(time.time())}", base=project.base_branch)
         except wt.GitError as e:
