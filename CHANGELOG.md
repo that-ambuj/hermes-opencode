@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.1] - 2026-05-17
+
+### Fixed
+
+- **`OpencodeClient.ensure_server` is now thread-safe.** Completes the
+  v0.12.0 watchdog feature. The lock + reaper landed in `transport.py`
+  but weren't committed alongside the rest of the watchdog code in
+  v0.12.0. Added `self._spawn_lock = threading.Lock()` on init; the
+  entire spawn sequence in `ensure_server` is now wrapped in the lock,
+  re-checks the port after acquiring, and reaps any tracked-but-dead
+  `Popen` via `_reap_tracked_spawn` (terminate → 5s wait → kill → 2s
+  wait) before starting a fresh process. Without this, tool-handler
+  threads (`oc_spawn` on the hermes main thread) and the watchdog
+  thread (via `asyncio.to_thread`) could both observe the port closed
+  and race-spawn duplicate `opencode serve` processes — exactly the
+  zombie-process pattern we saw in `ps aux` earlier today (3 opencode
+  servers on different ports during one hermes session).
+
 ## [0.12.0] - 2026-05-17
 
 ### Added

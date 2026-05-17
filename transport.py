@@ -7,6 +7,7 @@ import os
 import shutil
 import socket
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -31,6 +32,9 @@ class OpencodeClient:
         self._host = parsed.hostname or "127.0.0.1"
         self._port = parsed.port or 80
         self._spawned: subprocess.Popen[str] | None = None
+        # Guards ensure_server against concurrent spawns from tool handlers
+        # (hermes main thread) and the bg event-loop watchdog.
+        self._spawn_lock = threading.Lock()
 
     def _client(self, directory: Path | None = None, timeout: float = 60.0) -> httpx.AsyncClient:
         headers = dict(self._headers)
@@ -55,43 +59,65 @@ class OpencodeClient:
             return False
 
     def ensure_server(self, deadline_sec: float = 15.0) -> None:
-        if self._port_open(self._host, self._port):
-            return
-        binary = shutil.which("opencode")
-        if not binary:
-            # Try well-known install locations when PATH is stripped (e.g. in-process plugin)
-            for candidate in [
-                Path.home() / ".bun" / "bin" / "opencode",
-                Path("/usr/local/bin/opencode"),
-                Path("/opt/homebrew/bin/opencode"),
-            ]:
-                if candidate.is_file() and os.access(candidate, os.X_OK):
-                    binary = str(candidate)
-                    break
-        if not binary:
-            raise OpencodeError("opencode binary not found on PATH; install opencode first")
-        env = dict(os.environ)
-        self._spawned = subprocess.Popen(
-            [binary, "serve", f"--hostname={self._host}", f"--port={self._port}"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            env=env,
-            start_new_session=True,
-        )
-        deadline = time.time() + deadline_sec
-        while time.time() < deadline:
-            if self._spawned.poll() is not None:
-                self._spawned = None
-                raise OpencodeError("opencode serve exited during startup")
+        with self._spawn_lock:
             if self._port_open(self._host, self._port):
                 return
-            time.sleep(0.2)
+            self._reap_tracked_spawn()
+            binary = shutil.which("opencode")
+            if not binary:
+                # Try well-known install locations when PATH is stripped (e.g. in-process plugin)
+                for candidate in [
+                    Path.home() / ".bun" / "bin" / "opencode",
+                    Path("/usr/local/bin/opencode"),
+                    Path("/opt/homebrew/bin/opencode"),
+                ]:
+                    if candidate.is_file() and os.access(candidate, os.X_OK):
+                        binary = str(candidate)
+                        break
+            if not binary:
+                raise OpencodeError("opencode binary not found on PATH; install opencode first")
+            env = dict(os.environ)
+            self._spawned = subprocess.Popen(
+                [binary, "serve", f"--hostname={self._host}", f"--port={self._port}"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                env=env,
+                start_new_session=True,
+            )
+            deadline = time.time() + deadline_sec
+            while time.time() < deadline:
+                if self._spawned.poll() is not None:
+                    self._spawned = None
+                    raise OpencodeError("opencode serve exited during startup")
+                if self._port_open(self._host, self._port):
+                    return
+                time.sleep(0.2)
+            try:
+                self._spawned.terminate()
+            finally:
+                self._spawned = None
+            raise OpencodeError(f"opencode serve did not become ready within {deadline_sec:.0f}s")
+
+    def _reap_tracked_spawn(self) -> None:
+        spawned = self._spawned
+        if spawned is None:
+            return
         try:
-            self._spawned.terminate()
+            if spawned.poll() is None:
+                spawned.terminate()
+                try:
+                    spawned.wait(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    spawned.kill()
+                    try:
+                        spawned.wait(timeout=2.0)
+                    except subprocess.TimeoutExpired:
+                        pass
+        except Exception as e:
+            logger.debug("reaping tracked opencode spawn raised: %s", e)
         finally:
             self._spawned = None
-        raise OpencodeError(f"opencode serve did not become ready within {deadline_sec:.0f}s")
 
     async def create_session(self, directory: Path, agent: str = "build") -> dict[str, Any]:
         async with self._client(directory) as c:
