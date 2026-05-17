@@ -55,6 +55,16 @@ class OpencodeClient:
             return
         binary = shutil.which("opencode")
         if not binary:
+            # Try well-known install locations when PATH is stripped (e.g. in-process plugin)
+            for candidate in [
+                Path.home() / ".bun" / "bin" / "opencode",
+                Path("/usr/local/bin/opencode"),
+                Path("/opt/homebrew/bin/opencode"),
+            ]:
+                if candidate.is_file() and os.access(candidate, os.X_OK):
+                    binary = str(candidate)
+                    break
+        if not binary:
             raise OpencodeError("opencode binary not found on PATH; install opencode first")
         env = dict(os.environ)
         self._spawned = subprocess.Popen(
@@ -98,6 +108,26 @@ class OpencodeClient:
                 return r.json()
             except Exception:
                 return {"raw": r.text}
+
+    async def send_message_async(self, session_id: str, directory: Path, text: str, timeout: float = 30.0) -> dict[str, Any]:
+        """Fire-and-forget: queue a prompt on the session and return immediately.
+
+        Use from synchronous-host code paths (hermes tool handlers, CLI subcommands)
+        where blocking the caller for the full assistant turn is unacceptable.
+        The plugin's bg event-loop is responsible for picking up completion via
+        the polling / SSE channels.
+        """
+        async with self._client(directory, timeout=timeout) as c:
+            r = await c.post(
+                f"/session/{session_id}/prompt_async",
+                json={"parts": [{"type": "text", "text": text}]},
+            )
+            if r.status_code >= 400:
+                raise OpencodeError(f"POST prompt_async failed: {r.status_code} {r.text[:200]}")
+            try:
+                return r.json() if r.text else {"queued": True}
+            except Exception:
+                return {"raw": r.text, "queued": True}
 
     async def wait_idle(self, session_id: str, directory: Path, timeout: float = 600.0) -> bool:
         async with self._client(directory, timeout=timeout) as c:

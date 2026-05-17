@@ -339,13 +339,12 @@ def make_spawn(rt: Runtime) -> Callable[..., Awaitable[str]]:
         rt.agents.add(agent)
 
         try:
-            resp = await rt.client.send_message(session_id, worktree_path, prompt)
+            await rt.client.send_message_async(session_id, worktree_path, prompt)
         except OpencodeError as e:
             rt.agents.update(agent_id, phase="FAILED", last_error=str(e))
-            return _err(f"send_message failed: {e}", agent_id=agent_id)
+            return _err(f"send_message_async failed: {e}", agent_id=agent_id)
 
         rt.agents.update(agent_id, phase="EXECUTING")
-        reply = OpencodeClient.extract_assistant_text(resp)
 
         event_loop.start(rt)
         event_loop.ensure_agent_task(agent_id)
@@ -355,9 +354,8 @@ def make_spawn(rt: Runtime) -> Callable[..., Awaitable[str]]:
             "session_id": session_id,
             "worktree_path": str(worktree_path),
             "branch": branch,
-            "opencode_agent_resolved": (resp.get("info") or {}).get("agent"),
-            "first_turn_assistant_text": reply[:2000],
-            "first_turn_finish": (resp.get("info") or {}).get("finish"),
+            "queued": True,
+            "note": "first turn queued asynchronously; poll oc_status/oc_wait to track progress",
             "bootstrap": {"ok": boot.ok, "method": boot.method, "skill_updated": boot.skill_updated},
         })
     return handler

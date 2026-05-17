@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.2] — 2026-05-17
+
+### Fixed
+
+- **`oc_spawn` no longer blocks the hermes main session.** Previously the
+  initial prompt was sent via `POST /session/:id/message`, which streams the
+  full assistant turn inline before returning — blocking the hermes tool
+  handler (and therefore the user's chat) for the entire first turn (often
+  30 s – several minutes for non-trivial tasks). Now uses
+  `POST /session/:id/prompt_async`, which queues the work and returns
+  immediately. The plugin's bg event-loop picks up state transitions via the
+  existing polling / SSE channels.
+  Trade-off: the return value no longer carries `first_turn_assistant_text`
+  or `first_turn_finish`. Use `oc_wait` + `oc_status` (or the upcoming
+  `oc_output` from v0.4) to inspect the first turn's result.
+  General rule for future tool handlers: any code path called synchronously
+  by a hermes tool dispatcher must use non-blocking opencode endpoints. Code
+  inside `event_loop._phase_*` may use blocking endpoints freely.
+
 ## [0.3.1] — 2026-05-17
 
 ### Fixed
