@@ -52,6 +52,16 @@ def commit_and_push(worktree: Path, message: str, branch: str) -> None:
         raise PrError(f"git push failed: {push.stderr.strip() or push.stdout.strip()}")
 
 
+def _existing_pr_from_output(stdout: str, stderr: str) -> tuple[str, int] | None:
+    combined = f"{stderr}\n{stdout}"
+    if "already exists" not in combined.lower():
+        return None
+    url_match = _PR_URL_RE.search(combined)
+    if not url_match:
+        return None
+    return url_match.group(0), int(url_match.group(1))
+
+
 def open_pr(
     worktree: Path, base_branch: str, title: str | None = None,
     body: str | None = None,
@@ -64,7 +74,15 @@ def open_pr(
         args += ["--fill"]
     res = subprocess.run(args, cwd=worktree, capture_output=True, text=True, timeout=120, check=False)
     if res.returncode != 0:
-        raise PrError(f"gh pr create failed: {res.stderr.strip() or res.stdout.strip()}")
+        existing = _existing_pr_from_output(res.stdout or "", res.stderr or "")
+        if existing is None:
+            raise PrError(f"gh pr create failed: {res.stderr.strip() or res.stdout.strip()}")
+        url, number = existing
+        try:
+            info = pr_state(worktree, number)
+        except PrError:
+            return PrInfo(number=number, url=url, state="OPEN", merged_at=None)
+        return PrInfo(number=number, url=url, state=info.state, merged_at=info.merged_at)
     url_match = _PR_URL_RE.search(res.stdout or "")
     if not url_match:
         raise PrError(f"could not parse PR URL from gh output: {res.stdout!r}")

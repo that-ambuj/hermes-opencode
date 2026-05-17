@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] — 2026-05-17
+
+### Fixed
+
+- **`gh pr create` finding an existing PR is no longer fatal.** When the
+  branch already has an open PR, `gh pr create` exits non-zero with stderr
+  like `a pull request for branch "..." into branch "main" already exists:
+  <url>`. Previously the orchestrator treated this as a `PrError` and
+  transitioned the agent to `FAILED` even though the PR demonstrably
+  existed. Now `pr.open_pr` parses the URL out of the gh output via a new
+  `_existing_pr_from_output` helper, calls `pr_state` to load the live PR
+  status, and returns a `PrInfo` as if `gh pr create` had succeeded. If
+  the follow-up `pr_state` call itself flakes (rate-limited `gh pr view`,
+  etc.), it falls back to `state="OPEN", merged_at=None` rather than
+  failing the agent — the whole point of the recovery is that the PR
+  demonstrably exists. Covered by `tests/test_pr.py`.
+
+### Rebased
+
+- Rebased onto `0.5.0` (had originally branched off PR #2 / `0.3.5` and
+  proposed `0.3.6`). Patch bump to `0.5.1` since main shipped both PR #1
+  (`0.4.0`) and PR #2 (`0.5.0`) in the meantime. The PR #2-derived
+  changes that this branch carried (cli.py, commands.py, slash command
+  registrations, etc.) are dropped — they're already in `0.5.0`. Only
+  the focused `gh pr create` recovery fix remains.
+
 ## [0.5.0] — 2026-05-17
 
 ### Added
