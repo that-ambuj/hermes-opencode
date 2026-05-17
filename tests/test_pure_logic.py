@@ -235,6 +235,61 @@ class TestExecutorOpenPrParse:
         assert reviewer_mod.parse_pr_opened(None) is None
 
 
+class TestServeRestartBackoff:
+    def test_first_attempt_uses_base_delay(self):
+        assert event_loop_mod._compute_serve_restart_delay(1) == 1.0
+
+    def test_doubles_each_attempt(self):
+        assert event_loop_mod._compute_serve_restart_delay(2) == 2.0
+        assert event_loop_mod._compute_serve_restart_delay(3) == 4.0
+        assert event_loop_mod._compute_serve_restart_delay(4) == 8.0
+        assert event_loop_mod._compute_serve_restart_delay(5) == 16.0
+
+    def test_zero_or_negative_attempt_clamped(self):
+        assert event_loop_mod._compute_serve_restart_delay(0) == 1.0
+        assert event_loop_mod._compute_serve_restart_delay(-3) == 1.0
+
+    def test_respects_custom_base(self):
+        assert event_loop_mod._compute_serve_restart_delay(3, base=0.5) == 2.0
+
+    def test_max_attempts_is_five(self):
+        assert event_loop_mod.SERVE_RESTART_MAX_ATTEMPTS == 5
+
+    def test_notify_targets_all_three_sinks(self):
+        assert set(event_loop_mod.SERVE_DOWN_NOTIFY_SINKS) == {"cli", "dashboard", "gateway"}
+
+
+class TestServeDownNotificationBody:
+    def _runtime(self, tmp_path: Path):
+        cfg = config_mod.Config(
+            projects_file=tmp_path / "projects.json",
+            agents_file=tmp_path / "agents.json",
+            worktrees_root=tmp_path / "wt",
+            logs_dir=tmp_path / "logs",
+            notifications_file=tmp_path / "notifications.jsonl",
+            events_log=tmp_path / "events.log",
+            server_url="http://127.0.0.1:9999",
+        )
+        cfg.ensure_dirs()
+
+        class _Stub:
+            def __init__(self):
+                self.config = cfg
+
+        return _Stub()
+
+    def test_body_includes_server_url_and_attempt_count(self, tmp_path: Path):
+        rt = self._runtime(tmp_path)
+        with patch.object(event_loop_mod, "_runtime", rt):
+            title, body, meta = event_loop_mod._build_serve_down_notification()
+        assert "unreachable" in title.lower()
+        assert "127.0.0.1:9999" in body
+        assert str(event_loop_mod.SERVE_RESTART_MAX_ATTEMPTS) in body
+        assert meta["kind"] == "serve_down"
+        assert meta["server_url"] == "http://127.0.0.1:9999"
+        assert meta["attempts"] == event_loop_mod.SERVE_RESTART_MAX_ATTEMPTS
+
+
 class TestExecutorOpenPrPrompt:
     def test_includes_branch_and_base(self):
         prompt = reviewer_mod.executor_open_pr_prompt("oco/x", "main")
@@ -246,3 +301,217 @@ class TestExecutorOpenPrPrompt:
         prompt = reviewer_mod.executor_open_pr_prompt("oco/x", "main")
         assert "hermes-opencode@local" not in prompt
         assert "do NOT pass" in prompt or "do not pass" in prompt.lower()
+
+
+class TestHomeChannelAutoDetect:
+    def test_discovers_first_available_platform(self, monkeypatch):
+        monkeypatch.delenv("BLUEBUBBLES_HOME_CHANNEL", raising=False)
+        monkeypatch.delenv("TELEGRAM_HOME_CHANNEL", raising=False)
+        monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "@me")
+        result = config_mod.discover_home_channel()
+        assert result == ("telegram", "@me", "env:TELEGRAM_HOME_CHANNEL")
+
+    def test_bluebubbles_takes_priority_over_telegram(self, monkeypatch):
+        monkeypatch.setenv("BLUEBUBBLES_HOME_CHANNEL", "+1234")
+        monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "@me")
+        result = config_mod.discover_home_channel()
+        assert result[0] == "bluebubbles"
+
+    def test_returns_none_when_no_env_set(self, monkeypatch):
+        for plat in config_mod.HOME_CHANNEL_PLATFORMS:
+            monkeypatch.delenv(f"{plat.upper()}_HOME_CHANNEL", raising=False)
+        assert config_mod.discover_home_channel() is None
+
+
+class TestConfigSmartSinks:
+    def _clear_home_envs(self, monkeypatch):
+        for plat in config_mod.HOME_CHANNEL_PLATFORMS:
+            monkeypatch.delenv(f"{plat.upper()}_HOME_CHANNEL", raising=False)
+
+    def test_default_falls_back_to_cli_dashboard_without_home_channel(self, monkeypatch):
+        self._clear_home_envs(monkeypatch)
+        cfg = config_mod.Config.from_plugin_entry({})
+        assert cfg.notify_sinks == ["cli", "dashboard"]
+        assert cfg.notify_gateway_platform is None
+        assert cfg.notify_discovery_source is None
+
+    def test_default_uses_gateway_when_home_channel_detected(self, monkeypatch):
+        self._clear_home_envs(monkeypatch)
+        monkeypatch.setenv("BLUEBUBBLES_HOME_CHANNEL", "+1234")
+        cfg = config_mod.Config.from_plugin_entry({})
+        assert cfg.notify_sinks == ["gateway", "dashboard"]
+        assert cfg.notify_gateway_platform == "bluebubbles"
+        assert cfg.notify_gateway_chat_id == "+1234"
+        assert cfg.notify_discovery_source == "env:BLUEBUBBLES_HOME_CHANNEL"
+
+    def test_explicit_sinks_override_default(self, monkeypatch):
+        self._clear_home_envs(monkeypatch)
+        monkeypatch.setenv("BLUEBUBBLES_HOME_CHANNEL", "+1234")
+        cfg = config_mod.Config.from_plugin_entry({"notify": {"sinks": ["cli"]}})
+        assert cfg.notify_sinks == ["cli"]
+        assert cfg.notify_gateway_platform == "bluebubbles"
+
+    def test_explicit_platform_overrides_auto_detect(self, monkeypatch):
+        self._clear_home_envs(monkeypatch)
+        monkeypatch.setenv("BLUEBUBBLES_HOME_CHANNEL", "+1234")
+        monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "@me")
+        cfg = config_mod.Config.from_plugin_entry({"notify": {"gateway": {"platform": "telegram"}}})
+        assert cfg.notify_gateway_platform == "telegram"
+        assert cfg.notify_gateway_chat_id == "@me"
+        assert cfg.notify_discovery_source == "env:TELEGRAM_HOME_CHANNEL"
+
+    def test_explicit_chat_id_marks_discovery_explicit(self, monkeypatch):
+        self._clear_home_envs(monkeypatch)
+        cfg = config_mod.Config.from_plugin_entry({
+            "notify": {"gateway": {"platform": "telegram", "chat_id": "@boss"}}
+        })
+        assert cfg.notify_gateway_chat_id == "@boss"
+        assert cfg.notify_discovery_source == "explicit"
+
+    def test_cancelled_in_default_events(self, monkeypatch):
+        self._clear_home_envs(monkeypatch)
+        cfg = config_mod.Config.from_plugin_entry({})
+        assert "cancelled" in cfg.notify_events
+
+
+class TestPrOpenCancelOnClosed:
+    def _setup(self, tmp_path: Path, pr_state_value: str, monkeypatch):
+        cfg = config_mod.Config(
+            projects_file=tmp_path / "projects.json",
+            agents_file=tmp_path / "agents.json",
+            worktrees_root=tmp_path / "wt",
+            logs_dir=tmp_path / "logs",
+            notifications_file=tmp_path / "notifications.jsonl",
+        )
+        cfg.ensure_dirs()
+
+        store = state_mod.AgentStore(cfg.agents_file)
+        agent = state_mod.Agent(
+            agent_id="ma/x", project_label="my-app", worktree_path=str(tmp_path / "wt-x"),
+            session_id="s", branch="ma/x", initial_prompt="p", phase="PR_OPEN",
+            pr_url="https://github.test/o/r/pull/9", pr_number=9,
+        )
+        store.add(agent)
+        (tmp_path / "wt-x").mkdir(exist_ok=True)
+
+        class _Rt:
+            def __init__(self):
+                self.config = cfg
+                self.agents = store
+                self.projects = None
+                self.client = None
+
+        rt = _Rt()
+        monkeypatch.setattr(event_loop_mod, "_runtime", rt)
+
+        pr_mod = sys.modules["_oco_test_pkg.pr"]
+        merged_at = 12345.0 if pr_state_value == "MERGED" else None
+
+        def _stub_state(worktree, number):
+            return pr_mod.PrInfo(number=number, url="https://x", state=pr_state_value, merged_at=merged_at)
+        monkeypatch.setattr(pr_mod, "pr_state", _stub_state)
+
+        async def _stub_cleanup(_agent, _worktree):
+            return None
+        monkeypatch.setattr(event_loop_mod, "_cleanup_worktrees", _stub_cleanup)
+
+        notified = []
+        monkeypatch.setattr(event_loop_mod, "_maybe_notify_phase",
+                            lambda agent, kind, body="": notified.append(kind))
+        return store, agent, notified
+
+    def test_closed_transitions_to_cancelled_with_reason(self, tmp_path: Path, monkeypatch):
+        import asyncio
+        store, agent, notified = self._setup(tmp_path, "CLOSED", monkeypatch)
+        asyncio.run(event_loop_mod._phase_pr_open(agent))
+        after = store.get("ma/x")
+        assert after.phase == "CANCELLED"
+        assert after.cancelled_at is not None
+        assert "PR #9 closed without merge" in (after.cancellation_reason or "")
+        assert notified == ["cancelled"]
+
+    def test_merged_transitions_to_done(self, tmp_path: Path, monkeypatch):
+        import asyncio
+        store, agent, notified = self._setup(tmp_path, "MERGED", monkeypatch)
+        asyncio.run(event_loop_mod._phase_pr_open(agent))
+        after = store.get("ma/x")
+        assert after.phase == "DONE"
+        assert after.done_at is not None
+        assert notified == ["done"]
+
+    def test_open_does_not_transition(self, tmp_path: Path, monkeypatch):
+        import asyncio
+        store, agent, notified = self._setup(tmp_path, "OPEN", monkeypatch)
+
+        async def _stub_sleep(_):
+            return None
+        monkeypatch.setattr(event_loop_mod.asyncio, "sleep", _stub_sleep)
+        asyncio.run(event_loop_mod._phase_pr_open(agent))
+        after = store.get("ma/x")
+        assert after.phase == "PR_OPEN"
+        assert notified == []
+
+
+class TestPrunerArchivesCancelled:
+    def test_archives_cancelled_after_threshold(self, tmp_path: Path, monkeypatch):
+        cfg = config_mod.Config(
+            projects_file=tmp_path / "projects.json",
+            agents_file=tmp_path / "agents.json",
+            worktrees_root=tmp_path / "wt",
+            logs_dir=tmp_path / "logs",
+            notifications_file=tmp_path / "notifications.jsonl",
+        )
+        cfg.ensure_dirs()
+        store = state_mod.AgentStore(cfg.agents_file)
+        old = time.time() - (13 * 3600)
+        agent = state_mod.Agent(
+            agent_id="ma/old", project_label="my-app", worktree_path="/t",
+            session_id="s", branch="ma/old", initial_prompt="p", phase="CANCELLED",
+            cancelled_at=old, cancellation_reason="user cancelled",
+        )
+        store.add(agent)
+
+        class _Rt:
+            def __init__(self):
+                self.config = cfg
+                self.agents = store
+                self.projects = None
+
+        rt = _Rt()
+        monkeypatch.setattr(event_loop_mod, "_runtime", rt)
+        monkeypatch.setattr(event_loop_mod, "_archive_done", lambda _a: None)
+
+        for ag in list(store.list()):
+            if ag.archived:
+                continue
+            done_ts = ag.done_at if ag.phase == "DONE" else (ag.cancelled_at if ag.phase == "CANCELLED" else None)
+            if done_ts and (time.time() - done_ts) > event_loop_mod.ARCHIVE_AFTER_SEC:
+                store.update(ag.agent_id, archived=True, archived_at=time.time())
+
+        after = store.get("ma/old")
+        assert after.archived is True
+        assert after.archived_at is not None
+
+    def test_recent_cancelled_not_archived(self, tmp_path: Path):
+        cfg = config_mod.Config(
+            projects_file=tmp_path / "projects.json",
+            agents_file=tmp_path / "agents.json",
+            worktrees_root=tmp_path / "wt",
+            logs_dir=tmp_path / "logs",
+            notifications_file=tmp_path / "notifications.jsonl",
+        )
+        cfg.ensure_dirs()
+        store = state_mod.AgentStore(cfg.agents_file)
+        recent = time.time() - 60
+        agent = state_mod.Agent(
+            agent_id="ma/recent", project_label="my-app", worktree_path="/t",
+            session_id="s", branch="ma/recent", initial_prompt="p", phase="CANCELLED",
+            cancelled_at=recent,
+        )
+        store.add(agent)
+        for ag in list(store.list()):
+            done_ts = ag.cancelled_at if ag.phase == "CANCELLED" else None
+            assert done_ts is not None
+            assert (time.time() - done_ts) < event_loop_mod.ARCHIVE_AFTER_SEC
+        after = store.get("ma/recent")
+        assert after.archived is False

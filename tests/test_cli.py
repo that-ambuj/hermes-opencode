@@ -78,10 +78,11 @@ def _agent(**overrides) -> state_mod.Agent:
 
 
 class TestOcoSetup:
-    def test_registers_all_five_subcommands(self):
+    def test_registers_all_six_subcommands(self):
         parser = _build_parser()
-        for sub in ("list", "status", "attach", "kill", "projects"):
-            ns = parser.parse_args([sub] + (["agent"] if sub in ("attach", "kill") else []))
+        for sub in ("list", "status", "attach", "kill", "cancel", "projects"):
+            extra = ["agent"] if sub in ("attach", "kill", "cancel") else []
+            ns = parser.parse_args([sub] + extra)
             assert ns.oco_command == sub
 
     def test_help_does_not_raise(self):
@@ -257,3 +258,59 @@ class TestOcoDispatch:
         code = cli_mod.handler(ns)
         assert code == 1
         assert "unknown agent" in capsys.readouterr().err
+
+    def test_cancel_force_keeps_record_with_cancelled_phase(self, monkeypatch, tmp_path, capsys):
+        client = _StubClient()
+        ctx = _StubCtx(tmp_path, client=client)
+        ctx.agents.add(_agent())
+        monkeypatch.setattr(cli_mod, "build_context", lambda: ctx)
+        bootstrap_mod = sys.modules["_oco_test_pkg.bootstrap"]
+
+        async def _stub_cleanup(client_, project, worktree, **kwargs):
+            return bootstrap_mod.BootstrapResult(ok=True, method="skip", detail="(no project / no skill)")
+        monkeypatch.setattr(bootstrap_mod, "run_project_cleanup", _stub_cleanup)
+        parser = _build_parser()
+        ns = parser.parse_args(["cancel", "dp/refunds", "--force", "--reason", "PR closed by user"])
+        code = cli_mod.handler(ns)
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "cancelled dp/refunds" in out
+        agent_after = ctx.agents.get("dp/refunds")
+        assert agent_after is not None
+        assert agent_after.phase == "CANCELLED"
+        assert agent_after.cancellation_reason == "PR closed by user"
+        assert agent_after.cancelled_at is not None
+
+    def test_cancel_aborts_when_user_declines(self, monkeypatch, tmp_path, capsys):
+        ctx = _StubCtx(tmp_path)
+        ctx.agents.add(_agent())
+        monkeypatch.setattr(cli_mod, "build_context", lambda: ctx)
+        monkeypatch.setattr("builtins.input", lambda *_a, **_kw: "n")
+        parser = _build_parser()
+        ns = parser.parse_args(["cancel", "dp/refunds"])
+        code = cli_mod.handler(ns)
+        assert code == 1
+        assert "aborted" in capsys.readouterr().out
+        survivor = ctx.agents.get("dp/refunds")
+        assert survivor is not None
+        assert survivor.phase == "EXECUTING"
+
+    def test_cancel_unknown_agent_returns_error(self, monkeypatch, tmp_path, capsys):
+        ctx = _StubCtx(tmp_path)
+        monkeypatch.setattr(cli_mod, "build_context", lambda: ctx)
+        parser = _build_parser()
+        ns = parser.parse_args(["cancel", "missing/x", "--force"])
+        code = cli_mod.handler(ns)
+        assert code == 1
+        assert "unknown agent" in capsys.readouterr().err
+
+    def test_cancel_rejects_already_done(self, monkeypatch, tmp_path, capsys):
+        ctx = _StubCtx(tmp_path)
+        ctx.agents.add(_agent(phase="DONE"))
+        monkeypatch.setattr(cli_mod, "build_context", lambda: ctx)
+        parser = _build_parser()
+        ns = parser.parse_args(["cancel", "dp/refunds", "--force"])
+        code = cli_mod.handler(ns)
+        assert code == 1
+        err = capsys.readouterr().err
+        assert "already DONE" in err

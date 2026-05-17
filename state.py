@@ -22,6 +22,7 @@ PHASES = {
     "DONE",
     "FAILED",
     "KILLED",
+    "CANCELLED",
 }
 
 
@@ -47,6 +48,8 @@ class Agent:
     last_activity_at: float = field(default_factory=time.time)
     archived: bool = False
     archived_at: float | None = None
+    cancelled_at: float | None = None
+    cancellation_reason: str | None = None
 
 
 class AgentExists(ValueError):

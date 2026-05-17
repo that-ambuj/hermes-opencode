@@ -5,6 +5,127 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.0] - 2026-05-17
+
+### Added
+
+- **`opencode serve` watchdog loop.** A new background task on the
+  plugin's singleton asyncio loop pings `opencode serve` every 15 s. If
+  the server was previously seen alive and then becomes unreachable, the
+  watchdog attempts up to **5 restarts with exponential backoff**
+  (1 s, 2 s, 4 s, 8 s, 16 s before each successive attempt — ~31 s total
+  if every attempt fails) via `OpencodeClient.ensure_server`. On
+  successful recovery the notification cooldown resets and tool handlers
+  resume against the same server URL.
+- **Critical alert on all channels when restarts are exhausted.** If all
+  5 exponential restart attempts fail, a `serve_down` event fans out to
+  every notification sink — `cli`, `dashboard`, and `gateway` —
+  regardless of the user's `notify.sinks` config, because a dead opencode
+  server stalls every agent. The fanout is throttled to once per 10 min
+  while the server stays down; recovery resets the cooldown immediately.
+  The event is also appended to `events.log` with `kind=serve_down`,
+  `server_url`, and `attempts` metadata so the dashboard's events feed
+  and `hermes oco doctor` can surface it.
+
+### Changed
+
+- **`OpencodeClient.ensure_server` is now thread-safe.** A new
+  `_spawn_lock` (threading.Lock) guards the spawn region so concurrent
+  callers — the synchronous tool handlers running on the hermes main
+  thread and the asynchronous watchdog running via `asyncio.to_thread`
+  in the bg event-loop — can't both spawn duplicate `opencode serve`
+  processes against the same port. Before respawning, any tracked-but-
+  dead `Popen` is reaped via `_reap_tracked_spawn` (terminate → 5 s wait
+  → kill) so a crashed prior process can't linger as a zombie.
+
+### Internal
+
+- New constants in `event_loop.py`: `SERVE_WATCHDOG_INTERVAL_SEC`,
+  `SERVE_RESTART_MAX_ATTEMPTS`, `SERVE_RESTART_BACKOFF_BASE_SEC`,
+  `SERVE_DOWN_NOTIFY_COOLDOWN_SEC`, `SERVE_DOWN_NOTIFY_SINKS`.
+- New helpers: `_compute_serve_restart_delay(attempt, base)` (pure;
+  clamps non-positive attempts to 1), `_serve_watchdog_loop()` (arming +
+  detection + recovery + cooldown), `_try_restart_serve_with_backoff()`
+  (gated on `auto_spawn_server`), `_build_serve_down_notification()`
+  (returns `(title, body, meta)`; tested), and `_notify_serve_down()`.
+- `_supervisor` now spawns the watchdog alongside `_pruner_loop`,
+  `_heartbeat_loop`, and `_cleanup_loop`; all four are cancelled together
+  on `event_loop.stop()`.
+- 8 new tests in `test_pure_logic.py` cover the exponential delay
+  sequence (1, 2, 4, 8, 16 s), zero/negative-attempt clamping, custom
+  bases, the `MAX_ATTEMPTS == 5` invariant, the all-three-sinks fanout
+  target, and the `serve_down` notification body (server URL + attempt
+  count + metadata).
+
+## [0.12.0] - 2026-05-17
+
+### Added
+
+- **`CANCELLED` phase** (terminal) for tasks wound down without merging.
+  Distinct from `KILLED` (which erases the agent record). Cancelled rows
+  stay in `agents.json` for audit, render with the `🚫` glyph in
+  `/oc list` and the dashboard, carry an optional
+  `cancellation_reason`, and are archived after 12 h via the same path
+  as DONE.
+- **`oc_cancel` tool / `/oc cancel <agent_id> [reason ...]` slash /
+  `hermes oco cancel <agent_id> [--reason ...]` CLI.** Runs the full
+  cleanup sequence (delete opencode sessions, teardown reviewer
+  worktree, run cleanup skill, remove executor worktree) and flips
+  phase to `CANCELLED` with the supplied reason. Refuses on
+  already-terminal agents (`DONE`, `KILLED`, `CANCELLED`).
+- **Auto-cancel on upstream PR closed without merge.**
+  `event_loop._phase_pr_open` now branches on
+  `pr_state == "CLOSED"` in addition to `"MERGED"`. The agent
+  transitions to `CANCELLED` with `reason="PR #N closed without merge"`
+  and the cleanup helper runs end-to-end. Latency: at most
+  `PR_POLL_SEC = 5 min` between the user closing the PR on GitHub and
+  the local agent flipping; `oc_cancel` is the instant manual path.
+- **`cancelled` event** added to the default `notify.events.enabled`
+  set so users see cancellations on their DM channel.
+- **Auto-detected DM channel.** `Config.from_plugin_entry` now scans
+  `os.environ` for `<PLATFORM>_HOME_CHANNEL` in priority order
+  (`bluebubbles, telegram, discord, slack, teams, google_chat, feishu,
+  wecom, line, irc, mattermost, sms, qqbot`) and populates
+  `notify_gateway_platform` + `notify_gateway_chat_id` from the first
+  match — no plugin-entry config required. When a home channel is
+  detected, default `notify.sinks` flips from `["cli", "dashboard"]`
+  to `["gateway", "dashboard"]` so notifications land on the user's
+  DM by default. Explicit `notify.gateway.platform` or
+  `notify.sinks` in the plugin entry always win.
+- **`/oc doctor`** now prints `notify discovery` showing where the
+  gateway target came from (`explicit`, `env:<VAR>`, or absent when
+  unset).
+- **Dashboard** renders the `🚫` glyph for CANCELLED with a muted,
+  strikethrough phase label.
+
+### Changed
+
+- **`event_loop.TERMINAL_PHASES`** now includes `CANCELLED`.
+- **Pruner** archives both `DONE` and `CANCELLED` agents after 12 h.
+- **MERGED + CLOSED branches** in `_phase_pr_open` now share a single
+  `_cleanup_worktrees(agent, worktree)` helper. The MERGED branch
+  behaviour is unchanged.
+- **`oc_kill` tool description** clarified to direct users to
+  `oc_cancel` when they want to preserve the audit record.
+
+### Internal
+
+- `Agent.cancelled_at: float | None` + `Agent.cancellation_reason: str | None`
+  added to the dataclass (migration-tolerant — old rows load with defaults).
+- `Config.notify_discovery_source: str | None` records where the gateway
+  target was resolved from. Surfaced in `/oc doctor`.
+- New helper `config.discover_home_channel() -> tuple[platform, chat_id, source] | None`.
+- New helper `event_loop._cleanup_worktrees(agent, worktree)` — shared
+  by MERGED and CLOSED branches of `_phase_pr_open`.
+- New tool count: 21 (was 20).
+- 25 new tests across `test_pure_logic.py`, `test_registries.py`,
+  `test_commands.py`, `test_cli.py` cover: CANCELLED round-trip + the
+  pruner-archives-CANCELLED rule, `_phase_pr_open` branching on OPEN /
+  MERGED / CLOSED, home-channel auto-detection priority + explicit
+  override / sinks-override / discovery-source labelling, the
+  `/oc cancel` parser and slash handler, the `hermes oco cancel` CLI
+  including the already-DONE refusal. 175/175 green.
+
 ## [0.11.0] - 2026-05-17
 
 ### Added

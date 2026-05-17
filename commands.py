@@ -43,6 +43,7 @@ _PHASE_GLYPH = {
     "DONE": "✓",
     "FAILED": "✗",
     "KILLED": "🛑",
+    "CANCELLED": "🚫",
 }
 
 
@@ -73,6 +74,8 @@ def _fmt_list(agents: list["Agent"], now_ts: float | None = None, *, include_arc
 def _continuation_line(a: "Agent") -> str | None:
     if a.phase == "FAILED" and a.last_error:
         return f"error: {a.last_error[:160]}"
+    if a.phase == "CANCELLED" and a.cancellation_reason:
+        return f"cancelled: {a.cancellation_reason[:160]}"
     if a.phase == "DONE" and a.pr_url is None:
         return "merged"
     return None
@@ -205,6 +208,8 @@ def _fmt_doctor(runtime: "Runtime") -> str:
         target = f"{cfg.notify_gateway_platform or '?'}:{cfg.notify_gateway_chat_id or '?'}"
     lines.append(f"  notify sinks         · {sinks}")
     lines.append(f"  notify gateway       · {target}")
+    if cfg.notify_discovery_source:
+        lines.append(f"  notify discovery     · {cfg.notify_discovery_source}")
     lines.append(f"  notify events        · {','.join(sorted(cfg.notify_events))}")
     lines.append(
         f"  heartbeat            · enabled={cfg.heartbeat_enabled} "
@@ -273,6 +278,47 @@ def make_oc_attach(runtime: "Runtime") -> Callable[[str], str]:
     return handler
 
 
+def _parse_oc_cancel_args(raw_args: str) -> tuple[str | None, str | None, str | None]:
+    text = (raw_args or "").strip()
+    if not text:
+        return None, None, "usage: /oc cancel <agent_id> [reason ...]"
+    agent_id, _, rest = text.partition(" ")
+    reason = rest.strip() or None
+    return agent_id, reason, None
+
+
+def make_oc_cancel(runtime: "Runtime") -> Callable[[str], str]:
+    def handler(raw_args: str) -> str:
+        agent_id, reason, err = _parse_oc_cancel_args(raw_args)
+        if err:
+            return err
+        agent = runtime.agents.get(agent_id)
+        if agent is None:
+            return f"unknown agent: {agent_id}"
+        if agent.phase in {"DONE", "KILLED", "CANCELLED"}:
+            return f"cannot cancel {agent_id}: already {agent.phase}"
+        try:
+            from . import tools as tools_mod
+            spawn_fn = tools_mod.make_cancel(runtime)
+            result = asyncio.run(spawn_fn({"agent_id": agent_id, "reason": reason}))
+        except RuntimeError as e:
+            return f"cancel failed: {e}"
+        import json
+        try:
+            payload = json.loads(result)
+        except (ValueError, TypeError):
+            return result
+        if not payload.get("ok"):
+            return f"cancel failed: {payload.get('error', 'unknown')}"
+        data = payload.get("data") or {}
+        errors = data.get("errors") or []
+        out = [f"cancelled {agent_id}", f"reason: {data.get('reason')}"]
+        if errors:
+            out.append(f"non-fatal: {'; '.join(errors)}")
+        return "\n".join(out)
+    return handler
+
+
 def make_oc_questions(runtime: "Runtime") -> Callable[[str], str]:
     def handler(raw_args: str) -> str:
         questions, _permissions = event_loop.get_pending_snapshot()
@@ -305,6 +351,7 @@ _OC_HELP_TEXT = (
     "  /oc list [--archived]                 list tracked agents (one line per agent, status + age + pr_url); --archived also shows archived\n"
     "  /oc attach <agent_id> [--lines N]     print the last N (default 80) lines of an agent's transcript\n"
     "  /oc questions                         list pending opencode questions awaiting a human answer\n"
+    "  /oc cancel <agent_id> [reason ...]    wind down an agent without merging; keeps record as CANCELLED\n"
     "  /oc doctor                            plugin health report (versions, bg loop alive, deps, state files)\n"
     "  /oc help                              show this help\n"
     "\n"
@@ -317,11 +364,13 @@ def make_oc_dispatcher(runtime: "Runtime") -> Callable[[str], str]:
     attach_fn = make_oc_attach(runtime)
     questions_fn = make_oc_questions(runtime)
     doctor_fn = make_oc_doctor(runtime)
+    cancel_fn = make_oc_cancel(runtime)
     subcommands = {
         "list": list_fn,
         "attach": attach_fn,
         "questions": questions_fn,
         "doctor": doctor_fn,
+        "cancel": cancel_fn,
     }
 
     def handler(raw_args: str) -> str:

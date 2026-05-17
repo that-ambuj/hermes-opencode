@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("hermes_opencode.event_loop")
 
-TERMINAL_PHASES = {"DONE", "KILLED", "FAILED"}
+TERMINAL_PHASES = {"DONE", "KILLED", "FAILED", "CANCELLED"}
 IDLE_DEBOUNCE_SEC = 30.0
 PR_POLL_SEC = 300.0
 PRUNE_INTERVAL_SEC = 60.0
@@ -33,6 +33,11 @@ HISTORY_RETAIN_DAYS = 30.0
 PR_OPEN_TIMEOUT_SEC = 900.0
 PR_OPENED_RE_PATTERN = r"PR_OPENED:\s*(https?://[^\s]+/pull/\d+)"
 PR_URL_FALLBACK_RE_PATTERN = r"https?://github\.com/[^\s]+/pull/(\d+)"
+SERVE_WATCHDOG_INTERVAL_SEC = 15.0
+SERVE_RESTART_MAX_ATTEMPTS = 5
+SERVE_RESTART_BACKOFF_BASE_SEC = 1.0
+SERVE_DOWN_NOTIFY_COOLDOWN_SEC = 600.0
+SERVE_DOWN_NOTIFY_SINKS = ("cli", "dashboard", "gateway")
 
 _state_lock = threading.Lock()
 _thread: threading.Thread | None = None
@@ -49,6 +54,9 @@ _notified_questions: dict[str, set[str]] = {}
 _notified_phases: dict[str, set[str]] = {}
 _notify_dedup_lock = threading.Lock()
 
+_serve_seen_alive: bool = False
+_serve_down_notified_at: float = 0.0
+
 
 _EVENT_GLYPH = {
     "pr_opened": "🔗",
@@ -56,6 +64,7 @@ _EVENT_GLYPH = {
     "failed": "✗",
     "awaiting_human": "⏸",
     "review_started": "🔎",
+    "cancelled": "🚫",
 }
 
 
@@ -111,6 +120,9 @@ def _default_event_body(agent: "Agent", kind: str) -> str:
         return f"Agent paused, awaiting human input. Reply in chat to forward."
     if kind == "review_started":
         return f"Executor finished its turn. Reviewer session staged on `{agent.branch}` for a code-review pass."
+    if kind == "cancelled":
+        reason = agent.cancellation_reason or "(no reason recorded)"
+        return f"Agent cancelled. Reason: {reason}. Worktree cleaned up."
     return f"{kind} for {agent.agent_id}"
 
 
@@ -303,6 +315,7 @@ async def _supervisor() -> None:
     pruner = asyncio.create_task(_pruner_loop())
     heartbeat = asyncio.create_task(_heartbeat_loop())
     cleanup = asyncio.create_task(_cleanup_loop())
+    watchdog = asyncio.create_task(_serve_watchdog_loop())
     try:
         while not _stop_flag.is_set():
             if _runtime is not None:
@@ -311,7 +324,7 @@ async def _supervisor() -> None:
                         await _ensure_agent_task_async(agent.agent_id)
             await asyncio.sleep(2.0)
     finally:
-        for t in (pruner, heartbeat, cleanup):
+        for t in (pruner, heartbeat, cleanup, watchdog):
             t.cancel()
             try:
                 await t
@@ -424,6 +437,135 @@ def _remove_orphan_worktrees() -> int:
     return removed
 
 
+def _compute_serve_restart_delay(attempt: int, base: float = SERVE_RESTART_BACKOFF_BASE_SEC) -> float:
+    if attempt < 1:
+        attempt = 1
+    return base * (2 ** (attempt - 1))
+
+
+async def _serve_watchdog_loop() -> None:
+    global _serve_seen_alive, _serve_down_notified_at
+    while not _stop_flag.is_set():
+        if _runtime is None:
+            await asyncio.sleep(SERVE_WATCHDOG_INTERVAL_SEC)
+            continue
+        try:
+            alive = await _runtime.client.ping()
+        except Exception as e:
+            logger.debug("serve watchdog ping errored: %s", e)
+            alive = False
+        if alive:
+            if not _serve_seen_alive:
+                logger.info("opencode serve detected alive at %s; watchdog armed", _runtime.config.server_url)
+            _serve_seen_alive = True
+            _serve_down_notified_at = 0.0
+            await asyncio.sleep(SERVE_WATCHDOG_INTERVAL_SEC)
+            continue
+        if not _serve_seen_alive:
+            await asyncio.sleep(SERVE_WATCHDOG_INTERVAL_SEC)
+            continue
+        logger.warning(
+            "opencode serve at %s appears down; attempting exponential restart (max %d)",
+            _runtime.config.server_url, SERVE_RESTART_MAX_ATTEMPTS,
+        )
+        recovered = await _try_restart_serve_with_backoff()
+        if recovered:
+            logger.info("opencode serve recovered after watchdog restart")
+            _serve_down_notified_at = 0.0
+        else:
+            now = time.time()
+            if now - _serve_down_notified_at >= SERVE_DOWN_NOTIFY_COOLDOWN_SEC:
+                _notify_serve_down()
+                _serve_down_notified_at = now
+        await asyncio.sleep(SERVE_WATCHDOG_INTERVAL_SEC)
+
+
+async def _try_restart_serve_with_backoff() -> bool:
+    if _runtime is None:
+        return False
+    if not _runtime.config.auto_spawn_server:
+        logger.warning("serve watchdog: auto_spawn_server disabled; skipping restart attempts")
+        return False
+    for attempt in range(1, SERVE_RESTART_MAX_ATTEMPTS + 1):
+        delay = _compute_serve_restart_delay(attempt)
+        logger.info(
+            "serve restart attempt %d/%d: backing off %.1fs",
+            attempt, SERVE_RESTART_MAX_ATTEMPTS, delay,
+        )
+        await asyncio.sleep(delay)
+        if _stop_flag.is_set():
+            return False
+        try:
+            await asyncio.to_thread(_runtime.client.ensure_server)
+        except OpencodeError as e:
+            logger.warning("serve restart attempt %d: ensure_server failed: %s", attempt, e)
+            continue
+        except Exception as e:
+            logger.exception("serve restart attempt %d crashed: %s", attempt, e)
+            continue
+        try:
+            if await _runtime.client.ping():
+                logger.info("serve restart attempt %d succeeded", attempt)
+                return True
+        except Exception as e:
+            logger.debug("serve restart attempt %d post-spawn ping errored: %s", attempt, e)
+        logger.warning("serve restart attempt %d: spawn returned but ping failed", attempt)
+    return False
+
+
+def _build_serve_down_notification() -> tuple[str, str, dict]:
+    assert _runtime is not None
+    title = "✗ opencode serve unreachable"
+    body = (
+        f"`opencode serve` at {_runtime.config.server_url} is down and "
+        f"{SERVE_RESTART_MAX_ATTEMPTS} exponential restart attempts failed. "
+        f"Agents will stall until the server is restored. Check the host, "
+        f"or run `hermes oco doctor` for diagnostics."
+    )
+    meta = {
+        "kind": "serve_down",
+        "server_url": _runtime.config.server_url,
+        "attempts": SERVE_RESTART_MAX_ATTEMPTS,
+        "auto_spawn_server": _runtime.config.auto_spawn_server,
+    }
+    return title, body, meta
+
+
+def _notify_serve_down() -> None:
+    if _runtime is None:
+        return
+    from . import notify as notify_mod
+    title, body, meta = _build_serve_down_notification()
+    try:
+        _runtime.config.events_log.parent.mkdir(parents=True, exist_ok=True)
+        import json
+        line = json.dumps({
+            "ts": time.time(), "kind": "serve_down", "agent_id": None,
+            "title": title, "body": body, "meta": meta,
+        }, default=str)
+        with _runtime.config.events_log.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError as e:
+        logger.warning("events.log write failed during serve_down notify: %s", e)
+    try:
+        results = notify_mod.fanout(
+            sinks=list(SERVE_DOWN_NOTIFY_SINKS),
+            title=title,
+            body=body,
+            meta=meta,
+            dashboard_path=_runtime.config.notifications_file,
+            gateway_platform=_runtime.config.notify_gateway_platform,
+            gateway_chat_id=_runtime.config.notify_gateway_chat_id,
+        )
+        logger.error(
+            "serve_down notified on sinks=%s results=%s",
+            list(SERVE_DOWN_NOTIFY_SINKS),
+            [(r.sink, r.ok, r.detail) for r in results],
+        )
+    except Exception as e:
+        logger.exception("serve_down fanout failed: %s", e)
+
+
 async def _pruner_loop() -> None:
     while not _stop_flag.is_set():
         if _runtime is None:
@@ -432,15 +574,13 @@ async def _pruner_loop() -> None:
         try:
             now = time.time()
             for agent in list(_runtime.agents.list()):
-                if (
-                    agent.phase == "DONE"
-                    and not agent.archived
-                    and agent.done_at
-                    and (now - agent.done_at) > ARCHIVE_AFTER_SEC
-                ):
+                if agent.archived:
+                    continue
+                done_ts = agent.done_at if agent.phase == "DONE" else (agent.cancelled_at if agent.phase == "CANCELLED" else None)
+                if done_ts and (now - done_ts) > ARCHIVE_AFTER_SEC:
                     _archive_done(agent)
                     _runtime.agents.update(agent.agent_id, archived=True, archived_at=now)
-                    logger.info("archived DONE agent %s after %.0fs", agent.agent_id, now - agent.done_at)
+                    logger.info("archived %s agent %s after %.0fs", agent.phase, agent.agent_id, now - done_ts)
         except Exception as e:
             logger.warning("pruner tick failed: %s", e)
         await asyncio.sleep(PRUNE_INTERVAL_SEC)
@@ -732,18 +872,41 @@ async def _phase_pr_open(agent: Agent) -> None:
             pr_merged_at=info.merged_at, done_at=time.time(),
         )
         _maybe_notify_phase(refreshed, "done")
-        project = _runtime.projects.get(agent.project_label)
-        if project:
-            from . import bootstrap as bootstrap_mod
-            try:
-                cleanup_result = await bootstrap_mod.run_project_cleanup(_runtime.client, project, worktree)
-                if not cleanup_result.ok:
-                    logger.warning("cleanup skill failed for %s: %s", agent.agent_id, cleanup_result.detail)
-            except Exception as e:
-                logger.warning("cleanup skill exception for %s: %s", agent.agent_id, e)
-            wt_mod.remove_worktree(Path(project.repo_path), worktree, force=True)
+        await _cleanup_worktrees(refreshed, worktree)
+        return
+    if info.state == "CLOSED":
+        reason = f"PR #{agent.pr_number} closed without merge"
+        refreshed = _runtime.agents.update(
+            agent.agent_id, phase="CANCELLED",
+            cancelled_at=time.time(), cancellation_reason=reason,
+        )
+        _maybe_notify_phase(refreshed, "cancelled")
+        await _cleanup_worktrees(refreshed, worktree)
         return
     await asyncio.sleep(PR_POLL_SEC)
+
+
+async def _cleanup_worktrees(agent: Agent, worktree: Path) -> None:
+    assert _runtime is not None
+    project = _runtime.projects.get(agent.project_label)
+    if not project:
+        return
+    from . import bootstrap as bootstrap_mod
+    if agent.reviewer_worktree_path:
+        try:
+            reviewer_mod.teardown_reviewer_worktree(project, worktree)
+        except Exception as e:
+            logger.warning("reviewer worktree teardown failed for %s: %s", agent.agent_id, e)
+    try:
+        cleanup_result = await bootstrap_mod.run_project_cleanup(_runtime.client, project, worktree)
+        if not cleanup_result.ok:
+            logger.warning("cleanup skill failed for %s: %s", agent.agent_id, cleanup_result.detail)
+    except Exception as e:
+        logger.warning("cleanup skill exception for %s: %s", agent.agent_id, e)
+    try:
+        wt_mod.remove_worktree(Path(project.repo_path), worktree, force=True)
+    except Exception as e:
+        logger.warning("remove_worktree failed for %s: %s", agent.agent_id, e)
 
 
 _PHASE_HANDLERS = {

@@ -126,6 +126,62 @@ If you add new phases or shortcuts that bypass `_phase_committing`,
 either route them through this same executor-driven path or document
 why the slug-based fallback is acceptable for that path.
 
+## CANCELLED vs KILLED (LOAD-BEARING)
+
+Two terminal phases mean different things:
+
+| Phase | Record in `agents.json` | When to use |
+|---|---|---|
+| `CANCELLED` | **kept** (carries `cancellation_reason`, `cancelled_at`); archived after 12 h like DONE | task abandoned without merging — manual via `oc_cancel` / `/oc cancel` / `hermes oco cancel`, OR automatic via `_phase_pr_open` when GitHub reports `state == "CLOSED"` |
+| `KILLED` | **removed** | broken / wrong agent you want erased entirely |
+
+`oc_cancel` runs the full cleanup sequence (delete sessions, teardown
+reviewer worktree, run cleanup skill, remove executor worktree). It
+refuses on already-terminal agents (`DONE`, `KILLED`, `CANCELLED`).
+
+Auto-cancel on PR closed runs through the same shared
+`event_loop._cleanup_worktrees(agent, worktree)` helper that the
+MERGED → DONE branch uses. If you add new terminal transitions, route
+them through that helper so they get sister teardown + cleanup skill +
+worktree removal in the same order.
+
+`cancelled` is in the default `notify.events.enabled` set; the
+`_default_event_body` renders `Agent cancelled. Reason: ...`. Don't add
+a new terminal phase without a notify event — silent terminal
+transitions are confusing.
+
+## Auto-detected DM channel (LOAD-BEARING)
+
+`Config.from_plugin_entry` scans `os.environ` for
+`<PLATFORM>_HOME_CHANNEL` in this priority order
+(`config.HOME_CHANNEL_PLATFORMS`):
+
+`bluebubbles, telegram, discord, slack, teams, google_chat, feishu,
+wecom, line, irc, mattermost, sms, qqbot`
+
+The first match populates `notify_gateway_platform` +
+`notify_gateway_chat_id`. When both are set (whether via the env
+auto-detect path OR explicit plugin entry), the default `notify.sinks`
+becomes `["gateway", "dashboard"]` instead of `["cli", "dashboard"]` —
+so a user with a home channel configured gets DM notifications without
+touching `plugins.entries.hermes-opencode`.
+
+Override precedence:
+1. Explicit `plugins.entries.hermes-opencode.notify.sinks` always wins.
+2. Explicit `notify.gateway.platform` + `notify.gateway.chat_id`
+   overrides env auto-detect.
+3. When `platform` is set but `chat_id` isn't, we still read
+   `<PLATFORM>_HOME_CHANNEL` for the chat id — preserves the v0.11.0
+   behaviour.
+
+`Config.notify_discovery_source` records where the gateway target came
+from (`explicit`, `env:<VAR>`, or `None`). `/oc doctor` surfaces it.
+
+If you add a new platform to `HOME_CHANNEL_PLATFORMS`, put it where
+its priority sits (more common → earlier). Don't reorder existing
+entries without a CHANGELOG note — users may have multiple home
+channels set and rely on the priority order.
+
 ## Archived agents (LOAD-BEARING)
 
 `Agent` carries `archived: bool` and `archived_at: float | None`. The

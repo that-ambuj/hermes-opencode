@@ -10,6 +10,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+from . import bootstrap as bootstrap_mod
 from . import commands as commands_mod
 from . import event_loop
 from . import reviewer as reviewer_mod
@@ -64,6 +65,11 @@ def setup(subparser: argparse.ArgumentParser) -> None:
     kill_p.add_argument("--force", action="store_true", help="Skip the interactive confirmation.")
     kill_p.add_argument("--keep-worktree", dest="keep_worktree", action="store_true",
                         help="Leave the git worktree on disk after killing.")
+
+    cancel_p = subs.add_parser("cancel", help="Wind down an agent without merging (keeps record as CANCELLED).")
+    cancel_p.add_argument("agent_id")
+    cancel_p.add_argument("--reason", default=None, help="Free-form reason recorded on the agent.")
+    cancel_p.add_argument("--force", action="store_true", help="Skip the interactive confirmation.")
 
     subs.add_parser("projects", help="List registered projects.")
 
@@ -169,6 +175,32 @@ def cmd_kill(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_cancel(args: argparse.Namespace) -> int:
+    ctx = build_context()
+    agent_id = args.agent_id
+    agent = ctx.agents.get(agent_id)
+    if agent is None:
+        print(f"unknown agent: {agent_id}", file=sys.stderr)
+        return 1
+    if agent.phase in {"DONE", "KILLED", "CANCELLED"}:
+        print(f"cannot cancel {agent_id}: already {agent.phase}", file=sys.stderr)
+        return 1
+    if not args.force:
+        try:
+            ans = input(f"cancel agent {agent_id!r} and remove worktree? [y/N]: ").strip().lower()
+        except EOFError:
+            ans = ""
+        if ans not in ("y", "yes"):
+            print("aborted")
+            return 1
+    errors = cancel_agent(ctx, agent_id, reason=args.reason)
+    if errors:
+        for line in errors:
+            print(f"warn: {line}", file=sys.stderr)
+    print(f"cancelled {agent_id} (reason={args.reason or 'manually cancelled'})")
+    return 0
+
+
 def cmd_projects(args: argparse.Namespace) -> int:
     ctx = build_context()
     projects = ctx.projects.list()
@@ -230,6 +262,61 @@ def kill_agent(ctx: CliContext, agent_id: str, *, remove_worktree: bool) -> list
     return errors
 
 
+def cancel_agent(ctx: CliContext, agent_id: str, *, reason: str | None = None) -> list[str]:
+    import time
+    errors: list[str] = []
+    agent = ctx.agents.get(agent_id)
+    if agent is None:
+        return [f"unknown agent: {agent_id}"]
+    worktree_path = Path(agent.worktree_path)
+    try:
+        asyncio.run(ctx.client.delete_session(agent.session_id, worktree_path))
+    except OpencodeError as e:
+        errors.append(f"delete_session: {e}")
+    except Exception as e:
+        errors.append(f"delete_session: {type(e).__name__}: {e}")
+    if agent.reviewer_session_id and agent.reviewer_worktree_path:
+        try:
+            asyncio.run(ctx.client.delete_session(
+                agent.reviewer_session_id, Path(agent.reviewer_worktree_path),
+            ))
+        except OpencodeError as e:
+            errors.append(f"delete_reviewer_session: {e}")
+        except Exception as e:
+            errors.append(f"delete_reviewer_session: {type(e).__name__}: {e}")
+    project = ctx.projects.get(agent.project_label)
+    if project and agent.reviewer_worktree_path:
+        try:
+            reviewer_mod.teardown_reviewer_worktree(project, worktree_path)
+        except Exception as e:
+            errors.append(f"teardown_reviewer_worktree: {e}")
+    if project:
+        try:
+            cleanup_result = asyncio.run(bootstrap_mod.run_project_cleanup(ctx.client, project, worktree_path))
+            if not cleanup_result.ok:
+                errors.append(f"cleanup_skill: {cleanup_result.detail}")
+        except Exception as e:
+            errors.append(f"cleanup_skill exception: {e}")
+        try:
+            wt_mod.remove_worktree(Path(project.repo_path), worktree_path, force=True)
+        except Exception as e:
+            errors.append(f"remove_worktree: {e}")
+    elif worktree_path.exists():
+        import shutil as _shutil
+        _shutil.rmtree(worktree_path, ignore_errors=True)
+    try:
+        ctx.agents.update(
+            agent_id,
+            phase="CANCELLED",
+            cancelled_at=time.time(),
+            cancellation_reason=reason or "manually cancelled",
+        )
+    except Exception as e:
+        errors.append(f"update: {e}")
+    event_loop._drop_snapshots(agent_id)
+    return errors
+
+
 def _print_agent_summary(payload: dict[str, Any]) -> None:
     keys = [
         "agent_id", "project_label", "phase", "branch", "session_id",
@@ -249,6 +336,7 @@ _DISPATCH = {
     "status": cmd_status,
     "attach": cmd_attach,
     "kill": cmd_kill,
+    "cancel": cmd_cancel,
     "projects": cmd_projects,
 }
 

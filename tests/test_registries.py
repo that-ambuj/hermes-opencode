@@ -167,6 +167,26 @@ class TestAgentStore:
         assert updated.archived is True
         assert updated.archived_at == 1234.5
 
+    def test_cancelled_phase_round_trip(self, tmp_path: Path):
+        store = state_mod.AgentStore(tmp_path / "agents.json")
+        store.add(self._agent())
+        updated = store.update(
+            "ma/test",
+            phase="CANCELLED",
+            cancelled_at=12345.6,
+            cancellation_reason="PR #5 closed",
+        )
+        assert updated.phase == "CANCELLED"
+        assert updated.cancelled_at == 12345.6
+        assert updated.cancellation_reason == "PR #5 closed"
+
+    def test_cancellation_defaults_to_none_for_new_agent(self, tmp_path: Path):
+        store = state_mod.AgentStore(tmp_path / "agents.json")
+        store.add(self._agent())
+        got = store.get("ma/test")
+        assert got.cancelled_at is None
+        assert got.cancellation_reason is None
+
     def test_old_rows_without_archived_field_load_with_default(self, tmp_path: Path):
         import json
         path = tmp_path / "agents.json"

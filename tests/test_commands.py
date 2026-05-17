@@ -348,3 +348,35 @@ class TestOcDispatcher:
         rt = self._stub_runtime(tmp_path)
         out = commands_mod.make_oc_dispatcher(rt)("LIST")
         assert "dp/refunds" in out
+
+    def test_help_text_lists_cancel(self):
+        assert "/oc cancel" in commands_mod._OC_HELP_TEXT
+
+
+class TestParseOcCancelArgs:
+    def test_no_args_returns_usage(self):
+        agent_id, reason, err = commands_mod._parse_oc_cancel_args("")
+        assert agent_id is None
+        assert reason is None
+        assert err and "usage" in err
+
+    def test_agent_id_only(self):
+        agent_id, reason, err = commands_mod._parse_oc_cancel_args("dp/refunds")
+        assert agent_id == "dp/refunds"
+        assert reason is None
+        assert err is None
+
+    def test_agent_id_with_reason(self):
+        agent_id, reason, err = commands_mod._parse_oc_cancel_args("dp/refunds PR was closed without merging")
+        assert agent_id == "dp/refunds"
+        assert reason == "PR was closed without merging"
+        assert err is None
+
+
+class TestPhaseGlyphCancelled:
+    def test_cancelled_glyph_in_list(self):
+        a = _agent(agent_id="ma/c", phase="CANCELLED", cancellation_reason="PR #1 closed without merge")
+        body = commands_mod._fmt_list([a], include_archived=True)
+        assert "🚫" in body
+        assert "CANCELLED" in body
+        assert "cancelled: PR #1 closed without merge" in body

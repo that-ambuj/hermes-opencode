@@ -187,13 +187,28 @@ WAIT_SCHEMA: dict[str, Any] = {
 
 KILL_SCHEMA: dict[str, Any] = {
     "name": "oc_kill",
-    "description": "Abort an agent: delete its opencode session(s) (executor and reviewer), optionally remove its git worktree (default true), and drop it from the agent registry.",
+    "description": "Abort an agent and erase it from the registry: delete its opencode session(s) (executor and reviewer), optionally remove its git worktree (default true), drop the agent record entirely. Use for broken/wrong agents you want gone. For 'task abandoned without merging' (e.g. PR closed manually), prefer oc_cancel which keeps the record for audit.",
     "parameters": {
         "type": "object",
         "additionalProperties": False,
         "properties": {
             "agent_id": {"type": "string"},
             "remove_worktree": {"type": "boolean", "default": True},
+        },
+        "required": ["agent_id"],
+    },
+}
+
+
+CANCEL_SCHEMA: dict[str, Any] = {
+    "name": "oc_cancel",
+    "description": "Wind down a task without merging: runs the cleanup skill, removes the executor + reviewer worktrees, deletes opencode sessions, and sets phase=CANCELLED with an optional reason. Unlike oc_kill, the agent record IS preserved (for audit) and archived after 12h like DONE. Auto-fires when the upstream PR is closed without merging. Refuses on already-terminal agents (DONE / KILLED / CANCELLED).",
+    "parameters": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "agent_id": {"type": "string"},
+            "reason": {"type": "string", "description": "Optional human-readable reason recorded on the agent."},
         },
         "required": ["agent_id"],
     },
@@ -532,6 +547,63 @@ def make_kill(rt: Runtime) -> Callable[..., Awaitable[str]]:
         event_loop.clear_text_buffer(agent_id)
         rt.agents.remove(agent_id)
         return _ok({"agent_id": agent_id, "killed": True, "worktree_removed": remove_wt, "errors": errors})
+    return handler
+
+
+def make_cancel(rt: Runtime) -> Callable[..., Awaitable[str]]:
+    async def handler(args: dict, **_: Any) -> str:
+        agent_id = args.get("agent_id")
+        if not agent_id:
+            return _err("agent_id required")
+        agent = rt.agents.get(agent_id)
+        if not agent:
+            return _err(f"unknown agent: {agent_id}")
+        if agent.phase in {"DONE", "KILLED", "CANCELLED"}:
+            return _err(f"cannot cancel from phase {agent.phase}")
+        reason = args.get("reason") or "manually cancelled"
+        worktree_path = Path(agent.worktree_path)
+        errors: list[str] = []
+        try:
+            await rt.client.delete_session(agent.session_id, worktree_path)
+        except OpencodeError as e:
+            errors.append(f"delete_session: {e}")
+        except Exception as e:
+            errors.append(f"delete_session: {type(e).__name__}: {e}")
+        if agent.reviewer_session_id and agent.reviewer_worktree_path:
+            try:
+                await rt.client.delete_session(agent.reviewer_session_id, Path(agent.reviewer_worktree_path))
+            except OpencodeError as e:
+                errors.append(f"delete_reviewer_session: {e}")
+            except Exception as e:
+                errors.append(f"delete_reviewer_session: {type(e).__name__}: {e}")
+        project = rt.projects.get(agent.project_label)
+        if project and agent.reviewer_worktree_path:
+            try:
+                reviewer_mod.teardown_reviewer_worktree(project, worktree_path)
+            except Exception as e:
+                errors.append(f"teardown_reviewer_worktree: {e}")
+        if project:
+            try:
+                cleanup_result = await bootstrap_mod.run_project_cleanup(rt.client, project, worktree_path)
+                if not cleanup_result.ok:
+                    errors.append(f"cleanup_skill: {cleanup_result.detail}")
+            except Exception as e:
+                errors.append(f"cleanup_skill exception: {e}")
+            try:
+                wt.remove_worktree(Path(project.repo_path), worktree_path, force=True)
+            except Exception as e:
+                errors.append(f"remove_worktree: {e}")
+        elif worktree_path.exists():
+            shutil.rmtree(worktree_path, ignore_errors=True)
+        rt.agents.update(
+            agent_id,
+            phase="CANCELLED",
+            cancelled_at=time.time(),
+            cancellation_reason=reason,
+        )
+        event_loop._drop_snapshots(agent_id)
+        event_loop.clear_text_buffer(agent_id)
+        return _ok({"agent_id": agent_id, "phase": "CANCELLED", "reason": reason, "errors": errors})
     return handler
 
 
@@ -936,6 +1008,7 @@ def all_tool_specs(rt: Runtime) -> list[dict[str, Any]]:
         {"name": "oc_status", "toolset": "hermes_opencode", "schema": STATUS_SCHEMA, "handler": make_status(rt), "is_async": True, "emoji": "📊"},
         {"name": "oc_wait", "toolset": "hermes_opencode", "schema": WAIT_SCHEMA, "handler": make_wait(rt), "is_async": True, "emoji": "⏳"},
         {"name": "oc_kill", "toolset": "hermes_opencode", "schema": KILL_SCHEMA, "handler": make_kill(rt), "is_async": True, "emoji": "🛑"},
+        {"name": "oc_cancel", "toolset": "hermes_opencode", "schema": CANCEL_SCHEMA, "handler": make_cancel(rt), "is_async": True, "emoji": "🚫"},
         {"name": "oc_output", "toolset": "hermes_opencode", "schema": OUTPUT_SCHEMA, "handler": make_output(rt), "is_async": True, "emoji": "📤"},
         {"name": "oc_answer", "toolset": "hermes_opencode", "schema": ANSWER_SCHEMA, "handler": make_answer(rt), "is_async": True, "emoji": "✉️"},
         {"name": "oc_review_now", "toolset": "hermes_opencode", "schema": REVIEW_NOW_SCHEMA, "handler": make_review_now(rt), "is_async": True, "emoji": "🔎"},

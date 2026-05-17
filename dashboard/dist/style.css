@@ -77,3 +77,4 @@
 .oco-archive-toggle { display: inline-flex; align-items: center; gap: 0.35rem; font-size: 0.8rem; color: var(--color-muted-foreground); cursor: pointer; user-select: none; }
 .oco-archive-toggle input { accent-color: var(--color-primary); cursor: pointer; }
 .oco-archived-badge { margin-left: 0.4rem; padding: 0.05rem 0.4rem; border-radius: 4px; background: color-mix(in srgb, var(--color-muted-foreground) 25%, transparent); color: var(--color-muted-foreground); font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.05em; }
+.oco-phase-CANCELLED .oco-phase-label { color: var(--color-muted-foreground); text-decoration: line-through; }

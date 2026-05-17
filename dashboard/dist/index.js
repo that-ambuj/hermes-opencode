@@ -19,7 +19,8 @@
       PR_OPEN: "\u{1F517}",
       DONE: "\u2713",
       FAILED: "\u2717",
-      KILLED: "\u{1F6D1}"
+      KILLED: "\u{1F6D1}",
+      CANCELLED: "\u{1F6AB}"
     };
     async function api(path, options) {
       const token = window.__HERMES_SESSION_TOKEN__ || "";

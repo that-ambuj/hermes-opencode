@@ -24,6 +24,7 @@
     DONE: "✓",
     FAILED: "✗",
     KILLED: "🛑",
+    CANCELLED: "🚫",
   };
 
   async function api(path, options) {

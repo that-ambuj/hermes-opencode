@@ -7,6 +7,31 @@ from pathlib import Path
 PLUGIN_NAME = "hermes-opencode"
 DEFAULT_SERVER_URL = "http://127.0.0.1:4096"
 
+HOME_CHANNEL_PLATFORMS = (
+    "bluebubbles",
+    "telegram",
+    "discord",
+    "slack",
+    "teams",
+    "google_chat",
+    "feishu",
+    "wecom",
+    "line",
+    "irc",
+    "mattermost",
+    "sms",
+    "qqbot",
+)
+
+
+def discover_home_channel() -> tuple[str, str, str] | None:
+    for platform in HOME_CHANNEL_PLATFORMS:
+        env_var = f"{platform.upper()}_HOME_CHANNEL"
+        chat_id = os.environ.get(env_var)
+        if chat_id:
+            return platform, chat_id, f"env:{env_var}"
+    return None
+
 
 def _resolve_hermes_home() -> Path:
     try:
@@ -57,7 +82,8 @@ class Config:
     notify_sinks: list[str] = field(default_factory=lambda: ["cli", "dashboard"])
     notify_gateway_platform: str | None = None
     notify_gateway_chat_id: str | None = None
-    notify_events: set[str] = field(default_factory=lambda: {"pr_opened", "done", "failed", "awaiting_human", "review_started"})
+    notify_discovery_source: str | None = None
+    notify_events: set[str] = field(default_factory=lambda: {"pr_opened", "done", "failed", "awaiting_human", "review_started", "cancelled"})
     events_log: Path = field(default_factory=lambda: plugin_state_dir() / "events.log")
     heartbeat_enabled: bool = True
     heartbeat_timezone: str | None = None
@@ -76,17 +102,38 @@ class Config:
         events = (notify.get("events") or {})
         heartbeat = entry.get("heartbeat") or {}
         day_window = heartbeat.get("unconditional_hours", [9, 23])
-        default_events = {"pr_opened", "done", "failed", "awaiting_human", "review_started"}
+        default_events = {"pr_opened", "done", "failed", "awaiting_human", "review_started", "cancelled"}
+
+        platform = gateway.get("platform")
+        explicit_chat_id = gateway.get("chat_id")
+        chat_id: str | None = None
+        discovery_source: str | None = None
+        if platform:
+            chat_id = explicit_chat_id or os.environ.get(f"{platform.upper()}_HOME_CHANNEL") or None
+            if chat_id:
+                discovery_source = "explicit" if explicit_chat_id else f"env:{platform.upper()}_HOME_CHANNEL"
+        else:
+            detected = discover_home_channel()
+            if detected is not None:
+                platform, chat_id, discovery_source = detected
+
+        explicit_sinks = notify.get("sinks")
+        if explicit_sinks is not None:
+            sinks = list(explicit_sinks)
+        elif platform and chat_id:
+            sinks = ["gateway", "dashboard"]
+        else:
+            sinks = ["cli", "dashboard"]
+
         return cls(
             server_url=server.get("url", DEFAULT_SERVER_URL),
             server_password=server.get("password") or os.environ.get("OPENCODE_SERVER_PASSWORD") or None,
             default_base_branch=pr.get("base_branch", "main"),
             auto_spawn_server=bool(entry.get("auto_spawn_server", True)),
-            notify_sinks=list(notify.get("sinks", ["cli", "dashboard"])),
-            notify_gateway_platform=gateway.get("platform"),
-            notify_gateway_chat_id=gateway.get("chat_id") or os.environ.get(
-                f"{(gateway.get('platform') or '').upper()}_HOME_CHANNEL"
-            ) or None,
+            notify_sinks=sinks,
+            notify_gateway_platform=platform,
+            notify_gateway_chat_id=chat_id,
+            notify_discovery_source=discovery_source,
             notify_events=set(events.get("enabled", default_events)),
             heartbeat_enabled=bool(heartbeat.get("enabled", True)),
             heartbeat_timezone=heartbeat.get("timezone"),
