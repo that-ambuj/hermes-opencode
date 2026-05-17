@@ -53,6 +53,9 @@ class Agent:
     last_progress_at: float = field(default_factory=time.time)
     last_awaiting_notify_at: float | None = None
     last_classifier_verdict: dict | None = None
+    last_tick_error: str | None = None
+    last_tick_error_at: float | None = None
+    consecutive_tick_failures: int = 0
 
 
 class AgentExists(ValueError):
@@ -125,8 +128,7 @@ class AgentStore:
             if isinstance(phase, str) and phase not in PHASES:
                 raise ValueError(f"invalid phase: {phase}")
             for k, v in fields_to_set.items():
-                if v is not None:
-                    d[agent_id][k] = v
+                d[agent_id][k] = v
             d[agent_id]["last_activity_at"] = time.time()
             self._write(d)
             return Agent(**d[agent_id])

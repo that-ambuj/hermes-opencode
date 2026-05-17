@@ -5,6 +5,83 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.1] - 2026-05-17
+
+### Fixed
+
+- **Event loop now actually recovers from opencode connection errors.**
+  Pre-existing bug uncovered when opencode-serve crashed mid-session: every
+  transport method (`wait_idle`, `list_questions`, `list_permissions`,
+  `get_messages`, `create_session`, `send_message`, `send_message_async`,
+  `delete_session`, `reply_question`, `reject_question`, `reply_permission`)
+  could raise raw `httpx.ConnectError` / `httpx.HTTPError`, but every phase
+  handler only caught `OpencodeError`. The raw httpx error escaped, hit
+  `_agent_loop`'s generic `except Exception`, dumped a 30-line traceback to
+  `errors.log` every minute, and the agent just sat there in
+  `EXECUTING`/`EXECUTOR_ADDRESSING` forever with the user no wiser. Fix:
+  new `_wrap_transport_errors` decorator wraps every transport method and
+  reraises `httpx.HTTPError` (covers `ConnectError`, `ConnectTimeout`,
+  `ReadTimeout`, `RemoteProtocolError`, `WriteError`, `NetworkError`, etc.)
+  as `OpencodeError` with the original exception preserved as `__cause__`.
+  Phase handlers' existing `except OpencodeError` branches now actually
+  catch the failure and back off gracefully.
+
+- **Watchdog cold-start gate removed.** Previously
+  `_serve_watchdog_loop` required `_serve_seen_alive == True` ONCE in the
+  current process lifetime before it would ever attempt a restart. If
+  hermes was restarted while opencode-serve was already dead — exactly
+  the scenario seen in production at 20:25 today — the watchdog's first
+  ping failed, `_serve_seen_alive` stayed `False`, and it sat in the
+  watch-only branch forever. Two stuck agents and zero restart attempts
+  in the log. Fix: watchdog now treats any "unreachable" tick as
+  recoverable (regardless of `_serve_seen_alive`), fires `serve_down`
+  immediately at detection (subject to the existing 10-minute cooldown),
+  then attempts the exponential restart sequence when
+  `auto_spawn_server=True`. When the restart succeeds — or when an
+  externally-restarted opencode comes back — fires `serve_recovered` on
+  the next tick.
+
+### Added
+
+- **`opencode serve` stderr + stdout captured to a log file.** Was
+  `stdout=DEVNULL, stderr=DEVNULL`, meaning every opencode crash was a
+  silent black box. Now written to
+  `~/.hermes/plugins/hermes-opencode/logs/opencode-serve.<YYYYMMDD-HHMMSS>.log`
+  (one file per spawn). `ensure_server()` now takes an optional
+  `log_dir` parameter; all in-tree callers (`tools._ensure_server`,
+  `make_regen_bootstrap`, `make_regen_cleanup`, the watchdog's
+  `_try_restart_serve_with_backoff`) pass `rt.config.logs_dir`. When a
+  serve spawn exits during startup, the error message includes the
+  tail of the new log so the root cause is in the immediate failure
+  payload instead of buried under `journalctl`.
+
+- **`serve_recovered` event** parallel to the existing `serve_down`
+  event. Fires once when the watchdog observes opencode transition from
+  down to alive (including externally-restarted instances). Hits the
+  same `("cli","dashboard","gateway")` sink list — your DM channel
+  gets a `✓ opencode serve recovered` follow-up after every outage.
+
+- **Per-agent tick-failure tracking on `Agent`.** New fields
+  `last_tick_error`, `last_tick_error_at`, `consecutive_tick_failures`
+  (all migration-tolerant defaults). `_agent_loop` records the error
+  name + first 200 chars of `repr(exc)` on each tick failure and
+  clears the counter on success. Surfaced in `/oc list` as a `↻ N tick
+  fails` chip on the agent line and as a `tick error: ...`
+  continuation when the streak reaches ≥ 3. `/oc doctor` adds a
+  `tick failing · <agent_id>` section enumerating every agent
+  currently in a failure streak. No more "phase=EXECUTING with
+  silent connection refused" mystery.
+
+### Changed
+
+- `AgentStore.update(field=None)` now actually clears the field
+  instead of silently no-op-ing. The previous `if v is not None` skip
+  was load-bearing for no caller in this codebase (verified via grep)
+  and blocked the tick-failure-clearing path. Existing
+  `update(... last_error=None)` calls (e.g. the
+  `_phase_executor_addressing → COMMITTING` recovery in v0.5.x) now
+  also work as their original authors expected.
+
 ## [0.14.0] - 2026-05-17
 
 ### Fixed

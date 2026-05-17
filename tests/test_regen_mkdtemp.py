@@ -48,7 +48,7 @@ def git_repo(tmp_path: Path) -> Path:
 
 
 class _StubClient:
-    def ensure_server(self) -> None:
+    def ensure_server(self, deadline_sec: float = 15.0, log_dir=None) -> None:
         return None
 
 

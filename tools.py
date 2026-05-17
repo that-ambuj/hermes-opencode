@@ -82,7 +82,7 @@ def _err(msg: str, **extra: Any) -> str:
 
 def _ensure_server(rt: Runtime) -> None:
     if rt.config.auto_spawn_server:
-        rt.client.ensure_server()
+        rt.client.ensure_server(log_dir=rt.config.logs_dir)
 
 
 PROJECT_ADD_SCHEMA: dict[str, Any] = {
@@ -969,7 +969,7 @@ def make_regen_bootstrap(rt: Runtime) -> Callable[..., Awaitable[str]]:
             return _err(f"throwaway worktree create failed: {e}")
         try:
             try:
-                rt.client.ensure_server()
+                rt.client.ensure_server(log_dir=rt.config.logs_dir)
             except OpencodeError as e:
                 return _err(f"opencode server unavailable: {e}")
             result = await bootstrap_mod.generate_bootstrap_skill(rt.client, project, throwaway, rt.projects)
@@ -1007,7 +1007,7 @@ def make_regen_cleanup(rt: Runtime) -> Callable[..., Awaitable[str]]:
             return _err(f"throwaway worktree create failed: {e}")
         try:
             try:
-                rt.client.ensure_server()
+                rt.client.ensure_server(log_dir=rt.config.logs_dir)
             except OpencodeError as e:
                 return _err(f"opencode server unavailable: {e}")
             result = await bootstrap_mod.generate_cleanup_skill(rt.client, project, throwaway, rt.projects)

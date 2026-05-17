@@ -603,28 +603,34 @@ async def _serve_watchdog_loop() -> None:
             logger.debug("serve watchdog ping errored: %s", e)
             alive = False
         if alive:
+            was_down = _serve_down_notified_at != 0.0
             if not _serve_seen_alive:
                 logger.info("opencode serve detected alive at %s; watchdog armed", _runtime.config.server_url)
             _serve_seen_alive = True
+            if was_down:
+                _notify_serve_recovered()
             _serve_down_notified_at = 0.0
             await asyncio.sleep(SERVE_WATCHDOG_INTERVAL_SEC)
             continue
-        if not _serve_seen_alive:
+        now = time.time()
+        cooldown_elapsed = now - _serve_down_notified_at >= SERVE_DOWN_NOTIFY_COOLDOWN_SEC
+        if cooldown_elapsed:
+            logger.warning("opencode serve at %s appears down", _runtime.config.server_url)
+            _notify_serve_down()
+            _serve_down_notified_at = now
+        if not _runtime.config.auto_spawn_server:
             await asyncio.sleep(SERVE_WATCHDOG_INTERVAL_SEC)
             continue
         logger.warning(
-            "opencode serve at %s appears down; attempting exponential restart (max %d)",
-            _runtime.config.server_url, SERVE_RESTART_MAX_ATTEMPTS,
+            "attempting exponential restart of opencode serve (max %d)",
+            SERVE_RESTART_MAX_ATTEMPTS,
         )
         recovered = await _try_restart_serve_with_backoff()
         if recovered:
             logger.info("opencode serve recovered after watchdog restart")
+            _serve_seen_alive = True
+            _notify_serve_recovered()
             _serve_down_notified_at = 0.0
-        else:
-            now = time.time()
-            if now - _serve_down_notified_at >= SERVE_DOWN_NOTIFY_COOLDOWN_SEC:
-                _notify_serve_down()
-                _serve_down_notified_at = now
         await asyncio.sleep(SERVE_WATCHDOG_INTERVAL_SEC)
 
 
@@ -644,7 +650,7 @@ async def _try_restart_serve_with_backoff() -> bool:
         if _stop_flag.is_set():
             return False
         try:
-            await asyncio.to_thread(_runtime.client.ensure_server)
+            await asyncio.to_thread(_runtime.client.ensure_server, 15.0, _runtime.config.logs_dir)
         except OpencodeError as e:
             logger.warning("serve restart attempt %d: ensure_server failed: %s", attempt, e)
             continue
@@ -680,21 +686,42 @@ def _build_serve_down_notification() -> tuple[str, str, dict]:
 
 
 def _notify_serve_down() -> None:
+    _fanout_serve_event("serve_down", *_build_serve_down_notification())
+
+
+def _build_serve_recovered_notification() -> tuple[str, str, dict]:
+    assert _runtime is not None
+    title = "✓ opencode serve recovered"
+    body = (
+        f"`opencode serve` at {_runtime.config.server_url} is reachable again. "
+        f"Agents will resume next tick."
+    )
+    meta = {
+        "kind": "serve_recovered",
+        "server_url": _runtime.config.server_url,
+    }
+    return title, body, meta
+
+
+def _notify_serve_recovered() -> None:
+    _fanout_serve_event("serve_recovered", *_build_serve_recovered_notification())
+
+
+def _fanout_serve_event(kind: str, title: str, body: str, meta: dict) -> None:
     if _runtime is None:
         return
     from . import notify as notify_mod
-    title, body, meta = _build_serve_down_notification()
     try:
         _runtime.config.events_log.parent.mkdir(parents=True, exist_ok=True)
         import json
         line = json.dumps({
-            "ts": time.time(), "kind": "serve_down", "agent_id": None,
+            "ts": time.time(), "kind": kind, "agent_id": None,
             "title": title, "body": body, "meta": meta,
         }, default=str)
         with _runtime.config.events_log.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
     except OSError as e:
-        logger.warning("events.log write failed during serve_down notify: %s", e)
+        logger.warning("events.log write failed during %s notify: %s", kind, e)
     try:
         results = notify_mod.fanout(
             sinks=list(SERVE_DOWN_NOTIFY_SINKS),
@@ -705,13 +732,13 @@ def _notify_serve_down() -> None:
             gateway_platform=_runtime.config.notify_gateway_platform,
             gateway_chat_id=_runtime.config.notify_gateway_chat_id,
         )
-        logger.error(
-            "serve_down notified on sinks=%s results=%s",
-            list(SERVE_DOWN_NOTIFY_SINKS),
+        logger.info(
+            "%s notified on sinks=%s results=%s",
+            kind, list(SERVE_DOWN_NOTIFY_SINKS),
             [(r.sink, r.ok, r.detail) for r in results],
         )
     except Exception as e:
-        logger.exception("serve_down fanout failed: %s", e)
+        logger.exception("%s fanout failed: %s", kind, e)
 
 
 async def _pruner_loop() -> None:
@@ -781,12 +808,50 @@ async def _agent_loop(agent_id: str) -> None:
         try:
             await _tick(agent)
             backoff = 1.0
+            _clear_tick_failure(agent)
         except Exception as e:
-            logger.exception("agent %s tick failed: %s", agent_id, e)
+            logger.warning(
+                "agent %s tick failed: %s: %s",
+                agent_id, type(e).__name__, e,
+            )
+            _record_tick_failure(agent, e)
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60.0)
         else:
             await asyncio.sleep(0.5)
+
+
+def _record_tick_failure(agent: Agent, exc: BaseException) -> None:
+    if _runtime is None:
+        return
+    summary = f"{type(exc).__name__}: {str(exc)[:200]}"
+    try:
+        current = _runtime.agents.get(agent.agent_id)
+        consecutive = (current.consecutive_tick_failures if current else 0) + 1
+        _runtime.agents.update(
+            agent.agent_id,
+            last_tick_error=summary,
+            last_tick_error_at=time.time(),
+            consecutive_tick_failures=consecutive,
+        )
+    except Exception as e:
+        logger.debug("could not record tick failure for %s: %s", agent.agent_id, e)
+
+
+def _clear_tick_failure(agent: Agent) -> None:
+    if _runtime is None:
+        return
+    try:
+        current = _runtime.agents.get(agent.agent_id)
+        if current and current.consecutive_tick_failures > 0:
+            _runtime.agents.update(
+                agent.agent_id,
+                last_tick_error=None,
+                last_tick_error_at=None,
+                consecutive_tick_failures=0,
+            )
+    except Exception as e:
+        logger.debug("could not clear tick failure for %s: %s", agent.agent_id, e)
 
 
 async def _sse_consumer_loop(agent_id: str, stop_event: asyncio.Event) -> None:

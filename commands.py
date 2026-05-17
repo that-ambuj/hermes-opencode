@@ -61,6 +61,8 @@ def _fmt_list(agents: list["Agent"], now_ts: float | None = None, *, include_arc
         parts = [f"{glyph} {a.agent_id}", a.phase, age]
         if getattr(a, "archived", False):
             parts.append("archived")
+        if getattr(a, "consecutive_tick_failures", 0) > 0:
+            parts.append(f"↻ {a.consecutive_tick_failures} tick fails")
         if a.pr_url:
             parts.append(a.pr_url)
         elif a.pr_number:
@@ -78,6 +80,8 @@ def _continuation_line(a: "Agent") -> str | None:
         return f"cancelled: {a.cancellation_reason[:160]}"
     if a.phase == "DONE" and a.pr_url is None:
         return "merged"
+    if getattr(a, "consecutive_tick_failures", 0) >= 3 and getattr(a, "last_tick_error", None):
+        return f"tick error: {a.last_tick_error[:160]}"
     return None
 
 
@@ -234,6 +238,14 @@ def _fmt_doctor(runtime: "Runtime") -> str:
             lines.append(
                 f"  awaiting · {a.agent_id} · phase={a.phase} "
                 f"verdict=awaiting={awaiting} src={src} conf={conf}"
+            )
+    failing_agents = [a for a in agents if getattr(a, "consecutive_tick_failures", 0) > 0]
+    if failing_agents:
+        for a in failing_agents:
+            err = a.last_tick_error or "(no detail)"
+            lines.append(
+                f"  tick failing · {a.agent_id} · phase={a.phase} "
+                f"consecutive={a.consecutive_tick_failures} last_error={err[:120]}"
             )
 
     deps = []
