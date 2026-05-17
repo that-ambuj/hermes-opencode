@@ -84,7 +84,7 @@ class Config:
     notify_gateway_platform: str | None = None
     notify_gateway_chat_id: str | None = None
     notify_discovery_source: str | None = None
-    notify_events: set[str] = field(default_factory=lambda: {"pr_opened", "done", "failed", "awaiting_human", "review_started", "cancelled"})
+    notify_events: set[str] = field(default_factory=lambda: {"pr_opened", "done", "failed", "awaiting_human", "review_started", "cancelled", "tick_error", "aborted"})
     events_log: Path = field(default_factory=lambda: plugin_state_dir() / "events.log")
     heartbeat_enabled: bool = True
     heartbeat_timezone: str | None = None
@@ -112,7 +112,7 @@ class Config:
         classifier = entry.get("classifier") or {}
         awaiting = entry.get("awaiting_input") or {}
         day_window = heartbeat.get("unconditional_hours", [9, 23])
-        default_events = {"pr_opened", "done", "failed", "awaiting_human", "review_started", "cancelled"}
+        default_events = {"pr_opened", "done", "failed", "awaiting_human", "review_started", "cancelled", "tick_error", "aborted"}
 
         platform = gateway.get("platform")
         explicit_chat_id = gateway.get("chat_id")

@@ -150,6 +150,23 @@ If you add new phases or shortcuts that bypass `_phase_committing`,
 either route them through this same executor-driven path or document
 why the slug-based fallback is acceptable for that path.
 
+v0.14.6 strengthened this contract after observing every PR opened in
+v0.14.x was going through the slug-based fallback (executor not emitting
+the sentinel line). Changes:
+
+- `executor_open_pr_prompt(...)` now explicitly forbids `gh pr create --fill`
+  (which would pull from the pre-review staging commit and produce
+  garbage), shows a concrete `PR_OPENED:` URL example to copy the shape
+  of, and notes the executor MAY amend the staging commit so the final
+  history reflects what actually changed.
+- `parse_pr_opened(text)` accepts three formats: strict
+  `PR_OPENED: <url>` (primary), permissive
+  `PR opened / Opened PR / PR url / PR_OPENED ... <url>` (variant), and
+  bare github.com/.../pull/N URL (last-resort fallback).
+- `executor_open_pr(...)` logs the executor's full response (truncated
+  to 4KB) at WARNING when parsing fails, so future drift is debuggable
+  from the orchestrator log without re-running the failure.
+
 ## Awaiting-input gate and classifier cascade (LOAD-BEARING)
 
 `_phase_executing` and `_phase_executor_addressing` do NOT transition the
@@ -193,6 +210,63 @@ When extending the state machine: any phase that wants to gate review
 or commit on "executor is plausibly done" must call
 `_awaiting_input_blocks_review(agent)` before transitioning. Do NOT
 re-implement the cascade inline.
+
+## Error surfacing (LOAD-BEARING)
+
+The orchestrator has TWO orthogonal error-surfacing paths. Both are
+load-bearing; silently swallowing either side leaves agents stalled in
+a broken state with no user-visible signal.
+
+### Tick-failure side (orchestrator / transport exceptions)
+
+`_agent_loop` catches every exception from `_tick`, calls
+`_record_tick_failure(agent, exc)` which writes `last_tick_error` /
+`last_tick_error_at` / `consecutive_tick_failures` on the agent record.
+v0.14.6 added two thresholds on this path:
+
+1. **First failure of a streak** fires a `tick_error` notification via
+   `_notify_event(...)`. The `tick_error` kind is in the default
+   `notify_events` set since v0.14.6. Subsequent consecutive failures
+   do NOT re-notify (avoids spam from transient network errors). A
+   successful tick clears `consecutive_tick_failures` to 0 via
+   `_clear_tick_failure`, resetting the "first of a streak" detection.
+
+2. **`TICK_FAILURE_ESCALATION_THRESHOLD = 3` consecutive failures**
+   escalates the agent to `phase=FAILED` with
+   `last_error = "stalled after N consecutive tick failures: <summary>"`
+   and fires the existing `failed` notification via
+   `_maybe_notify_phase`. Tasks are cancelled via `_cancel_agent_tasks`.
+   Terminal agents (DONE/KILLED/FAILED/CANCELLED) are NOT re-escalated.
+
+### Message-level side (opencode aborts inside a "successful" turn)
+
+Opencode marks an aborted assistant turn by setting
+`message.error = { name, message }` (e.g. `MessageAbortedError`,
+`"Interrupted"`) on the assistant message. The error is a structured
+field on the message itself, NOT a text part. The existing
+`_last_assistant_text` / `_fetch_last_assistant_text` readers in
+event_loop.py only walk `parts[].text`, so they miss aborts entirely.
+
+v0.14.6 added `_message_error(item)` to extract the structured error
+and `_check_executor_abort(agent)` which runs from both
+`_phase_executing` and `_phase_executor_addressing` immediately after
+`wait_idle` succeeds. The handler is idempotent on `message.id`: each
+new abort fires exactly one `aborted` notification and queues exactly
+one `continue` follow-up via `send_message_async`. Same-id re-observations
+are noops. Forward progress (no error on the latest message) clears
+`consecutive_aborts` and `last_abort_msg_id`.
+
+After `ABORT_ESCALATION_THRESHOLD = 3` distinct aborts (different
+`message.id`) the agent is escalated to `phase=FAILED` with
+`last_error = "executor aborted N consecutive times: <name>: <msg>"`,
+firing the existing `failed` notification.
+
+The `aborted` event kind is in the default `notify_events` set since
+v0.14.6. Body template lives in `_default_event_body`.
+
+When adding new phases or new tool-error paths: fire `tick_error` /
+`aborted` events through the same helpers. NEVER add a silent
+`except Exception: pass` branch on these paths.
 
 ## OMO directive coexistence (LOAD-BEARING)
 

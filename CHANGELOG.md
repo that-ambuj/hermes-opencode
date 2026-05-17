@@ -5,6 +5,126 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.6] - 2026-05-17
+
+### Fixed
+
+- **PR title / body regression: executor-driven path falls back every
+  time.** The `_phase_committing` flow has been "executor authors title
+  + body, plugin parses `PR_OPENED:` sentinel, falls back to slug-based
+  finalize on parse failure" since v0.4.0 (documented as LOAD-BEARING in
+  AGENTS.md). In v0.14.x every PR was hitting the fallback because the
+  executor wasn't emitting the sentinel — producing slug-derived titles
+  like `Fix bb gateway` from agent_id `oco/fix-bb-gateway` and bodies
+  set to the verbatim initial prompt.
+
+  Three coordinated fixes:
+
+  1. **`executor_open_pr_prompt(...)` strengthened**: explicit ban on
+     `gh pr create --fill` (it would pull from the pre-review
+     `chore: <slug>` staging commit and produce garbage), a concrete
+     `PR_OPENED: https://github.com/octocat/hello-world/pull/42` example
+     to copy the shape of, and an explicit note that the executor MAY
+     amend the pre-review staging commit so final git history reflects
+     what actually changed (instead of the slug placeholder).
+
+  2. **`parse_pr_opened(text)` accepts three formats**: strict
+     `PR_OPENED:` (primary), permissive
+     `PR opened` / `Opened PR` / `PR url` variants (middle layer), and
+     bare `github.com/.../pull/N` URLs (last-resort fallback). Widening
+     catches drift in executor wording without losing strictness for
+     compliant responses.
+
+  3. **`executor_open_pr(...)` diagnostic logging**: on parse failure,
+     logs the executor's full assistant response (truncated to 4KB) at
+     WARNING level, so future drift is debuggable from the orchestrator
+     log without re-running the failure. Also logs the successful
+     response at INFO with the first 800 chars.
+
+### Added
+
+- **Tick-failure surfacing + auto-escalation.** Previously,
+  `_record_tick_failure` recorded `last_tick_error` /
+  `consecutive_tick_failures` but never fired a notification and never
+  escalated the phase, so a stuck agent looped forever in EXECUTING
+  with no user-visible signal. Now:
+
+  - First failure of a streak fires the new `tick_error` notification
+    (`"Tick failed: <summary>"`). Subsequent consecutive failures do
+    NOT re-notify (avoids spam from transient network errors). A
+    successful tick clears the streak.
+  - After `TICK_FAILURE_ESCALATION_THRESHOLD = 3` consecutive failures
+    the agent transitions to `phase=FAILED` with
+    `last_error = "stalled after N consecutive tick failures: ..."`,
+    fires the existing `failed` notification, and cancels its asyncio
+    tasks. Terminal agents are not re-escalated.
+
+  `tick_error` is in the default `notify_events` set.
+
+- **Opencode-side abort detection + auto-continue.** Opencode marks an
+  aborted assistant turn by setting `message.error = { name, message }`
+  (e.g. `MessageAbortedError` / `"Interrupted"`) on the assistant
+  message — a structured field, NOT a text part — so the existing
+  text-part readers in event_loop.py never saw aborts. The agent would
+  appear to be running while actually being stuck.
+
+  New `_message_error(item)` extracts the structured error.
+  `_check_executor_abort(agent)` runs from both `_phase_executing` and
+  `_phase_executor_addressing` immediately after `wait_idle` succeeds.
+  Behavior:
+
+  - Idempotent on `message.id`: each new abort fires exactly one
+    `aborted` notification and queues exactly one `continue` follow-up
+    to the executor via `send_message_async`. Same-id re-observations
+    are noops.
+  - Forward progress (no error on latest message) clears
+    `consecutive_aborts` and `last_abort_msg_id`.
+  - After `ABORT_ESCALATION_THRESHOLD = 3` distinct aborts the agent is
+    escalated to `phase=FAILED` with
+    `last_error = "executor aborted N consecutive times: ..."`, fires
+    the existing `failed` notification, and cancels asyncio tasks.
+
+  `aborted` is in the default `notify_events` set. New `Agent` fields:
+  `last_abort_msg_id: str | None`, `consecutive_aborts: int = 0`.
+
+- **24 new regression tests** in `tests/test_pure_logic.py`:
+  - `TestParsePrOpenedAcceptsVariants` (7): strict prefix; case
+    insensitivity; PR-opened-with-space variant; Opened-PR variant;
+    PR-url variant; bare github URL fallback; no-match returns None.
+  - `TestExecutorOpenPrPromptHardening` (4): prompt forbids `--fill`;
+    contains concrete `PR_OPENED:` example; emphasizes the literal
+    prefix is REQUIRED; mentions the staging-commit amend option.
+  - `TestMessageErrorExtraction` (5): no error returns None;
+    MessageAbortedError extracted as `(name, message)`; error without
+    message-string still extracted; error at item level also detected;
+    error without `name` rejected as None.
+  - `TestRecordTickFailureEscalation` (4): first failure fires
+    `tick_error`; second consecutive does NOT re-notify; third
+    consecutive escalates to FAILED; terminal agents not re-escalated.
+  - `TestCheckExecutorAbort` (4): no error returns False AND clears
+    streak; first abort notifies + sends "continue"; same `message.id`
+    is idempotent (no re-notify, no re-send); third distinct abort
+    escalates to FAILED.
+
+  Full suite: 283 passed (was 259 at v0.14.5).
+
+### Changed
+
+- `notify_events` default set: added `tick_error` and `aborted` kinds.
+  Both `Config.notify_events` and `Config.from_plugin_entry`'s
+  `default_events` updated; users with explicit
+  `plugins.entries.hermes-opencode.notify.events.enabled` lists must
+  add these kinds manually to receive the new notifications.
+- `_default_event_body` body templates added for `tick_error` and
+  `aborted` (used when `_notify_event` is called without an explicit
+  body).
+- `_EVENT_GLYPH` gained `tick_error: "⚠"` and `aborted: "⏹"`.
+- `AGENTS.md` gained a new `Error surfacing (LOAD-BEARING)` section
+  documenting both surfaces (tick failures, message-level aborts) and
+  their thresholds. The existing `Executor-driven PR open` section
+  records the v0.14.x slug-fallback regression and the three fixes
+  applied here.
+
 ## [0.14.5] - 2026-05-17
 
 ### Added

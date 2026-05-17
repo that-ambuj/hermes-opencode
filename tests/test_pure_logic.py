@@ -983,3 +983,356 @@ class TestServeHostnameConfig:
         )
         assert c._host == "10.0.0.5"
         assert c._serve_hostname == "10.0.0.5"
+
+
+class TestParsePrOpenedAcceptsVariants:
+    """v0.14.6: parse_pr_opened tries strict `PR_OPENED:` first, then a
+    permissive variant regex (PR opened: / Opened PR: / PR_URL etc),
+    then falls back to a bare github.com/.../pull/<N> match. Widening
+    catches format drift in the executor's response.
+    """
+
+    def test_strict_pr_opened_prefix(self):
+        url, n = reviewer_mod.parse_pr_opened(
+            "Done.\nPR_OPENED: https://github.com/o/r/pull/42\n"
+        )
+        assert url == "https://github.com/o/r/pull/42"
+        assert n == 42
+
+    def test_strict_is_case_insensitive(self):
+        url, n = reviewer_mod.parse_pr_opened(
+            "pr_opened: https://github.com/o/r/pull/3"
+        )
+        assert n == 3
+
+    def test_variant_pr_opened_with_space(self):
+        url, n = reviewer_mod.parse_pr_opened(
+            "PR opened at https://github.com/o/r/pull/7"
+        )
+        assert n == 7
+
+    def test_variant_opened_pr(self):
+        url, n = reviewer_mod.parse_pr_opened(
+            "Opened PR: https://github.com/o/r/pull/11"
+        )
+        assert n == 11
+
+    def test_variant_pr_url(self):
+        url, n = reviewer_mod.parse_pr_opened(
+            "PR url: https://github.com/o/r/pull/55"
+        )
+        assert n == 55
+
+    def test_fallback_bare_github_url(self):
+        url, n = reviewer_mod.parse_pr_opened(
+            "I opened https://github.com/o/r/pull/99 for you."
+        )
+        assert url == "https://github.com/o/r/pull/99"
+        assert n == 99
+
+    def test_no_match_returns_none(self):
+        assert reviewer_mod.parse_pr_opened("nothing to see here") is None
+        assert reviewer_mod.parse_pr_opened("") is None
+        assert reviewer_mod.parse_pr_opened("just a comment without url") is None
+
+
+class TestExecutorOpenPrPromptHardening:
+    """v0.14.6: the executor-driven PR-open prompt was strengthened with
+    a concrete sentinel example, explicit `--fill` ban, and clearer
+    instruction that the literal `PR_OPENED:` prefix is required.
+    """
+
+    def test_prompt_forbids_fill(self):
+        p = reviewer_mod.executor_open_pr_prompt("feat/x", "main")
+        assert "--fill" in p
+        assert "Do NOT use `--fill`" in p
+
+    def test_prompt_contains_concrete_example(self):
+        p = reviewer_mod.executor_open_pr_prompt("feat/x", "main")
+        assert "PR_OPENED: https://github.com/" in p
+        assert "octocat/hello-world/pull/42" in p
+
+    def test_prompt_emphasizes_required_prefix(self):
+        p = reviewer_mod.executor_open_pr_prompt("feat/x", "main")
+        assert "REQUIRED" in p
+        assert "literal `PR_OPENED:` prefix" in p
+
+    def test_prompt_mentions_amend_option(self):
+        p = reviewer_mod.executor_open_pr_prompt("feat/x", "main")
+        assert "amend" in p.lower()
+        assert "chore: <slug>" in p
+
+
+class TestMessageErrorExtraction:
+    """v0.14.6: _message_error extracts opencode's structured `error`
+    field from a messages-API item. Opencode places aborts at
+    `message.error = { name, message }` (e.g. MessageAbortedError),
+    NOT in any text part, so existing text-part readers miss it.
+    """
+
+    def test_no_error_returns_none(self):
+        assert event_loop_mod._message_error({}) is None
+        assert event_loop_mod._message_error({"message": {"role": "assistant"}}) is None
+
+    def test_message_aborted_error(self):
+        item = {
+            "message": {
+                "role": "assistant",
+                "id": "msg_1",
+                "error": {"name": "MessageAbortedError", "message": "Interrupted"},
+            },
+            "parts": [],
+        }
+        result = event_loop_mod._message_error(item)
+        assert result == ("MessageAbortedError", "Interrupted")
+
+    def test_error_without_message_string_ok(self):
+        item = {"message": {"role": "assistant", "error": {"name": "ProviderError"}}}
+        result = event_loop_mod._message_error(item)
+        assert result == ("ProviderError", "")
+
+    def test_error_at_item_level_also_works(self):
+        item = {"error": {"name": "FooError", "message": "bar"}, "message": {"role": "assistant"}}
+        result = event_loop_mod._message_error(item)
+        assert result == ("FooError", "bar")
+
+    def test_error_without_name_treated_as_none(self):
+        item = {"message": {"error": {"message": "no name field"}}}
+        assert event_loop_mod._message_error(item) is None
+
+
+class TestRecordTickFailureEscalation:
+    """v0.14.6: _record_tick_failure now notifies the user via the
+    `tick_error` event on the FIRST failure of a streak (not on every
+    consecutive failure to avoid spam), and escalates the agent to
+    FAILED phase after TICK_FAILURE_ESCALATION_THRESHOLD (3) consecutive
+    failures.
+    """
+
+    def setup_method(self):
+        self._notified: list = []
+        self._saved_pkg_runtime = plugin_mod._runtime
+        self._saved_evloop_runtime = event_loop_mod._runtime
+        self._saved_notify = event_loop_mod._notify_event
+        self._saved_maybe_notify = event_loop_mod._maybe_notify_phase
+        self._saved_cancel = event_loop_mod._cancel_agent_tasks
+        event_loop_mod._notify_event = lambda agent, kind, body="": self._notified.append((kind, agent.agent_id, body))
+        event_loop_mod._maybe_notify_phase = lambda agent, kind, body="": self._notified.append(("phase:" + kind, agent.agent_id, body))
+        event_loop_mod._cancel_agent_tasks = lambda agent_id: None
+
+    def teardown_method(self):
+        plugin_mod._runtime = self._saved_pkg_runtime
+        event_loop_mod._runtime = self._saved_evloop_runtime
+        event_loop_mod._notify_event = self._saved_notify
+        event_loop_mod._maybe_notify_phase = self._saved_maybe_notify
+        event_loop_mod._cancel_agent_tasks = self._saved_cancel
+
+    def _setup_runtime(self, tmp_path, agent_phase: str = "EXECUTING"):
+        cfg = config_mod.Config(
+            projects_file=tmp_path / "projects.json",
+            agents_file=tmp_path / "agents.json",
+            worktrees_root=tmp_path / "wt",
+            logs_dir=tmp_path / "logs",
+            notifications_file=tmp_path / "notifications.jsonl",
+        )
+        cfg.ensure_dirs()
+        agents = state_mod.AgentStore(cfg.agents_file)
+        agent = state_mod.Agent(
+            agent_id="bck/test", project_label="bck",
+            worktree_path=str(tmp_path), session_id="s",
+            branch="bck/test", initial_prompt="p", phase=agent_phase,
+        )
+        agents.add(agent)
+        tools_mod = sys.modules["_oco_test_pkg.tools"]
+        rt = tools_mod.Runtime(config=cfg, client=None, projects=None, agents=agents)
+        plugin_mod._runtime = rt
+        event_loop_mod._runtime = rt
+        return rt, agents
+
+    def test_first_failure_fires_tick_error_event(self, tmp_path: Path):
+        rt, agents = self._setup_runtime(tmp_path)
+        agent = agents.get("bck/test")
+        event_loop_mod._record_tick_failure(agent, RuntimeError("boom"))
+        kinds = [k for (k, _aid, _b) in self._notified]
+        assert kinds == ["tick_error"]
+        assert agents.get("bck/test").consecutive_tick_failures == 1
+        assert agents.get("bck/test").last_tick_error == "RuntimeError: boom"
+
+    def test_second_failure_does_not_re_notify(self, tmp_path: Path):
+        rt, agents = self._setup_runtime(tmp_path)
+        agent = agents.get("bck/test")
+        event_loop_mod._record_tick_failure(agent, RuntimeError("first"))
+        self._notified.clear()
+        agent_after_first = agents.get("bck/test")
+        event_loop_mod._record_tick_failure(agent_after_first, RuntimeError("second"))
+        kinds = [k for (k, _aid, _b) in self._notified]
+        assert kinds == [], (
+            "second consecutive failure must NOT re-notify; only escalation at "
+            "the threshold fires another event"
+        )
+        assert agents.get("bck/test").consecutive_tick_failures == 2
+
+    def test_third_failure_escalates_to_failed(self, tmp_path: Path):
+        rt, agents = self._setup_runtime(tmp_path)
+        agent = agents.get("bck/test")
+        event_loop_mod._record_tick_failure(agent, RuntimeError("e1"))
+        agent2 = agents.get("bck/test")
+        event_loop_mod._record_tick_failure(agent2, RuntimeError("e2"))
+        agent3 = agents.get("bck/test")
+        self._notified.clear()
+        event_loop_mod._record_tick_failure(agent3, RuntimeError("e3"))
+        kinds = [k for (k, _aid, _b) in self._notified]
+        assert "phase:failed" in kinds, f"expected escalation, got {kinds}"
+        final = agents.get("bck/test")
+        assert final.phase == "FAILED"
+        assert "stalled after 3" in (final.last_error or "")
+
+    def test_terminal_agent_not_re_escalated(self, tmp_path: Path):
+        rt, agents = self._setup_runtime(tmp_path, agent_phase="DONE")
+        agent = agents.get("bck/test")
+        agents.update("bck/test", consecutive_tick_failures=2)
+        agent2 = agents.get("bck/test")
+        self._notified.clear()
+        event_loop_mod._record_tick_failure(agent2, RuntimeError("late tick"))
+        kinds = [k for (k, _aid, _b) in self._notified]
+        assert "phase:failed" not in kinds, (
+            "agent already in terminal phase must not be re-escalated"
+        )
+        assert agents.get("bck/test").phase == "DONE"
+
+
+class TestCheckExecutorAbort:
+    """v0.14.6: _check_executor_abort detects opencode's structured
+    abort errors on the latest assistant message, surfaces them via
+    the `aborted` event, auto-sends a "continue" follow-up, and
+    escalates to FAILED after ABORT_ESCALATION_THRESHOLD (3) distinct
+    aborts. Same-message.id aborts are idempotent.
+    """
+
+    def setup_method(self):
+        self._notified: list = []
+        self._continue_sent: list = []
+        self._messages_box: list[list[dict]] = [[]]
+        self._saved_pkg_runtime = plugin_mod._runtime
+        self._saved_evloop_runtime = event_loop_mod._runtime
+        self._saved_notify = event_loop_mod._notify_event
+        self._saved_maybe_notify = event_loop_mod._maybe_notify_phase
+        self._saved_cancel = event_loop_mod._cancel_agent_tasks
+        event_loop_mod._notify_event = lambda agent, kind, body="": self._notified.append((kind, body))
+        event_loop_mod._maybe_notify_phase = lambda agent, kind, body="": self._notified.append(("phase:" + kind, body))
+        event_loop_mod._cancel_agent_tasks = lambda agent_id: None
+
+    def teardown_method(self):
+        plugin_mod._runtime = self._saved_pkg_runtime
+        event_loop_mod._runtime = self._saved_evloop_runtime
+        event_loop_mod._notify_event = self._saved_notify
+        event_loop_mod._maybe_notify_phase = self._saved_maybe_notify
+        event_loop_mod._cancel_agent_tasks = self._saved_cancel
+
+    def _setup(self, tmp_path: Path, messages_items: list[dict]):
+        cfg = config_mod.Config(
+            projects_file=tmp_path / "projects.json",
+            agents_file=tmp_path / "agents.json",
+            worktrees_root=tmp_path / "wt",
+            logs_dir=tmp_path / "logs",
+            notifications_file=tmp_path / "notifications.jsonl",
+        )
+        cfg.ensure_dirs()
+        agents = state_mod.AgentStore(cfg.agents_file)
+        agent = state_mod.Agent(
+            agent_id="bck/test", project_label="bck",
+            worktree_path=str(tmp_path), session_id="s",
+            branch="bck/test", initial_prompt="p", phase="EXECUTING",
+        )
+        agents.add(agent)
+        self._messages_box[0] = messages_items
+        captured = self._continue_sent
+        box = self._messages_box
+
+        class FakeClient:
+            async def get_messages(self_inner, session_id, directory, cursor=None):
+                return {"items": box[0]}
+
+            async def send_message_async(self_inner, session_id, directory, text, timeout=30.0):
+                captured.append({"session_id": session_id, "text": text})
+                return {"queued": True}
+
+        tools_mod = sys.modules["_oco_test_pkg.tools"]
+        rt = tools_mod.Runtime(config=cfg, client=FakeClient(), projects=None, agents=agents)
+        plugin_mod._runtime = rt
+        event_loop_mod._runtime = rt
+        return agents
+
+    def _run(self, agent):
+        import asyncio
+        return asyncio.run(event_loop_mod._check_executor_abort(agent))
+
+    def test_no_error_returns_false_and_clears_streak(self, tmp_path: Path):
+        agents = self._setup(tmp_path, [{
+            "message": {"role": "assistant", "id": "m1"},
+            "parts": [{"type": "text", "text": "all good"}],
+        }])
+        agents.update("bck/test", consecutive_aborts=2, last_abort_msg_id="old")
+        agent = agents.get("bck/test")
+        assert self._run(agent) is False
+        refreshed = agents.get("bck/test")
+        assert refreshed.consecutive_aborts == 0
+        assert refreshed.last_abort_msg_id is None
+
+    def test_first_abort_notifies_and_sends_continue(self, tmp_path: Path):
+        agents = self._setup(tmp_path, [{
+            "message": {
+                "role": "assistant", "id": "msg_a",
+                "error": {"name": "MessageAbortedError", "message": "Interrupted"},
+            },
+            "parts": [],
+        }])
+        agent = agents.get("bck/test")
+        assert self._run(agent) is True
+        kinds = [k for (k, _b) in self._notified]
+        assert kinds == ["aborted"]
+        assert len(self._continue_sent) == 1
+        assert self._continue_sent[0]["text"] == event_loop_mod.ABORT_AUTO_CONTINUE_MESSAGE
+        refreshed = agents.get("bck/test")
+        assert refreshed.consecutive_aborts == 1
+        assert refreshed.last_abort_msg_id == "msg_a"
+
+    def test_same_message_id_is_idempotent(self, tmp_path: Path):
+        agents = self._setup(tmp_path, [{
+            "message": {
+                "role": "assistant", "id": "msg_a",
+                "error": {"name": "MessageAbortedError", "message": "Interrupted"},
+            },
+            "parts": [],
+        }])
+        agent = agents.get("bck/test")
+        self._run(agent)
+        self._notified.clear()
+        self._continue_sent.clear()
+        agent2 = agents.get("bck/test")
+        assert self._run(agent2) is True
+        assert self._notified == [], "same msg_id must not re-notify"
+        assert self._continue_sent == [], "same msg_id must not re-send 'continue'"
+        assert agents.get("bck/test").consecutive_aborts == 1
+
+    def test_third_distinct_abort_escalates_to_failed(self, tmp_path: Path):
+        agents = self._setup(tmp_path, [])
+        events_log: list = []
+        for i in range(1, 4):
+            self._messages_box[0] = [{
+                "message": {
+                    "role": "assistant", "id": f"msg_{i}",
+                    "error": {"name": "MessageAbortedError", "message": f"abort {i}"},
+                },
+                "parts": [],
+            }]
+            self._notified.clear()
+            agent = agents.get("bck/test")
+            self._run(agent)
+            events_log.append([k for (k, _b) in self._notified])
+        assert events_log[0] == ["aborted"]
+        assert events_log[1] == ["aborted"]
+        assert "phase:failed" in events_log[2], f"expected failed escalation on 3rd, got {events_log[2]}"
+        final = agents.get("bck/test")
+        assert final.phase == "FAILED"
+        assert "aborted 3" in (final.last_error or "")

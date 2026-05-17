@@ -56,6 +56,8 @@ class Agent:
     last_tick_error: str | None = None
     last_tick_error_at: float | None = None
     consecutive_tick_failures: int = 0
+    last_abort_msg_id: str | None = None
+    consecutive_aborts: int = 0
 
 
 class AgentExists(ValueError):

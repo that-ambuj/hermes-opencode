@@ -17,6 +17,10 @@ _LGTM_RE = re.compile(r"\bREVIEW\s*:\s*LGTM\b", re.IGNORECASE)
 _REQUEST_RE = re.compile(r"\bREVIEW\s*:\s*REQUESTS?_CHANGES\b", re.IGNORECASE)
 _COLLISION_SUFFIX_RE = re.compile(r"-\d+$")
 _PR_OPENED_LINE_RE = re.compile(r"PR_OPENED:\s*(https?://[^\s]+/pull/(\d+))", re.IGNORECASE)
+_PR_OPENED_VARIANT_RE = re.compile(
+    r"\b(?:PR[ _-]*OPENED|OPENED[ _-]*PR|PR[ _-]*URL)\b[^h\n]{0,40}(https?://[^\s)]+/pull/(\d+))",
+    re.IGNORECASE,
+)
 _PR_URL_FALLBACK_RE = re.compile(r"https?://github\.com/[^\s)]+/pull/(\d+)")
 
 REVIEWER_AGENT_TYPE = "plan"
@@ -156,25 +160,38 @@ def executor_open_pr_prompt(branch: str, base_branch: str) -> str:
         "Steps (run them in your shell tool, in order):\n"
         "  1. If `git status --porcelain` shows any uncommitted or untracked changes, stage and commit them "
         "     with a single clear commit message that summarizes what you did. Use the user's existing git "
-        "     identity; do NOT pass `-c user.email=...` or `-c user.name=...`.\n"
-        f"  2. Push the branch: `git push -u origin {branch}`.\n"
-        f"  3. Open the PR: `gh pr create --base {base_branch} --title \"<concise title>\" "
-        "--body \"<markdown summary>\"`. The title should describe the change in <= 72 chars. The body should "
-        "be a short markdown summary of what changed and why; reference notable files if helpful. Do NOT paste "
-        "the original task prompt into the body.\n"
-        f"  4. If the PR already exists for branch `{branch}`, run `gh pr view --json url,number` to fetch it "
-        "     instead of failing.\n\n"
-        "After the PR exists, emit ONE line in this exact format on its own line, then stop:\n"
-        "  PR_OPENED: <full github pull request url>\n\n"
+        "     identity; do NOT pass `-c user.email=...` or `-c user.name=...`. If a pre-review staging commit "
+        "     with title `chore: <slug>` already exists at HEAD and you have nothing new to add, you MAY amend "
+        "     it with `git commit --amend -m \"<your real commit message>\"` so the final history reflects "
+        "     what actually changed.\n"
+        f"  2. Push the branch: `git push -u origin {branch}` (use `--force-with-lease` if you amended).\n"
+        f"  3. Open the PR with `gh pr create --base {base_branch} --title \"<your concise title>\" "
+        "--body \"<your markdown summary>\"`. YOU write the title and body. The title should describe the "
+        "change in <= 72 chars. The body should be a short markdown summary of what changed and why; "
+        "reference notable files if helpful. Do NOT paste the original task prompt into the body. Do NOT "
+        "use `--fill` (it would pull from the slug-based staging commit and produce garbage).\n"
+        f"  4. If the PR already exists for branch `{branch}`, run `gh pr view --json url,number` to fetch "
+        "     it instead of failing.\n\n"
+        "After the PR exists, you MUST emit ONE line in this EXACT format on its own line:\n\n"
+        "  PR_OPENED: https://github.com/<owner>/<repo>/pull/<number>\n\n"
+        "Concrete example you can copy the shape of (substitute your real URL):\n"
+        "  PR_OPENED: https://github.com/octocat/hello-world/pull/42\n\n"
+        "The literal `PR_OPENED:` prefix is REQUIRED on its own line. Without it the orchestrator falls "
+        "back to a generic slug-based title and pastes the original task prompt as the body, throwing away "
+        "the title and body you authored. After emitting the line, stop.\n\n"
         "If anything in steps 1-4 fails, fix it and retry. Do not give up silently."
     )
 
 
 def parse_pr_opened(text: str) -> tuple[str, int] | None:
-    m = _PR_OPENED_LINE_RE.search(text or "")
+    src = text or ""
+    m = _PR_OPENED_LINE_RE.search(src)
     if m:
         return m.group(1), int(m.group(2))
-    m = _PR_URL_FALLBACK_RE.search(text or "")
+    m = _PR_OPENED_VARIANT_RE.search(src)
+    if m:
+        return m.group(1), int(m.group(2))
+    m = _PR_URL_FALLBACK_RE.search(src)
     if m:
         return m.group(0), int(m.group(1))
     return None
@@ -190,12 +207,22 @@ async def executor_open_pr(
     except OpencodeError as e:
         logger.warning("executor_open_pr: send_message failed for %s: %s", agent.agent_id, e)
         return None
-    final_text = OpencodeClient.extract_assistant_text(resp)
+    final_text = OpencodeClient.extract_assistant_text(resp) or ""
+    logger.info(
+        "executor_open_pr: %s response received (%d chars, first 800: %s)",
+        agent.agent_id, len(final_text), final_text[:800],
+    )
     parsed = parse_pr_opened(final_text)
     if not parsed:
-        logger.warning("executor_open_pr: no PR url emitted by executor for %s; falling back", agent.agent_id)
+        logger.warning(
+            "executor_open_pr: %s emitted no recognizable PR URL (tried strict / variant / fallback "
+            "regexes); falling back to slug-based finalize_and_open_pr. Full executor response "
+            "(truncated to 4KB) follows:\n%s",
+            agent.agent_id, final_text[:4000],
+        )
         return None
     url, number = parsed
+    logger.info("executor_open_pr: %s parsed PR url=%s number=%d", agent.agent_id, url, number)
     try:
         info = pr.pr_state(worktree, number)
         if info.url:

@@ -39,6 +39,9 @@ SERVE_RESTART_MAX_ATTEMPTS = 5
 SERVE_RESTART_BACKOFF_BASE_SEC = 1.0
 SERVE_DOWN_NOTIFY_COOLDOWN_SEC = 600.0
 SERVE_DOWN_NOTIFY_SINKS = ("cli", "dashboard", "gateway")
+TICK_FAILURE_ESCALATION_THRESHOLD = 3
+ABORT_ESCALATION_THRESHOLD = 3
+ABORT_AUTO_CONTINUE_MESSAGE = "continue"
 
 _state_lock = threading.Lock()
 _thread: threading.Thread | None = None
@@ -68,6 +71,8 @@ _EVENT_GLYPH = {
     "awaiting_human": "⏸",
     "review_started": "🔎",
     "cancelled": "🚫",
+    "tick_error": "⚠",
+    "aborted": "⏹",
 }
 
 
@@ -126,6 +131,10 @@ def _default_event_body(agent: "Agent", kind: str) -> str:
     if kind == "cancelled":
         reason = agent.cancellation_reason or "(no reason recorded)"
         return f"Agent cancelled. Reason: {reason}. Worktree cleaned up."
+    if kind == "tick_error":
+        return f"Tick failed: {agent.last_tick_error or '(no detail)'}"
+    if kind == "aborted":
+        return f"Executor turn aborted. Last error: {agent.last_error or '(no detail)'}"
     return f"{kind} for {agent.agent_id}"
 
 
@@ -827,13 +836,24 @@ def _record_tick_failure(agent: Agent, exc: BaseException) -> None:
     summary = f"{type(exc).__name__}: {str(exc)[:200]}"
     try:
         current = _runtime.agents.get(agent.agent_id)
-        consecutive = (current.consecutive_tick_failures if current else 0) + 1
-        _runtime.agents.update(
+        previous = current.consecutive_tick_failures if current else 0
+        consecutive = previous + 1
+        updated = _runtime.agents.update(
             agent.agent_id,
             last_tick_error=summary,
             last_tick_error_at=time.time(),
             consecutive_tick_failures=consecutive,
         )
+        if previous == 0:
+            _notify_event(updated, "tick_error", f"Tick failed: {summary}")
+        if consecutive >= TICK_FAILURE_ESCALATION_THRESHOLD and updated.phase not in TERMINAL_PHASES:
+            escalated = _runtime.agents.update(
+                agent.agent_id,
+                phase="FAILED",
+                last_error=f"stalled after {consecutive} consecutive tick failures: {summary}",
+            )
+            _maybe_notify_phase(escalated, "failed")
+            _cancel_agent_tasks(agent.agent_id)
     except Exception as e:
         logger.debug("could not record tick failure for %s: %s", agent.agent_id, e)
 
@@ -910,6 +930,100 @@ async def _tick(agent: Agent) -> None:
     await handler(agent)
 
 
+def _message_error(item: dict) -> tuple[str, str] | None:
+    """Extract opencode's structured error from a messages-API item.
+
+    Opencode marks aborted assistant turns by setting `message.error =
+    { name, message }` (e.g. `MessageAbortedError`). The error lives on
+    the message itself, NOT as a text part, so the existing text-part
+    readers in this module miss it entirely. This helper bridges that gap
+    so the orchestrator can surface aborts as events.
+    """
+    message = item.get("message") or {}
+    err = message.get("error") or item.get("error")
+    if not isinstance(err, dict):
+        return None
+    name = err.get("name") or ""
+    if not name:
+        return None
+    return name, err.get("message") or ""
+
+
+async def _check_executor_abort(agent: Agent) -> bool:
+    """Detect a structured error on the executor's latest assistant turn.
+
+    Returns True when an abort was observed (caller should NOT transition
+    the agent this tick). On a newly-observed abort: notifies the user via
+    `"aborted"` event and queues a "continue" follow-up to the executor.
+    Same-`message.id` aborts are idempotent: we record it once, surface it
+    once, and let the executor's own response stream advance state. After
+    `ABORT_ESCALATION_THRESHOLD` distinct aborts the agent is escalated to
+    FAILED. When no abort is observed and the agent has a non-empty abort
+    streak, the streak is cleared as forward progress.
+    """
+    if _runtime is None:
+        return False
+    worktree = Path(agent.worktree_path)
+    try:
+        body = await _runtime.client.get_messages(agent.session_id, worktree)
+    except OpencodeError:
+        return False
+    items = body.get("items") or []
+    latest_err: tuple[str, str] | None = None
+    latest_id: str | None = None
+    for item in reversed(items):
+        message = item.get("message") or {}
+        if message.get("role") != "assistant" and message.get("type") != "assistant":
+            continue
+        latest_err = _message_error(item)
+        latest_id = message.get("id") or item.get("id")
+        break
+    if latest_err is None:
+        if agent.consecutive_aborts > 0 or agent.last_abort_msg_id:
+            _runtime.agents.update(
+                agent.agent_id,
+                consecutive_aborts=0,
+                last_abort_msg_id=None,
+            )
+        return False
+    if latest_id and agent.last_abort_msg_id == latest_id:
+        return True
+    name, err_msg = latest_err
+    consecutive = (agent.consecutive_aborts or 0) + 1
+    updated = _runtime.agents.update(
+        agent.agent_id,
+        last_abort_msg_id=latest_id,
+        consecutive_aborts=consecutive,
+        last_error=f"{name}: {err_msg}" if err_msg else name,
+    )
+    if consecutive >= ABORT_ESCALATION_THRESHOLD and updated.phase not in TERMINAL_PHASES:
+        escalated = _runtime.agents.update(
+            agent.agent_id,
+            phase="FAILED",
+            last_error=f"executor aborted {consecutive} consecutive times: {name}: {err_msg}",
+        )
+        _maybe_notify_phase(escalated, "failed")
+        _cancel_agent_tasks(agent.agent_id)
+        return True
+    body_text = (
+        f"Executor turn aborted (attempt {consecutive}/{ABORT_ESCALATION_THRESHOLD}): "
+        f"{name}"
+        + (f": {err_msg}" if err_msg else "")
+        + f". Auto-sending '{ABORT_AUTO_CONTINUE_MESSAGE}' to the executor."
+    )
+    _notify_event(updated, "aborted", body_text)
+    try:
+        await _runtime.client.send_message_async(
+            agent.session_id, worktree, ABORT_AUTO_CONTINUE_MESSAGE,
+        )
+    except OpencodeError as e:
+        logger.warning(
+            "aborted: send '%s' to %s failed: %s",
+            ABORT_AUTO_CONTINUE_MESSAGE, agent.agent_id, e,
+        )
+    return True
+
+
 async def _phase_executing(agent: Agent) -> None:
     assert _runtime is not None
     worktree = Path(agent.worktree_path)
@@ -920,6 +1034,8 @@ async def _phase_executing(agent: Agent) -> None:
         await asyncio.sleep(5.0)
         return
     if not became_idle:
+        return
+    if await _check_executor_abort(agent):
         return
     questions = await _runtime.client.list_questions(worktree)
     permissions = await _runtime.client.list_permissions(worktree)
@@ -1035,6 +1151,8 @@ async def _phase_executor_addressing(agent: Agent) -> None:
     worktree = Path(agent.worktree_path)
     became_idle = await _runtime.client.wait_idle(agent.session_id, worktree, timeout=60.0)
     if not became_idle:
+        return
+    if await _check_executor_abort(agent):
         return
     questions = await _runtime.client.list_questions(worktree)
     permissions = await _runtime.client.list_permissions(worktree)
