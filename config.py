@@ -77,7 +77,7 @@ def load_entry_config() -> dict:
 class Config:
     server_url: str = DEFAULT_SERVER_URL
     server_password: str | None = None
-    serve_hostname: str | None = None
+    host: str | None = None
     pr_fallback_models: list[str] = field(default_factory=lambda: list(DEFAULT_PR_FALLBACK_MODELS))
     default_base_branch: str = "main"
     worktrees_root: Path = field(default_factory=lambda: plugin_state_dir() / "wt")
@@ -90,7 +90,7 @@ class Config:
     notify_gateway_platform: str | None = None
     notify_gateway_chat_id: str | None = None
     notify_discovery_source: str | None = None
-    notify_events: set[str] = field(default_factory=lambda: {"pr_opened", "done", "failed", "awaiting_human", "review_started", "cancelled", "tick_error", "aborted", "rate_limited", "rate_limit_cleared", "queued", "queue_drained"})
+    notify_events: set[str] = field(default_factory=lambda: {"pr_opened", "done", "failed", "awaiting_human", "awaiting_human_resumed", "review_started", "cancelled", "tick_error", "aborted", "rate_limited", "rate_limit_cleared", "queued", "queue_drained"})
     events_log: Path = field(default_factory=lambda: plugin_state_dir() / "events.log")
     heartbeat_enabled: bool = True
     heartbeat_timezone: str | None = None
@@ -118,7 +118,7 @@ class Config:
         classifier = entry.get("classifier") or {}
         awaiting = entry.get("awaiting_input") or {}
         day_window = heartbeat.get("unconditional_hours", [9, 23])
-        default_events = {"pr_opened", "done", "failed", "awaiting_human", "review_started", "cancelled", "tick_error", "aborted", "rate_limited", "rate_limit_cleared", "queued", "queue_drained"}
+        default_events = {"pr_opened", "done", "failed", "awaiting_human", "awaiting_human_resumed", "review_started", "cancelled", "tick_error", "aborted", "rate_limited", "rate_limit_cleared", "queued", "queue_drained"}
 
         platform = gateway.get("platform")
         explicit_chat_id = gateway.get("chat_id")
@@ -144,7 +144,7 @@ class Config:
         return cls(
             server_url=server.get("url", DEFAULT_SERVER_URL),
             server_password=server.get("password") or os.environ.get("OPENCODE_SERVER_PASSWORD") or None,
-            serve_hostname=server.get("serve_hostname") or os.environ.get("OPENCODE_SERVE_HOSTNAME") or None,
+            host=server.get("host") or os.environ.get("OPENCODE_HOST") or None,
             pr_fallback_models=cls._resolve_pr_fallback_models(server.get("pr_fallback_models")),
             default_base_branch=pr.get("base_branch", "main"),
             auto_spawn_server=bool(entry.get("auto_spawn_server", True)),

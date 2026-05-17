@@ -37,7 +37,7 @@ def build_context() -> CliContext:
     """
     config = Config.from_plugin_entry(load_entry_config())
     config.ensure_dirs()
-    client = OpencodeClient(config.server_url, config.server_password, config.serve_hostname)
+    client = OpencodeClient(config.server_url, config.server_password, config.host)
     projects = ProjectRegistry(config.projects_file)
     agents = AgentStore(config.agents_file)
     return CliContext(config=config, projects=projects, agents=agents, client=client)
@@ -73,13 +73,32 @@ def setup(subparser: argparse.ArgumentParser) -> None:
 
     subs.add_parser("projects", help="List registered projects.")
 
+    spawn_p = subs.add_parser("spawn", help="Spawn a new opencode agent (worktree + session + first turn).")
+    spawn_p.add_argument("project", help="Registered project label.")
+    spawn_p.add_argument("task", help="2-4 kebab-case words; agent_id task slug + branch name.")
+    spawn_p.add_argument("prompt", nargs="+", help="The task body sent VERBATIM to the executor session.")
+    spawn_p.add_argument("--branch", default=None, help="Override the branch name (default: agent_id).")
+    spawn_p.add_argument("--base-branch", dest="base_branch", default=None,
+                         help="Override the base branch to fork from (default: project's base_branch).")
+    spawn_p.add_argument("--agent", default="build", help="Opencode agent type (default: build).")
+
+    resume_p = subs.add_parser(
+        "resume-pr",
+        help="Resume work on an open PR: checks out its branch and dispatches a follow-up prompt.",
+    )
+    resume_p.add_argument("project", help="Registered project label.")
+    resume_p.add_argument("pr_number", type=int, help="Open PR number on the project's github repo.")
+    resume_p.add_argument("prompt", nargs="+", help="The follow-up task sent VERBATIM to the executor session.")
+    resume_p.add_argument("--skip-review", dest="skip_review", action="store_true",
+                          help="Skip the review cycle (trivial follow-ups). Agent goes straight from EXECUTING to COMMITTING.")
+
     subparser.set_defaults(func=handler)
 
 
 def handler(args: argparse.Namespace) -> int:
     sub = getattr(args, "oco_command", None)
     if not sub:
-        print("usage: hermes oco {list,status,attach,kill,projects}", file=sys.stderr)
+        print("usage: hermes oco {list,status,attach,kill,cancel,projects,spawn,resume-pr}", file=sys.stderr)
         return 2
     dispatch = _DISPATCH.get(sub)
     if dispatch is None:
@@ -331,6 +350,82 @@ def _print_agent_summary(payload: dict[str, Any]) -> None:
         print(f"  {k.ljust(width)}  {v}")
 
 
+def cmd_spawn(args: argparse.Namespace) -> int:
+    ctx = build_context()
+    from . import tools as tools_mod
+    spawn_fn = tools_mod.make_spawn(ctx_to_runtime(ctx))
+    prompt = " ".join(args.prompt)
+    payload: dict[str, Any] = {
+        "project": args.project, "task": args.task, "prompt": prompt,
+    }
+    if args.branch:
+        payload["branch"] = args.branch
+    if args.base_branch:
+        payload["base_branch"] = args.base_branch
+    if args.agent and args.agent != "build":
+        payload["agent"] = args.agent
+    try:
+        result = asyncio.run(spawn_fn(payload))
+    except OpencodeError as e:
+        print(f"spawn failed: {e}", file=sys.stderr)
+        return 1
+    return _print_spawn_result(result, kind="spawn")
+
+
+def cmd_resume_pr(args: argparse.Namespace) -> int:
+    ctx = build_context()
+    from . import tools as tools_mod
+    resume_fn = tools_mod.make_resume_pr(ctx_to_runtime(ctx))
+    prompt = " ".join(args.prompt)
+    payload: dict[str, Any] = {
+        "project": args.project,
+        "pr_number": int(args.pr_number),
+        "prompt": prompt,
+        "skip_review": bool(getattr(args, "skip_review", False)),
+    }
+    try:
+        result = asyncio.run(resume_fn(payload))
+    except OpencodeError as e:
+        print(f"resume-pr failed: {e}", file=sys.stderr)
+        return 1
+    return _print_spawn_result(result, kind="resume-pr")
+
+
+def ctx_to_runtime(ctx: "CliContext"):
+    from . import tools as tools_mod
+    return tools_mod.Runtime(
+        config=ctx.config, client=ctx.client,
+        projects=ctx.projects, agents=ctx.agents,
+    )
+
+
+def _print_spawn_result(result: str, *, kind: str) -> int:
+    try:
+        payload = json.loads(result)
+    except (ValueError, TypeError):
+        print(result)
+        return 0
+    if not payload.get("ok"):
+        print(f"{kind} failed: {payload.get('error', 'unknown')}", file=sys.stderr)
+        return 1
+    d = payload.get("data") or {}
+    print(f"{kind} ok: agent_id={d.get('agent_id')}")
+    for k in ("branch", "session_id", "worktree_path", "pr_url", "pr_number"):
+        v = d.get(k)
+        if v is not None:
+            print(f"  {k}: {v}")
+    if d.get("blocked_by"):
+        print(f"  QUEUED, blocked_by: {', '.join(d['blocked_by'])}")
+    if d.get("skip_review"):
+        print("  skip_review: true")
+    print(
+        "\nnote: hermes must be running for the bg event loop to drive this "
+        "agent. If hermes isn't running right now, the agent will progress on "
+        "its next startup."
+    )
+    return 0
+
+
 _DISPATCH = {
     "list": cmd_list,
     "status": cmd_status,
@@ -338,6 +433,8 @@ _DISPATCH = {
     "kill": cmd_kill,
     "cancel": cmd_cancel,
     "projects": cmd_projects,
+    "spawn": cmd_spawn,
+    "resume-pr": cmd_resume_pr,
 }
 
 

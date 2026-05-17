@@ -43,20 +43,22 @@ class OpencodeClient:
         self,
         base_url: str,
         password: str | None = None,
-        serve_hostname: str | None = None,
+        host: str | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self._headers: dict[str, str] = {}
         if password:
             self._headers["x-opencode-password"] = password
         parsed = urlparse(self.base_url)
-        self._host = parsed.hostname or "127.0.0.1"
+        self._connect_host = parsed.hostname or "127.0.0.1"
         self._port = parsed.port or 80
-        # `_host` is used to CONNECT (loopback probe + httpx target). `_serve_hostname`
-        # is what we pass to `opencode serve --hostname=...` when auto-spawning. The two
-        # diverge when the user wants opencode to bind to e.g. 0.0.0.0 (reachable from
-        # other hosts) while hermes itself still connects via 127.0.0.1.
-        self._serve_hostname = serve_hostname or self._host
+        # `_connect_host` is used to CONNECT (loopback probe + httpx target via
+        # base_url). `_bind_host` is what we pass to `opencode serve --host=...`
+        # when auto-spawning. The two diverge when the user wants opencode to
+        # bind to e.g. 0.0.0.0 (reachable from other hosts) while hermes
+        # itself still connects via 127.0.0.1. The connect path NEVER uses
+        # `_bind_host` because 0.0.0.0 is a bind-only address.
+        self._bind_host = host or self._connect_host
         self._spawned: subprocess.Popen[str] | None = None
         self._spawn_lock = threading.Lock()
         self._last_serve_log_path: Path | None = None
@@ -85,7 +87,7 @@ class OpencodeClient:
 
     def ensure_server(self, deadline_sec: float = 15.0, log_dir: Path | None = None) -> None:
         with self._spawn_lock:
-            if self._port_open(self._host, self._port):
+            if self._port_open(self._connect_host, self._port):
                 return
             self._reap_tracked_spawn()
             binary = shutil.which("opencode")
@@ -104,7 +106,7 @@ class OpencodeClient:
             log_path = self._prepare_serve_log_path(log_dir)
             log_handle = self._open_serve_log(log_path)
             self._spawned = subprocess.Popen(
-                [binary, "serve", f"--hostname={self._serve_hostname}", f"--port={self._port}"],
+                [binary, "serve", f"--host={self._bind_host}", f"--port={self._port}"],
                 stdout=log_handle if log_handle is not None else subprocess.DEVNULL,
                 stderr=subprocess.STDOUT if log_handle is not None else subprocess.DEVNULL,
                 text=True,
@@ -128,7 +130,7 @@ class OpencodeClient:
                         f"opencode serve exited during startup (rc={exit_code})"
                         + (f"; last log lines:\n{detail}" if detail else "")
                     )
-                if self._port_open(self._host, self._port):
+                if self._port_open(self._connect_host, self._port):
                     return
                 time.sleep(0.2)
             try:

@@ -12,6 +12,7 @@ PHASES = {
     "QUEUED",
     "BOOTSTRAPPING",
     "EXECUTING",
+    "AWAITING_HUMAN",
     "IDLE_TASK_COMPLETE",
     "REVIEW_SPAWNING",
     "REVIEWING",
@@ -64,6 +65,8 @@ class Agent:
     rate_limit_retry_after_at: float | None = None
     phase_before_rate_limit: str | None = None
     queued_blocked_by: list[str] = field(default_factory=list)
+    phase_before_awaiting: str | None = None
+    awaiting_human_since: float | None = None
 
 
 class AgentExists(ValueError):

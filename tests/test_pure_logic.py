@@ -932,57 +932,60 @@ class TestAtAgentDirectDispatch:
         assert captured == [], "send_message_async must NOT be called for /oc"
 
 
-class TestServeHostnameConfig:
-    """v0.14.5: Config.serve_hostname overrides the `opencode serve --hostname=`
-    bind address independently of the connect URL, so a user can expose
-    opencode serve to other hosts (e.g. 0.0.0.0) while hermes itself still
-    connects via loopback.
+class TestHostConfig:
+    """v0.14.5 introduced a bind-host override for `opencode serve`; v0.16.0
+    renamed it `serve_hostname` -> `host` and changed the spawn flag from
+    `--hostname=` to `--host=`. The override sets the bind address
+    independently of the connect URL, so a user can expose opencode serve
+    to other hosts (e.g. 0.0.0.0) while hermes itself still connects via
+    loopback. The connect path never uses the bind host because 0.0.0.0
+    is bind-only.
     """
 
     def setup_method(self):
         self._config_mod = sys.modules["_oco_test_pkg.config"]
         self._transport_mod = sys.modules["_oco_test_pkg.transport"]
 
-    def test_config_default_serve_hostname_is_none(self):
+    def test_config_default_host_is_none(self):
         cfg = self._config_mod.Config.from_plugin_entry({})
-        assert cfg.serve_hostname is None
+        assert cfg.host is None
 
-    def test_config_reads_yaml_serve_hostname(self):
+    def test_config_reads_yaml_host(self):
         cfg = self._config_mod.Config.from_plugin_entry({
-            "opencode_server": {"url": "http://127.0.0.1:4096", "serve_hostname": "0.0.0.0"},
+            "opencode_server": {"url": "http://127.0.0.1:4096", "host": "0.0.0.0"},
         })
-        assert cfg.serve_hostname == "0.0.0.0"
+        assert cfg.host == "0.0.0.0"
 
-    def test_config_reads_env_var_serve_hostname(self, monkeypatch):
-        monkeypatch.setenv("OPENCODE_SERVE_HOSTNAME", "192.168.1.10")
+    def test_config_reads_env_var_host(self, monkeypatch):
+        monkeypatch.setenv("OPENCODE_HOST", "192.168.1.10")
         cfg = self._config_mod.Config.from_plugin_entry({})
-        assert cfg.serve_hostname == "192.168.1.10"
+        assert cfg.host == "192.168.1.10"
 
     def test_config_yaml_overrides_env_var(self, monkeypatch):
-        monkeypatch.setenv("OPENCODE_SERVE_HOSTNAME", "from-env")
+        monkeypatch.setenv("OPENCODE_HOST", "from-env")
         cfg = self._config_mod.Config.from_plugin_entry({
-            "opencode_server": {"serve_hostname": "from-yaml"},
+            "opencode_server": {"host": "from-yaml"},
         })
-        assert cfg.serve_hostname == "from-yaml"
+        assert cfg.host == "from-yaml"
 
-    def test_client_default_serve_hostname_falls_back_to_url_host(self):
+    def test_client_default_host_falls_back_to_url_host(self):
         c = self._transport_mod.OpencodeClient("http://127.0.0.1:4096")
-        assert c._host == "127.0.0.1"
-        assert c._serve_hostname == "127.0.0.1"
+        assert c._connect_host == "127.0.0.1"
+        assert c._bind_host == "127.0.0.1"
 
-    def test_client_serve_hostname_override_does_not_change_connect_host(self):
+    def test_client_host_override_does_not_change_connect_host(self):
         c = self._transport_mod.OpencodeClient(
-            "http://127.0.0.1:4096", None, serve_hostname="0.0.0.0",
+            "http://127.0.0.1:4096", None, host="0.0.0.0",
         )
-        assert c._host == "127.0.0.1", "connect host stays parsed from URL"
-        assert c._serve_hostname == "0.0.0.0", "bind host honors override"
+        assert c._connect_host == "127.0.0.1", "connect host stays parsed from URL"
+        assert c._bind_host == "0.0.0.0", "bind host honors override"
 
-    def test_client_serve_hostname_empty_falls_back_to_url_host(self):
+    def test_client_host_empty_falls_back_to_url_host(self):
         c = self._transport_mod.OpencodeClient(
-            "http://10.0.0.5:9000", None, serve_hostname=None,
+            "http://10.0.0.5:9000", None, host=None,
         )
-        assert c._host == "10.0.0.5"
-        assert c._serve_hostname == "10.0.0.5"
+        assert c._connect_host == "10.0.0.5"
+        assert c._bind_host == "10.0.0.5"
 
 
 class TestParsePrOpenedAcceptsVariants:
@@ -2025,3 +2028,444 @@ class TestCheckSessionRateLimited:
         ))
         assert result is False
         assert self._notified == []
+
+
+class TestAwaitingHumanPhase:
+    """v0.16.0: awaiting_human is now a proper phase. Entry sets
+    phase_before_awaiting; exit restores it via _phase_awaiting_human.
+    """
+
+    def setup_method(self):
+        self._notified: list = []
+        self._saved_pkg_runtime = plugin_mod._runtime
+        self._saved_evloop_runtime = event_loop_mod._runtime
+        self._saved_notify = event_loop_mod._notify_event
+        event_loop_mod._notify_event = lambda agent, kind, body="": self._notified.append((kind, body, agent.phase))
+
+    def teardown_method(self):
+        plugin_mod._runtime = self._saved_pkg_runtime
+        event_loop_mod._runtime = self._saved_evloop_runtime
+        event_loop_mod._notify_event = self._saved_notify
+
+    def _setup(self, tmp_path, agent_phase="EXECUTING"):
+        cfg = config_mod.Config(
+            projects_file=tmp_path / "projects.json",
+            agents_file=tmp_path / "agents.json",
+            worktrees_root=tmp_path / "wt",
+            logs_dir=tmp_path / "logs",
+            notifications_file=tmp_path / "notifications.jsonl",
+        )
+        cfg.ensure_dirs()
+        agents = state_mod.AgentStore(cfg.agents_file)
+        agent = state_mod.Agent(
+            agent_id="bck/test", project_label="bck",
+            worktree_path=str(tmp_path), session_id="s",
+            branch="bck/test", initial_prompt="p", phase=agent_phase,
+        )
+        agents.add(agent)
+        tools_mod = sys.modules["_oco_test_pkg.tools"]
+        rt = tools_mod.Runtime(config=cfg, client=None, projects=None, agents=agents)
+        plugin_mod._runtime = rt
+        event_loop_mod._runtime = rt
+        return agents
+
+    def test_enter_from_executing_saves_prior_phase(self, tmp_path: Path):
+        agents = self._setup(tmp_path, "EXECUTING")
+        agent = agents.get("bck/test")
+        event_loop_mod._enter_awaiting_human(agent, "test body")
+        refreshed = agents.get("bck/test")
+        assert refreshed.phase == "AWAITING_HUMAN"
+        assert refreshed.phase_before_awaiting == "EXECUTING"
+        assert refreshed.awaiting_human_since is not None
+        assert refreshed.last_awaiting_notify_at is not None
+        kinds = [k for (k, _b, _p) in self._notified]
+        assert kinds == ["awaiting_human"]
+
+    def test_enter_from_executor_addressing_saves_prior_phase(self, tmp_path: Path):
+        agents = self._setup(tmp_path, "EXECUTOR_ADDRESSING")
+        agent = agents.get("bck/test")
+        event_loop_mod._enter_awaiting_human(agent, "...")
+        assert agents.get("bck/test").phase_before_awaiting == "EXECUTOR_ADDRESSING"
+
+    def test_re_enter_does_not_overwrite_prior_phase(self, tmp_path: Path):
+        agents = self._setup(tmp_path, "EXECUTING")
+        agent = agents.get("bck/test")
+        event_loop_mod._enter_awaiting_human(agent, "first")
+        first_since = agents.get("bck/test").awaiting_human_since
+        agent_after_first = agents.get("bck/test")
+        event_loop_mod._enter_awaiting_human(agent_after_first, "reminder")
+        refreshed = agents.get("bck/test")
+        assert refreshed.phase_before_awaiting == "EXECUTING", (
+            "re-entry from AWAITING_HUMAN must not overwrite phase_before"
+        )
+        assert refreshed.awaiting_human_since == first_since, (
+            "awaiting_human_since must not reset on reminder fire"
+        )
+        kinds = [k for (k, _b, _p) in self._notified]
+        assert kinds == ["awaiting_human", "awaiting_human"]
+
+
+class TestPhaseAwaitingHumanHandler:
+    """v0.16.0: _phase_awaiting_human polls list_questions/list_permissions
+    and re-runs the classifier; restores phase_before_awaiting when both
+    say not-awaiting.
+    """
+
+    def setup_method(self):
+        self._notified: list = []
+        self._saved_pkg_runtime = plugin_mod._runtime
+        self._saved_evloop_runtime = event_loop_mod._runtime
+        self._saved_notify = event_loop_mod._notify_event
+        self._saved_check = sys.modules["_oco_test_pkg.awaiting_input"].check
+        event_loop_mod._notify_event = lambda agent, kind, body="": self._notified.append((kind, body))
+
+    def teardown_method(self):
+        plugin_mod._runtime = self._saved_pkg_runtime
+        event_loop_mod._runtime = self._saved_evloop_runtime
+        event_loop_mod._notify_event = self._saved_notify
+        sys.modules["_oco_test_pkg.awaiting_input"].check = self._saved_check
+
+    def _setup(self, tmp_path, questions: list, permissions: list, latest_text="resumed work"):
+        cfg = config_mod.Config(
+            projects_file=tmp_path / "projects.json",
+            agents_file=tmp_path / "agents.json",
+            worktrees_root=tmp_path / "wt",
+            logs_dir=tmp_path / "logs",
+            notifications_file=tmp_path / "notifications.jsonl",
+        )
+        cfg.ensure_dirs()
+        agents = state_mod.AgentStore(cfg.agents_file)
+        agent = state_mod.Agent(
+            agent_id="bck/test", project_label="bck",
+            worktree_path=str(tmp_path), session_id="exec-s",
+            branch="bck/test", initial_prompt="p",
+            phase="AWAITING_HUMAN",
+            phase_before_awaiting="EXECUTING",
+            awaiting_human_since=time.time() - 30.0,
+        )
+        agents.add(agent)
+        text_box = [latest_text]
+
+        class FakeClient:
+            async def list_questions(self_inner, directory):
+                return questions
+            async def list_permissions(self_inner, directory):
+                return permissions
+            async def get_messages(self_inner, session_id, directory, cursor=None):
+                return {"items": [{
+                    "message": {"role": "assistant", "id": "m"},
+                    "parts": [{"type": "text", "text": text_box[0]}],
+                }]}
+
+        tools_mod = sys.modules["_oco_test_pkg.tools"]
+        rt = tools_mod.Runtime(config=cfg, client=FakeClient(), projects=None, agents=agents)
+        plugin_mod._runtime = rt
+        event_loop_mod._runtime = rt
+        return agents
+
+    def test_pending_question_stays_awaiting(self, tmp_path: Path):
+        import asyncio
+        agents = self._setup(tmp_path, questions=[
+            {"sessionID": "exec-s", "id": "q1", "questions": [{"question": "choose?"}]},
+        ], permissions=[])
+        agent = agents.get("bck/test")
+        async def _fast():
+            event_loop_mod.RATE_LIMIT_MAX_TICK_WAIT_SEC = 0
+            await event_loop_mod._phase_awaiting_human(agent)
+        asyncio.run(_fast())
+        assert agents.get("bck/test").phase == "AWAITING_HUMAN"
+        assert self._notified == []
+
+    def test_pending_permission_stays_awaiting(self, tmp_path: Path):
+        import asyncio
+        agents = self._setup(tmp_path, questions=[], permissions=[
+            {"sessionID": "exec-s", "id": "p1", "permission": "bash"},
+        ])
+        agent = agents.get("bck/test")
+        asyncio.run(event_loop_mod._phase_awaiting_human(agent))
+        assert agents.get("bck/test").phase == "AWAITING_HUMAN"
+
+    def test_classifier_still_awaiting_keeps_phase(self, tmp_path: Path):
+        import asyncio
+        from dataclasses import dataclass
+        awaiting_mod = sys.modules["_oco_test_pkg.awaiting_input"]
+        @dataclass
+        class StubCheck:
+            awaiting: bool = True
+            source: str = "test"
+            confidence: str = "high"
+            reason: str = "still asking"
+            last_assistant_text: str = "what should I do?"
+        async def _stub_check(runtime, text):
+            return StubCheck()
+        awaiting_mod.check = _stub_check
+        agents = self._setup(tmp_path, questions=[], permissions=[], latest_text="what should I do?")
+        agent = agents.get("bck/test")
+        asyncio.run(event_loop_mod._phase_awaiting_human(agent))
+        assert agents.get("bck/test").phase == "AWAITING_HUMAN"
+
+    def test_clear_restores_prior_phase_and_fires_resumed(self, tmp_path: Path):
+        import asyncio
+        from dataclasses import dataclass
+        awaiting_mod = sys.modules["_oco_test_pkg.awaiting_input"]
+        @dataclass
+        class StubCheck:
+            awaiting: bool = False
+            source: str = "test"
+            confidence: str = "high"
+            reason: str = "not asking"
+            last_assistant_text: str = "done with that"
+        async def _stub_check(runtime, text):
+            return StubCheck()
+        awaiting_mod.check = _stub_check
+        agents = self._setup(tmp_path, questions=[], permissions=[], latest_text="done with that")
+        agent = agents.get("bck/test")
+        asyncio.run(event_loop_mod._phase_awaiting_human(agent))
+        refreshed = agents.get("bck/test")
+        assert refreshed.phase == "EXECUTING"
+        assert refreshed.phase_before_awaiting is None
+        assert refreshed.awaiting_human_since is None
+        kinds = [k for (k, _b) in self._notified]
+        assert "awaiting_human_resumed" in kinds
+
+    def test_clear_with_no_prior_phase_defaults_to_executing(self, tmp_path: Path):
+        import asyncio
+        from dataclasses import dataclass
+        awaiting_mod = sys.modules["_oco_test_pkg.awaiting_input"]
+        @dataclass
+        class StubCheck:
+            awaiting: bool = False
+            source: str = "test"
+            confidence: str = "high"
+            reason: str = ""
+            last_assistant_text: str = ""
+        async def _stub_check(runtime, text):
+            return StubCheck()
+        awaiting_mod.check = _stub_check
+        agents = self._setup(tmp_path, questions=[], permissions=[])
+        agents.update("bck/test", phase_before_awaiting=None)
+        agent = agents.get("bck/test")
+        asyncio.run(event_loop_mod._phase_awaiting_human(agent))
+        assert agents.get("bck/test").phase == "EXECUTING"
+
+
+class TestAwaitingHumanReminderLoopScansNewPhase:
+    """v0.16.0: _run_awaiting_input_reminders now scans AWAITING_HUMAN
+    instead of EXECUTING/EXECUTOR_ADDRESSING.
+    """
+
+    def setup_method(self):
+        self._notified: list = []
+        self._saved_pkg_runtime = plugin_mod._runtime
+        self._saved_evloop_runtime = event_loop_mod._runtime
+        self._saved_notify = event_loop_mod._notify_event
+        event_loop_mod._notify_event = lambda agent, kind, body="": self._notified.append((kind, body))
+
+    def teardown_method(self):
+        plugin_mod._runtime = self._saved_pkg_runtime
+        event_loop_mod._runtime = self._saved_evloop_runtime
+        event_loop_mod._notify_event = self._saved_notify
+
+    def test_awaiting_human_agent_gets_reminder_after_interval(self, tmp_path: Path):
+        cfg = config_mod.Config(
+            projects_file=tmp_path / "projects.json",
+            agents_file=tmp_path / "agents.json",
+            worktrees_root=tmp_path / "wt",
+            logs_dir=tmp_path / "logs",
+            notifications_file=tmp_path / "notifications.jsonl",
+            awaiting_input_reminder_interval_sec=0.0001,
+        )
+        cfg.ensure_dirs()
+        agents = state_mod.AgentStore(cfg.agents_file)
+        agent = state_mod.Agent(
+            agent_id="bck/test", project_label="bck",
+            worktree_path=str(tmp_path), session_id="s",
+            branch="bck/test", initial_prompt="p",
+            phase="AWAITING_HUMAN",
+            last_awaiting_notify_at=time.time() - 10.0,
+            last_classifier_verdict={
+                "reason": "asking which option",
+                "last_assistant_text": "A or B?",
+            },
+        )
+        agents.add(agent)
+        tools_mod = sys.modules["_oco_test_pkg.tools"]
+        rt = tools_mod.Runtime(config=cfg, client=None, projects=None, agents=agents)
+        plugin_mod._runtime = rt
+        event_loop_mod._runtime = rt
+        event_loop_mod._run_awaiting_input_reminders()
+        kinds = [k for (k, _b) in self._notified]
+        assert kinds == ["awaiting_human"]
+
+    def test_executing_agent_no_longer_triggers_reminder(self, tmp_path: Path):
+        cfg = config_mod.Config(
+            projects_file=tmp_path / "projects.json",
+            agents_file=tmp_path / "agents.json",
+            worktrees_root=tmp_path / "wt",
+            logs_dir=tmp_path / "logs",
+            notifications_file=tmp_path / "notifications.jsonl",
+            awaiting_input_reminder_interval_sec=0.0001,
+        )
+        cfg.ensure_dirs()
+        agents = state_mod.AgentStore(cfg.agents_file)
+        agent = state_mod.Agent(
+            agent_id="bck/test", project_label="bck",
+            worktree_path=str(tmp_path), session_id="s",
+            branch="bck/test", initial_prompt="p",
+            phase="EXECUTING",
+            last_awaiting_notify_at=time.time() - 10.0,
+        )
+        agents.add(agent)
+        tools_mod = sys.modules["_oco_test_pkg.tools"]
+        rt = tools_mod.Runtime(config=cfg, client=None, projects=None, agents=agents)
+        plugin_mod._runtime = rt
+        event_loop_mod._runtime = rt
+        event_loop_mod._run_awaiting_input_reminders()
+        assert self._notified == []
+
+
+class TestOcSpawnSlashCommand:
+    """v0.16.0: /oc spawn slash command parses <project> <task> <prompt>
+    and forwards to make_spawn via run_blocking.
+    """
+
+    def setup_method(self):
+        self._commands_mod = sys.modules["_oco_test_pkg.commands"]
+
+    def test_help_shown_on_no_args(self, tmp_path: Path):
+        tools_mod = sys.modules["_oco_test_pkg.tools"]
+        rt = tools_mod.Runtime(config=None, client=None, projects=None, agents=None)
+        h = self._commands_mod.make_oc_spawn(rt)
+        out = h("")
+        assert "usage:" in out
+        assert "<project>" in out
+        assert "<task>" in out
+        assert "<prompt>" in out
+
+    def test_help_flag(self, tmp_path: Path):
+        tools_mod = sys.modules["_oco_test_pkg.tools"]
+        rt = tools_mod.Runtime(config=None, client=None, projects=None, agents=None)
+        h = self._commands_mod.make_oc_spawn(rt)
+        assert "usage:" in h("--help")
+        assert "usage:" in h("help")
+
+    def test_too_few_args(self, tmp_path: Path):
+        tools_mod = sys.modules["_oco_test_pkg.tools"]
+        rt = tools_mod.Runtime(config=None, client=None, projects=None, agents=None)
+        h = self._commands_mod.make_oc_spawn(rt)
+        out = h("dodo fix-login")
+        assert "needs 3 args" in out
+
+
+class TestOcResumePrSlashCommand:
+    """v0.16.0: /oc resume-pr slash command parses
+    <project> <pr_number> [--skip-review] <prompt> and forwards to
+    make_resume_pr via run_blocking.
+    """
+
+    def setup_method(self):
+        self._commands_mod = sys.modules["_oco_test_pkg.commands"]
+
+    def test_help_shown_on_no_args(self):
+        tools_mod = sys.modules["_oco_test_pkg.tools"]
+        rt = tools_mod.Runtime(config=None, client=None, projects=None, agents=None)
+        h = self._commands_mod.make_oc_resume_pr(rt)
+        out = h("")
+        assert "usage:" in out
+        assert "--skip-review" in out
+
+    def test_invalid_pr_number(self):
+        tools_mod = sys.modules["_oco_test_pkg.tools"]
+        rt = tools_mod.Runtime(config=None, client=None, projects=None, agents=None)
+        h = self._commands_mod.make_oc_resume_pr(rt)
+        out = h("dodo abc address comments")
+        assert "invalid pr_number" in out
+
+    def test_skip_review_flag_parsed_anywhere_in_args(self, tmp_path: Path, monkeypatch):
+        """--skip-review can appear at any position; it's stripped before
+        positional parsing."""
+        called = {}
+        tools_mod = sys.modules["_oco_test_pkg.tools"]
+        async def fake_handler(args):
+            called.update(args)
+            import json
+            return json.dumps({"ok": True, "data": {
+                "agent_id": "x/r", "pr_number": 42, "pr_url": "u",
+                "branch": "b", "session_id": "s", "worktree_path": "w",
+                "skip_review": args.get("skip_review", False),
+            }})
+        monkeypatch.setattr(tools_mod, "make_resume_pr", lambda rt: fake_handler)
+        rt = tools_mod.Runtime(config=None, client=None, projects=None, agents=None)
+        h = self._commands_mod.make_oc_resume_pr(rt)
+        out = h("dodo 42 --skip-review address reptiles review")
+        assert called["project"] == "dodo"
+        assert called["pr_number"] == 42
+        assert called["skip_review"] is True
+        assert called["prompt"] == "address reptiles review"
+        assert "resumed PR #42" in out
+
+
+class TestResumePrHandler:
+    """v0.16.0: oc_resume_pr handler covers gh pr view path, branch
+    checkout, session creation, and agent record with pr_url + pr_number
+    pre-populated.
+    """
+
+    def setup_method(self):
+        self._tools_mod = sys.modules["_oco_test_pkg.tools"]
+        self._wt_mod = sys.modules["_oco_test_pkg.worktree"]
+        self._bootstrap_mod = sys.modules["_oco_test_pkg.bootstrap"]
+
+    def _make_runtime(self, tmp_path, projects_dict, fake_client, gh_pr_view_response: dict, project_label="bck"):
+        cfg = config_mod.Config(
+            projects_file=tmp_path / "projects.json",
+            agents_file=tmp_path / "agents.json",
+            worktrees_root=tmp_path / "wt",
+            logs_dir=tmp_path / "logs",
+            notifications_file=tmp_path / "notifications.jsonl",
+        )
+        cfg.ensure_dirs()
+        agents = state_mod.AgentStore(cfg.agents_file)
+        projects = sys.modules["_oco_test_pkg.projects"]
+        registry = projects.ProjectRegistry(cfg.projects_file)
+        (tmp_path / "fake-repo" / ".git").mkdir(parents=True, exist_ok=True)
+        registry.add(label=project_label, repo_path=tmp_path / "fake-repo",
+                     base_branch="main", abbrev="bck")
+        rt = self._tools_mod.Runtime(
+            config=cfg, client=fake_client, projects=registry, agents=agents,
+        )
+        return rt, agents, registry
+
+    def test_unknown_project_returns_error(self, tmp_path: Path):
+        import asyncio, json
+        rt, agents, _ = self._make_runtime(
+            tmp_path, {}, None, gh_pr_view_response={},
+            project_label="bck",
+        )
+        handler = self._tools_mod.make_resume_pr(rt)
+        result = asyncio.run(handler({
+            "project": "no-such", "pr_number": 1, "prompt": "x",
+        }))
+        payload = json.loads(result)
+        assert payload["ok"] is False
+        assert "unknown project" in payload["error"]
+
+    def test_pr_not_open_returns_error(self, tmp_path: Path, monkeypatch):
+        import asyncio, json, subprocess as _sp
+        pr_resp = {"state": "MERGED", "headRefName": "x", "url": "u", "number": 1}
+        class FakeResult:
+            returncode = 0
+            stdout = json.dumps(pr_resp)
+            stderr = ""
+        monkeypatch.setattr(_sp, "run", lambda *a, **kw: FakeResult())
+        rt, agents, _ = self._make_runtime(
+            tmp_path, {}, None, gh_pr_view_response=pr_resp,
+        )
+        handler = self._tools_mod.make_resume_pr(rt)
+        result = asyncio.run(handler({
+            "project": "bck", "pr_number": 1, "prompt": "x",
+        }))
+        payload = json.loads(result)
+        assert payload["ok"] is False
+        assert "MERGED" in payload["error"]
+        assert "OPEN" in payload["error"]

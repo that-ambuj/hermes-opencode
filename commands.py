@@ -31,7 +31,9 @@ def _format_age(seconds: float) -> str:
 
 
 _PHASE_GLYPH = {
+    "QUEUED": "⏳",
     "EXECUTING": "▶",
+    "AWAITING_HUMAN": "✋",
     "EXECUTOR_ADDRESSING": "▶",
     "IDLE_TASK_COMPLETE": "⏸",
     "IDLE_REVIEW_ADDRESSED": "⏸",
@@ -40,6 +42,7 @@ _PHASE_GLYPH = {
     "REVIEW_DELIVERED": "🔎",
     "COMMITTING": "💾",
     "PR_OPEN": "🔗",
+    "RATE_LIMITED": "⏳",
     "DONE": "✓",
     "FAILED": "✗",
     "KILLED": "🛑",
@@ -357,6 +360,117 @@ def make_oc_cancel(runtime: "Runtime") -> Callable[[str], str]:
     return handler
 
 
+def make_oc_spawn(runtime: "Runtime") -> Callable[[str], str]:
+    def handler(raw_args: str) -> str:
+        text = (raw_args or "").strip()
+        if not text or text in {"help", "-h", "--help"}:
+            return (
+                "usage: /oc spawn <project> <task> <prompt>\n"
+                "\n"
+                "  project   registered project label (see /oc list-projects or oc_project_list)\n"
+                "  task      2-4 kebab-case words; becomes the agent_id task slug and branch name\n"
+                "  prompt    the actual task body, sent VERBATIM to the executor opencode session\n"
+                "\n"
+                "example:\n"
+                "  /oc spawn dodo fix-login \"users cant sign in with apple sso\""
+            )
+        parts = text.split(None, 2)
+        if len(parts) < 3:
+            return (
+                "/oc spawn needs 3 args: project, task, prompt. "
+                "try `/oc spawn --help`."
+            )
+        project_label, task, prompt = parts[0], parts[1], parts[2]
+        try:
+            from . import tools as tools_mod
+            spawn_fn = tools_mod.make_spawn(runtime)
+            result = event_loop.run_blocking(
+                lambda: spawn_fn({"project": project_label, "task": task, "prompt": prompt}),
+            )
+        except RuntimeError as e:
+            return f"/oc spawn error: {e}"
+        import json
+        try:
+            payload = json.loads(result)
+        except (ValueError, TypeError):
+            return result
+        if not payload.get("ok"):
+            return f"spawn failed: {payload.get('error', 'unknown')}"
+        d = payload.get("data") or {}
+        lines = [
+            f"spawned {d.get('agent_id')}",
+            f"  branch:   {d.get('branch')}",
+            f"  session:  {d.get('session_id')}",
+            f"  worktree: {d.get('worktree_path')}",
+        ]
+        if d.get("blocked_by"):
+            lines.append(f"  QUEUED · blocked by: {', '.join(d['blocked_by'])}")
+        boot = d.get("bootstrap") or {}
+        if boot:
+            lines.append(f"  bootstrap: {boot.get('method', '?')} ({'ok' if boot.get('ok') else 'failed'})")
+        return "\n".join(lines)
+    return handler
+
+
+def make_oc_resume_pr(runtime: "Runtime") -> Callable[[str], str]:
+    def handler(raw_args: str) -> str:
+        text = (raw_args or "").strip()
+        if not text or text in {"help", "-h", "--help"}:
+            return (
+                "usage: /oc resume-pr <project> <pr_number> [--skip-review] <prompt>\n"
+                "\n"
+                "  project       registered project label\n"
+                "  pr_number     open PR number on the project's github repo\n"
+                "  --skip-review optional; on success the agent skips the review cycle\n"
+                "                and goes straight to commit + PR-update on the existing branch\n"
+                "  prompt        the follow-up task, sent VERBATIM to the executor opencode session\n"
+                "\n"
+                "example:\n"
+                "  /oc resume-pr dodo 42 address reptiles review comments"
+            )
+        tokens = text.split()
+        skip_review = "--skip-review" in tokens
+        tokens = [t for t in tokens if t != "--skip-review"]
+        if len(tokens) < 3:
+            return "/oc resume-pr needs project + pr_number + prompt; try `/oc resume-pr --help`."
+        project_label = tokens[0]
+        try:
+            pr_number = int(tokens[1])
+        except ValueError:
+            return f"invalid pr_number: {tokens[1]!r}"
+        prompt = " ".join(tokens[2:])
+        try:
+            from . import tools as tools_mod
+            resume_fn = tools_mod.make_resume_pr(runtime)
+            result = event_loop.run_blocking(
+                lambda: resume_fn({
+                    "project": project_label, "pr_number": pr_number,
+                    "prompt": prompt, "skip_review": skip_review,
+                }),
+            )
+        except RuntimeError as e:
+            return f"/oc resume-pr error: {e}"
+        import json
+        try:
+            payload = json.loads(result)
+        except (ValueError, TypeError):
+            return result
+        if not payload.get("ok"):
+            return f"resume-pr failed: {payload.get('error', 'unknown')}"
+        d = payload.get("data") or {}
+        lines = [
+            f"resumed PR #{d.get('pr_number')} as {d.get('agent_id')}",
+            f"  pr_url:   {d.get('pr_url')}",
+            f"  branch:   {d.get('branch')}",
+            f"  session:  {d.get('session_id')}",
+            f"  worktree: {d.get('worktree_path')}",
+        ]
+        if d.get("skip_review"):
+            lines.append("  --skip-review: review cycle bypassed")
+        return "\n".join(lines)
+    return handler
+
+
 def make_oc_test_notify(runtime: "Runtime") -> Callable[[str], str]:
     def handler(raw_args: str) -> str:
         from . import notify as notify_mod
@@ -419,6 +533,9 @@ _OC_HELP_TEXT = (
     "/oc - hermes-opencode slash command\n"
     "\n"
     "subcommands:\n"
+    "  /oc spawn <project> <task> <prompt>             create a new agent (worktree + opencode session + first turn)\n"
+    "  /oc resume-pr <project> <pr_num> [--skip-review] <prompt>\n"
+    "                                                  resume work on an open PR; checks out its branch and sends prompt\n"
     "  /oc list [--archived]                 list tracked agents (one line per agent, status + age + pr_url); --archived also shows archived\n"
     "  /oc attach <agent_id> [--lines N]     print the last N (default 80) lines of an agent's transcript\n"
     "  /oc questions                         list pending opencode questions awaiting a human answer\n"
@@ -426,6 +543,9 @@ _OC_HELP_TEXT = (
     "  /oc doctor                            plugin health report (versions, bg loop alive, deps, state files)\n"
     "  /oc test-notify [message ...]         force a notify fanout (gateway DM + dashboard + cli); reports per-sink ok/FAIL with detail\n"
     "  /oc help                              show this help\n"
+    "\n"
+    "direct dispatch (no LLM):\n"
+    "  @<agent_id> <text>                    forward <text> VERBATIM to that agent's opencode session (bypasses chat LLM)\n"
     "\n"
     "for richer ops outside an active chat session, use the `hermes oco` CLI subcommand."
 )
@@ -438,6 +558,8 @@ def make_oc_dispatcher(runtime: "Runtime") -> Callable[[str], str]:
     doctor_fn = make_oc_doctor(runtime)
     cancel_fn = make_oc_cancel(runtime)
     test_notify_fn = make_oc_test_notify(runtime)
+    spawn_fn = make_oc_spawn(runtime)
+    resume_pr_fn = make_oc_resume_pr(runtime)
     subcommands = {
         "list": list_fn,
         "attach": attach_fn,
@@ -445,6 +567,8 @@ def make_oc_dispatcher(runtime: "Runtime") -> Callable[[str], str]:
         "doctor": doctor_fn,
         "cancel": cancel_fn,
         "test-notify": test_notify_fn,
+        "spawn": spawn_fn,
+        "resume-pr": resume_pr_fn,
     }
 
     def handler(raw_args: str) -> str:

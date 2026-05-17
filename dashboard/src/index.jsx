@@ -12,7 +12,9 @@
     };
 
   const PHASE_GLYPH = {
+    QUEUED: "⏳",
     EXECUTING: "▶",
+    AWAITING_HUMAN: "✋",
     EXECUTOR_ADDRESSING: "▶",
     IDLE_TASK_COMPLETE: "⏸",
     IDLE_REVIEW_ADDRESSED: "⏸",
@@ -21,6 +23,7 @@
     REVIEW_DELIVERED: "🔎",
     COMMITTING: "💾",
     PR_OPEN: "🔗",
+    RATE_LIMITED: "⏳",
     DONE: "✓",
     FAILED: "✗",
     KILLED: "🛑",

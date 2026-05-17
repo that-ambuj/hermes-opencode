@@ -63,11 +63,14 @@ plugins:
       opencode_server:
         url: "http://127.0.0.1:4096"
         password: "${OPENCODE_SERVER_PASSWORD}"
-        # v0.14.5: override the host opencode serve binds to, independent of
-        # the connect URL. Defaults to the host parsed from `url`. Set to
-        # 0.0.0.0 to expose opencode serve to other machines on the LAN while
-        # hermes itself keeps connecting via loopback.
-        serve_hostname: null
+        # v0.16.0 (renamed from v0.14.5 `serve_hostname`): override the
+        # bind host the plugin passes to `opencode serve --host=...`,
+        # independent of the connect URL. Defaults to the host parsed
+        # from `url`. Set to 0.0.0.0 to expose opencode serve to other
+        # machines on the LAN while hermes itself keeps connecting via
+        # loopback. The connect path never uses this value because
+        # 0.0.0.0 is bind-only.
+        host: null
         # v0.15.0: when the executor session fails to author its own PR
         # title + body (no `PR_OPENED:` sentinel), the plugin spawns a
         # fresh opencode session per fallback model in this list and asks

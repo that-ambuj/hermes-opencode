@@ -8,7 +8,9 @@
       return Array.prototype.slice.call(arguments).filter(Boolean).join(" ");
     };
     const PHASE_GLYPH = {
+      QUEUED: "\u23F3",
       EXECUTING: "\u25B6",
+      AWAITING_HUMAN: "\u270B",
       EXECUTOR_ADDRESSING: "\u25B6",
       IDLE_TASK_COMPLETE: "\u23F8",
       IDLE_REVIEW_ADDRESSED: "\u23F8",
@@ -17,6 +19,7 @@
       REVIEW_DELIVERED: "\u{1F50E}",
       COMMITTING: "\u{1F4BE}",
       PR_OPEN: "\u{1F517}",
+      RATE_LIMITED: "\u23F3",
       DONE: "\u2713",
       FAILED: "\u2717",
       KILLED: "\u{1F6D1}",

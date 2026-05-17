@@ -5,6 +5,163 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.0] - 2026-05-17
+
+Minor bump: introduces a new `AWAITING_HUMAN` phase (previously only an
+event kind), the `/oc spawn` + `/oc resume-pr` slash commands, the
+matching `hermes oco spawn` + `hermes oco resume-pr` CLI subcommands,
+and a new `oc_resume_pr` tool for continuing work on an existing open PR.
+Also renames the v0.14.5 bind-host knob `serve_hostname` -> `host` and
+the spawn flag `--hostname=` -> `--host=`.
+
+### Breaking config rename
+
+- **`opencode_server.serve_hostname` -> `opencode_server.host`** (YAML).
+- **`OPENCODE_SERVE_HOSTNAME` -> `OPENCODE_HOST`** (env var).
+- **`Config.serve_hostname` -> `Config.host`** (dataclass field).
+- **`OpencodeClient(host=...)`** kwarg (was `serve_hostname=`).
+- **`opencode serve --host=<value>`** spawn flag (was `--hostname=`).
+- Internal `_serve_hostname` -> `_bind_host`; `_host` (the connect
+  loopback host) -> `_connect_host` for clarity in transport.py.
+
+Users of the v0.14.5 / v0.15.x knob must rename their YAML key on
+upgrade; the old key is no longer read. There was no other tool /
+slash / CLI surface that referenced the old name, so the migration is
+purely a hermes config edit.
+
+### Added
+
+- **`AWAITING_HUMAN` is now a proper phase**, surfaced on the dashboard
+  with the `✋` glyph and an amber color so a viewer can see at a glance
+  that an agent is paused on human input — without relying on the
+  `awaiting_human` DM notification stream.
+
+  New `_enter_awaiting_human(agent, body)` helper in event_loop.py
+  transitions the agent to `phase=AWAITING_HUMAN`, saves
+  `phase_before_awaiting` + `awaiting_human_since`, and fires the
+  existing `awaiting_human` notification. Idempotent on re-entry
+  (reminder loop fires don't reset `awaiting_human_since` or overwrite
+  `phase_before_awaiting`).
+
+  All three call sites that fired the awaiting-human event now route
+  through the helper:
+  - `_maybe_notify_new_pending` (executor emitted `/question` or
+    `/permission` opencode API entries).
+  - `_maybe_notify_awaiting_classified` (executor wrote prose that the
+    classifier flagged as awaiting; called from
+    `_awaiting_input_blocks_review`).
+
+  New `_phase_awaiting_human(agent)` handler polls each tick:
+  - If pending `/question` or `/permission` still exists for the
+    executor session, stay in AWAITING_HUMAN and return.
+  - Otherwise re-run the awaiting-input classifier on the latest
+    assistant text. If still awaiting, stay.
+  - If both detectors say not-awaiting, restore
+    `phase_before_awaiting` (default EXECUTING) and fire the new
+    `awaiting_human_resumed` event so the dashboard and DM watchers
+    see forward progress.
+
+  `_run_awaiting_input_reminders` now scans `phase == "AWAITING_HUMAN"`
+  exclusively. The v0.14.x scan of EXECUTING / EXECUTOR_ADDRESSING is
+  retired because every awaiting agent is now in AWAITING_HUMAN.
+
+  Dashboard + CLI phase-glyph tables (`commands.py::_PHASE_GLYPH`,
+  `dashboard/src/index.jsx::PHASE_GLYPH`) gain `AWAITING_HUMAN: "✋"`.
+  Dashboard CSS gains an amber-bold rule for the new phase plus
+  muted/orange rules for the v0.15.x `QUEUED` and `RATE_LIMITED`
+  phases that were missing previously.
+
+  New `Agent` fields: `phase_before_awaiting: str | None`,
+  `awaiting_human_since: float | None`.
+
+  New `awaiting_human_resumed` event kind in the default
+  `notify_events` set.
+
+- **`/oc spawn <project> <task> <prompt>` slash command + `hermes oco
+  spawn <project> <task> <prompt> [--branch …] [--base-branch …]
+  [--agent …]` CLI subcommand**. Both surfaces route through the
+  existing `make_spawn` handler (via `event_loop.run_blocking` for the
+  slash path, direct `asyncio.run` for the standalone CLI). Removes
+  the prior limitation that `oc_spawn` was only callable via the
+  chat-LLM tool surface — useful for scripting / cron, gateway DM
+  triggers, and bypassing the chat LLM entirely when the prompt is
+  pre-decided.
+
+  The CLI prints a hint when it doesn't detect a running hermes
+  process (the agent record is persisted, but the bg event loop only
+  ticks while hermes is running; the agent will resume normally on
+  next hermes start).
+
+- **`/oc resume-pr <project> <pr_num> [--skip-review] <prompt>` slash
+  command + `hermes oco resume-pr <project> <pr_num> <prompt>
+  [--skip-review]` CLI subcommand + `oc_resume_pr` tool**. Resumes
+  work on an existing OPEN pull request. Flow:
+
+  1. `gh pr view <num> --json headRefName,state,url,number` (run with
+     `cwd=project.repo_path`). Reject if state != OPEN.
+  2. `git fetch origin <branch>` to make sure the local repo has the
+     PR's branch ref.
+  3. `wt.compose_agent_id(project.abbrev, f"resume-pr-{pr_num}", …)`
+     to derive a unique agent_id.
+  4. `wt.create_worktree(repo, target, branch, base)` — the existing
+     helper already handles "branch exists -> check out via
+     `worktree add <target> <branch>` (no `-b`)", so the new worktree
+     lands on the PR's branch directly.
+  5. Bootstrap normally, create opencode session, persist Agent
+     record with `pr_url` + `pr_number` pre-populated.
+  6. Send the wrapped prompt via `send_message_async`.
+
+  When `skip_review=true`, the Agent record is created with
+  `review_cycle_count = config.review_max_cycles` so the review cycle
+  is treated as already-exhausted; the agent jumps from EXECUTING to
+  COMMITTING the moment it's idle with a diff. Use for trivial
+  follow-ups (typo fixes, comment edits) where re-running the
+  reviewer is wasteful.
+
+  Same dispatcher discipline applies: `prompt` is forwarded VERBATIM.
+
+  Spawn-gate honored: if any agent is in `RATE_LIMITED`, the
+  resume-pr agent enters `phase=QUEUED` with `queued_blocked_by`
+  populated, exactly like `oc_spawn`.
+
+- **18 new regression tests** in `tests/test_pure_logic.py`:
+  - `TestAwaitingHumanPhase` (3): enter saves prior phase; from
+    EXECUTOR_ADDRESSING vs EXECUTING; idempotent re-entry.
+  - `TestPhaseAwaitingHumanHandler` (5): pending question keeps phase;
+    pending permission keeps phase; classifier still-awaiting keeps
+    phase; clear restores prior + fires resumed; clear with no prior
+    defaults to EXECUTING.
+  - `TestAwaitingHumanReminderLoopScansNewPhase` (2): AWAITING_HUMAN
+    fires reminder; EXECUTING no longer triggers reminder.
+  - `TestOcSpawnSlashCommand` (3): help on no args; --help/help flags;
+    too few args.
+  - `TestOcResumePrSlashCommand` (3): help; invalid pr_number;
+    --skip-review parsed regardless of position.
+  - `TestResumePrHandler` (2): unknown project; PR not OPEN.
+
+  Full suite: 341 passed (was 323 at v0.15.2).
+
+### Changed
+
+- `_PHASE_HANDLERS` gained `AWAITING_HUMAN -> _phase_awaiting_human`.
+- `_OC_HELP_TEXT` (slash help) gained `/oc spawn`, `/oc resume-pr`,
+  and a direct-dispatch section pointing at `@<agent_id> <text>`
+  (v0.14.4).
+- `hermes oco --help` lists `spawn` + `resume-pr` in the usage line.
+- `plugin.yaml::provides_tools` gained `oc_resume_pr`.
+- `dashboard/dist/index.js` rebuilt via `bun run build`.
+- `AGENTS.md` state-machine section gained a new paragraph documenting
+  AWAITING_HUMAN entry/exit semantics.
+
+### Internal notes
+
+The v0.15.0 design choice for the rate-limit recovery (review NOT
+bypassed; wait-and-resume) applies the same way here: the awaiting-
+human recovery path simply restores the saved prior phase and lets
+the agent continue through its own normal flow. No
+shortcuts, no auto-`continue` (that's the abort path, not the
+awaiting-human path).
+
 ## [0.15.2] - 2026-05-17
 
 ### Fixed

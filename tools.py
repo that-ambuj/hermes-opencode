@@ -205,6 +205,60 @@ SPAWN_SCHEMA: dict[str, Any] = {
 }
 
 
+RESUME_PR_SCHEMA: dict[str, Any] = {
+    "name": "oc_resume_pr",
+    "description": (
+        "Resume work on an existing OPEN pull request. Looks up the PR via "
+        "`gh pr view`, fetches its branch, creates a new worktree CHECKED OUT "
+        "on that branch (not a new branch), spawns an opencode session there, "
+        "and forwards the human's `prompt` VERBATIM as the follow-up task. "
+        "The agent then runs its normal executor -> review -> commit -> "
+        "PR-update cycle. The Agent record is created with `pr_url` + "
+        "`pr_number` pre-populated so the dashboard and `oc_pr_status` "
+        "recognize it immediately.\n"
+        "\n"
+        "Use this when a previous PR was merged-then-revised, opened-by-a-"
+        "human-and-needs-AI-followup, or paused mid-flight and you want to "
+        "continue. The original agent record (if any) is NOT touched.\n"
+        "\n"
+        "Same dispatcher discipline as `oc_spawn`: the `prompt` arg is "
+        "forwarded verbatim. Do NOT plan, paraphrase, or summarize it. "
+        "Opencode owns the task.\n"
+        "\n"
+        "Set `skip_review=true` for trivial follow-ups (typo fixes, lint "
+        "patches, small comments) where you want to skip the reviewer cycle "
+        "entirely. The agent jumps straight from EXECUTING to COMMITTING "
+        "once it's idle with a diff."
+    ),
+    "parameters": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "project": {"type": "string", "description": "Registered project label."},
+            "pr_number": {"type": "integer", "description": "Open PR number on the project's github repo."},
+            "prompt": {
+                "type": "string",
+                "description": (
+                    "The human's follow-up task, forwarded VERBATIM to "
+                    "opencode. No planning, no rewriting, no added context."
+                ),
+            },
+            "skip_review": {
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "When true, the agent skips the review cycle (sets "
+                    "review_cycle_count to review_max_cycles at spawn time so "
+                    "the cycle is treated as exhausted) and goes from "
+                    "EXECUTING straight to COMMITTING once idle with a diff."
+                ),
+            },
+        },
+        "required": ["project", "pr_number", "prompt"],
+    },
+}
+
+
 SEND_SCHEMA: dict[str, Any] = {
     "name": "oc_send",
     "description": (
@@ -512,6 +566,142 @@ def make_spawn(rt: Runtime) -> Callable[..., Awaitable[str]]:
             "branch": branch,
             "queued": True,
             "note": "first turn queued asynchronously; poll oc_status/oc_wait to track progress",
+            "bootstrap": {"ok": boot.ok, "method": boot.method, "skill_updated": boot.skill_updated},
+        })
+    return handler
+
+
+def make_resume_pr(rt: Runtime) -> Callable[..., Awaitable[str]]:
+    async def handler(args: dict, **_: Any) -> str:
+        try:
+            project_label = args["project"]
+            pr_number = int(args["pr_number"])
+            prompt = args["prompt"]
+        except (KeyError, ValueError, TypeError) as e:
+            return _err(f"missing or invalid required arg: {e}")
+        skip_review = bool(args.get("skip_review", False))
+
+        project = rt.projects.get(project_label)
+        if not project:
+            return _err(f"unknown project: {project_label}. Run oc_project_add first.")
+        repo_path = Path(project.repo_path)
+        if not (repo_path / ".git").exists():
+            return _err(f"project repo missing: {repo_path}")
+
+        import subprocess as _subprocess
+        try:
+            res = _subprocess.run(
+                ["gh", "pr", "view", str(pr_number), "--json", "headRefName,state,url,number"],
+                cwd=str(repo_path), capture_output=True, text=True, check=False, timeout=30,
+            )
+        except (OSError, _subprocess.SubprocessError) as e:
+            return _err(f"gh pr view failed: {e}")
+        if res.returncode != 0:
+            return _err(f"gh pr view returned {res.returncode}: {(res.stderr or res.stdout).strip()}")
+        try:
+            pr_info = json.loads(res.stdout)
+        except (ValueError, TypeError) as e:
+            return _err(f"gh pr view output parse failed: {e}")
+        state = (pr_info.get("state") or "").upper()
+        if state != "OPEN":
+            return _err(f"PR #{pr_number} is {state or '(unknown)'}; resume_pr only works on OPEN PRs")
+        branch = pr_info.get("headRefName") or ""
+        pr_url = pr_info.get("url") or ""
+        if not branch:
+            return _err("gh pr view returned no headRefName")
+
+        try:
+            wt._git(repo_path, "fetch", "origin", branch, check=False)
+        except Exception as e:
+            return _err(f"git fetch origin {branch} failed: {e}")
+
+        existing = rt.agents.ids()
+        task_slug = f"resume-pr-{pr_number}"
+        try:
+            agent_id = wt.compose_agent_id(project.abbrev, task_slug, existing)
+        except ValueError as e:
+            return _err(str(e))
+
+        fs = wt.agent_id_to_fs(agent_id)
+        worktree_path = (rt.config.worktrees_root / fs).resolve()
+
+        try:
+            _ensure_server(rt)
+        except OpencodeError as e:
+            return _err(f"opencode server unavailable: {e}")
+
+        try:
+            wt.create_worktree(repo_path, worktree_path, branch=branch, base=project.base_branch)
+        except wt.GitError as e:
+            return _err(f"worktree creation failed: {e}")
+
+        boot = await bootstrap_mod.run_project_bootstrap(rt.client, project, worktree_path)
+        if not boot.ok:
+            wt.remove_worktree(repo_path, worktree_path)
+            return _err(f"bootstrap failed ({boot.method}): {boot.detail}")
+
+        try:
+            session = await rt.client.create_session(worktree_path, agent="build")
+        except OpencodeError as e:
+            wt.remove_worktree(repo_path, worktree_path)
+            return _err(f"session create failed: {e}")
+        session_id = session.get("id") or session.get("sessionID") or ""
+        if not session_id:
+            wt.remove_worktree(repo_path, worktree_path)
+            return _err(f"opencode returned no session id; keys={list(session.keys())[:8]}")
+
+        agent = Agent(
+            agent_id=agent_id,
+            project_label=project_label,
+            worktree_path=str(worktree_path),
+            session_id=session_id,
+            branch=branch,
+            initial_prompt=prompt,
+            phase="EXECUTING",
+            pr_url=pr_url,
+            pr_number=pr_number,
+            review_cycle_count=(rt.config.review_max_cycles if skip_review else 0),
+        )
+        rt.agents.add(agent)
+
+        rate_limited_agents = [a for a in rt.agents.list() if a.phase == "RATE_LIMITED"]
+        if rate_limited_agents:
+            blocked_by = [a.agent_id for a in rate_limited_agents]
+            rt.agents.update(agent_id, phase="QUEUED", queued_blocked_by=blocked_by)
+            event_loop.start(rt)
+            event_loop.ensure_agent_task(agent_id)
+            return _ok({
+                "agent_id": agent_id,
+                "session_id": session_id,
+                "worktree_path": str(worktree_path),
+                "branch": branch,
+                "pr_url": pr_url,
+                "pr_number": pr_number,
+                "skip_review": skip_review,
+                "queued": True,
+                "blocked_by": blocked_by,
+                "bootstrap": {"ok": boot.ok, "method": boot.method, "skill_updated": boot.skill_updated},
+            })
+
+        wrapped_prompt = wrap_initial_prompt(prompt)
+        try:
+            await rt.client.send_message_async(session_id, worktree_path, wrapped_prompt)
+        except OpencodeError as e:
+            rt.agents.update(agent_id, phase="FAILED", last_error=str(e))
+            return _err(f"send_message_async failed: {e}", agent_id=agent_id)
+
+        event_loop.start(rt)
+        event_loop.ensure_agent_task(agent_id)
+
+        return _ok({
+            "agent_id": agent_id,
+            "session_id": session_id,
+            "worktree_path": str(worktree_path),
+            "branch": branch,
+            "pr_url": pr_url,
+            "pr_number": pr_number,
+            "skip_review": skip_review,
+            "queued": True,
             "bootstrap": {"ok": boot.ok, "method": boot.method, "skill_updated": boot.skill_updated},
         })
     return handler
@@ -1114,6 +1304,7 @@ def all_tool_specs(rt: Runtime) -> list[dict[str, Any]]:
         {"name": "oc_project_remove", "toolset": "hermes_opencode", "schema": PROJECT_REMOVE_SCHEMA, "handler": make_project_remove(rt), "is_async": True, "emoji": "🗑️"},
         {"name": "oc_project_set_repo_path", "toolset": "hermes_opencode", "schema": PROJECT_SET_REPO_PATH_SCHEMA, "handler": make_project_set_repo_path(rt), "is_async": True, "emoji": "📍"},
         {"name": "oc_spawn", "toolset": "hermes_opencode", "schema": SPAWN_SCHEMA, "handler": make_spawn(rt), "is_async": True, "emoji": "🚀"},
+        {"name": "oc_resume_pr", "toolset": "hermes_opencode", "schema": RESUME_PR_SCHEMA, "handler": make_resume_pr(rt), "is_async": True, "emoji": "🔁"},
         {"name": "oc_send", "toolset": "hermes_opencode", "schema": SEND_SCHEMA, "handler": make_send(rt), "is_async": True, "emoji": "💬"},
         {"name": "oc_status", "toolset": "hermes_opencode", "schema": STATUS_SCHEMA, "handler": make_status(rt), "is_async": True, "emoji": "📊"},
         {"name": "oc_wait", "toolset": "hermes_opencode", "schema": WAIT_SCHEMA, "handler": make_wait(rt), "is_async": True, "emoji": "⏳"},

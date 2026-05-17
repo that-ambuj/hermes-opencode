@@ -1,5 +1,5 @@
 name: hermes-opencode
-version: 0.15.2
+version: 0.16.0
 manifest_version: 1
 description: "Orchestrate multiple opencode agents in git worktrees. Project registry, executor/reviewer cycle, auto-PR, opencode-driven bootstrap with shell + recovery, question routing via pre_llm_call, hourly heartbeat DMs. Dashboard in Phase 4."
 author: hermes-opencode-agents
@@ -14,6 +14,7 @@ provides_tools:
   - oc_project_regenerate_bootstrap
   - oc_project_regenerate_cleanup
   - oc_spawn
+  - oc_resume_pr
   - oc_send
   - oc_status
   - oc_wait

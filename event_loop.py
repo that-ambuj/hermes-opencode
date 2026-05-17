@@ -80,6 +80,7 @@ _EVENT_GLYPH = {
     "rate_limit_cleared": "▶",
     "queued": "⏳",
     "queue_drained": "▶",
+    "awaiting_human_resumed": "▶",
 }
 
 
@@ -150,6 +151,8 @@ def _default_event_body(agent: "Agent", kind: str) -> str:
         return f"Task queued; waiting for rate-limited agents to clear."
     if kind == "queue_drained":
         return f"Queue drained: agent started."
+    if kind == "awaiting_human_resumed":
+        return f"Human reply received; agent resumed."
     return f"{kind} for {agent.agent_id}"
 
 
@@ -184,6 +187,36 @@ def _format_permission_block(p: dict) -> str:
     return f"[{pid}] {detail}\n  Reply: /oc answer {pid} <once|always|reject>"
 
 
+def _enter_awaiting_human(agent: "Agent", body: str) -> "Agent":
+    """Transition agent into the AWAITING_HUMAN phase and fire the
+    `awaiting_human` notification with `body`. v0.16.0 promoted
+    `awaiting_human` from a recurring event-only signal to a proper phase
+    so dashboards can show it as a distinct state instead of leaving the
+    agent in EXECUTING (which looks active).
+
+    Idempotent: if already in AWAITING_HUMAN, only re-fires the event
+    (reminder-style) without resetting `awaiting_human_since` or
+    overwriting `phase_before_awaiting`.
+    """
+    if _runtime is None:
+        return agent
+    now = time.time()
+    if agent.phase == "AWAITING_HUMAN":
+        updated = _runtime.agents.update(
+            agent.agent_id, last_awaiting_notify_at=now,
+        )
+    else:
+        updated = _runtime.agents.update(
+            agent.agent_id,
+            phase="AWAITING_HUMAN",
+            phase_before_awaiting=agent.phase,
+            awaiting_human_since=now,
+            last_awaiting_notify_at=now,
+        )
+    _notify_event(updated, "awaiting_human", body)
+    return updated
+
+
 def _maybe_notify_new_pending(
     agent: "Agent",
     pending_q: list[dict],
@@ -214,7 +247,7 @@ def _maybe_notify_new_pending(
     p_blocks = [_format_permission_block(p) for p in pending_p if p.get("id") in new_p_ids]
     if p_blocks:
         sections.append("Pending permission requests:\n\n" + "\n\n".join(p_blocks))
-    _notify_event(agent, "awaiting_human", "\n\n".join(sections))
+    _enter_awaiting_human(agent, "\n\n".join(sections))
     return True
 
 
@@ -230,7 +263,7 @@ def _maybe_notify_awaiting_classified(
         f"Reason: {check.reason}\n\n"
         f"Last assistant text:\n{snippet}"
     )
-    _notify_event(agent, "awaiting_human", body)
+    _enter_awaiting_human(agent, body)
 
 
 async def _fetch_last_assistant_text(agent: "Agent") -> str:
@@ -524,7 +557,7 @@ def _run_awaiting_input_reminders() -> None:
     now = time.time()
     interval = cfg.awaiting_input_reminder_interval_sec
     for agent in _runtime.agents.list():
-        if agent.phase not in {"EXECUTING", "EXECUTOR_ADDRESSING"}:
+        if agent.phase != "AWAITING_HUMAN":
             continue
         last_notify = agent.last_awaiting_notify_at
         if last_notify is None:
@@ -538,11 +571,12 @@ def _run_awaiting_input_reminders() -> None:
         elapsed = _humanize_seconds(now - last_notify)
         reason = verdict.get("reason") or "(no reason recorded)"
         body = (
-            f"Agent has been awaiting input for {elapsed}. "
+            f"Agent still awaiting human input ({elapsed} since last reminder). "
             f"Detector reason: {reason}\n\n"
             f"Last assistant text:\n{snippet}"
         ) if snippet else (
-            f"Agent has been awaiting input for {elapsed}. Detector reason: {reason}"
+            f"Agent still awaiting human input ({elapsed} since last reminder). "
+            f"Detector reason: {reason}"
         )
         _notify_event(agent, "awaiting_human", body)
         _runtime.agents.update(agent.agent_id, last_awaiting_notify_at=now)
@@ -1246,6 +1280,53 @@ async def _phase_queued(agent: Agent) -> None:
     )
 
 
+async def _phase_awaiting_human(agent: Agent) -> None:
+    """Tick handler for AWAITING_HUMAN agents. Polls opencode for pending
+    `/question` and `/permission` entries on the executor session, then
+    re-runs the awaiting-input classifier on the latest assistant text.
+    If neither says still-awaiting, restores `phase_before_awaiting` (or
+    EXECUTING as fallback) and fires the `awaiting_human_resumed` event
+    so the user sees forward progress in the dashboard.
+    """
+    assert _runtime is not None
+    worktree = Path(agent.worktree_path)
+    try:
+        questions = await _runtime.client.list_questions(worktree)
+        permissions = await _runtime.client.list_permissions(worktree)
+    except OpencodeError:
+        await asyncio.sleep(5.0)
+        return
+    pending_q = [q for q in questions if q.get("sessionID") == agent.session_id]
+    pending_p = [p for p in permissions if p.get("sessionID") == agent.session_id]
+    _update_snapshots(agent.agent_id, pending_q, pending_p)
+    if pending_q or pending_p:
+        await asyncio.sleep(5.0)
+        return
+    last_text = await _fetch_last_assistant_text(agent)
+    if last_text:
+        check = await awaiting_input_mod.check(_runtime, last_text)
+        _runtime.agents.update(
+            agent.agent_id,
+            last_classifier_verdict=awaiting_input_mod.to_dict(check),
+        )
+        if check.awaiting:
+            await asyncio.sleep(5.0)
+            return
+    restored = agent.phase_before_awaiting or "EXECUTING"
+    duration = time.time() - (agent.awaiting_human_since or time.time())
+    refreshed = _runtime.agents.update(
+        agent.agent_id,
+        phase=restored,
+        phase_before_awaiting=None,
+        awaiting_human_since=None,
+    )
+    _notify_event(
+        refreshed, "awaiting_human_resumed",
+        f"Human reply received after {_humanize_seconds(duration)}; "
+        f"agent resumed at phase={restored}.",
+    )
+
+
 async def _phase_executing(agent: Agent) -> None:
     assert _runtime is not None
     worktree = Path(agent.worktree_path)
@@ -1493,6 +1574,7 @@ async def _cleanup_worktrees(agent: Agent, worktree: Path) -> None:
 _PHASE_HANDLERS = {
     "QUEUED": _phase_queued,
     "EXECUTING": _phase_executing,
+    "AWAITING_HUMAN": _phase_awaiting_human,
     "IDLE_TASK_COMPLETE": _phase_idle_task_complete,
     "REVIEW_SPAWNING": _phase_review_spawning,
     "REVIEWING": _phase_reviewing,

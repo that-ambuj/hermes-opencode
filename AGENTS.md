@@ -110,6 +110,24 @@ PR_OPEN → DONE
 Terminal phases: `DONE`, `FAILED`, `KILLED`, `CANCELLED`. The pruner
 archives terminal agents after `ARCHIVE_AFTER_SEC = 12h`.
 
+`AWAITING_HUMAN` (v0.16.0) is the phase entered whenever the
+awaiting-input cascade fires (pending `/question` or `/permission`
+on the executor session, OR the classifier flags the latest assistant
+text as a prose question). `_phase_executing`,
+`_phase_executor_addressing`, and `_awaiting_input_blocks_review` all
+route through `_enter_awaiting_human(agent, body)` which saves
+`phase_before_awaiting` and `awaiting_human_since`, then fires the
+`awaiting_human` event. The dedicated `_phase_awaiting_human` handler
+polls each tick: if Q/P are still pending OR the classifier says the
+latest text is still awaiting, sleeps briefly and returns; if both
+detectors say not-awaiting, restores `phase_before_awaiting` (default
+EXECUTING) and fires `awaiting_human_resumed`. The reminder loop
+(`_run_awaiting_input_reminders`) scans `phase == "AWAITING_HUMAN"`
+only — the prior v0.14.x scan of EXECUTING / EXECUTOR_ADDRESSING is
+retired because every awaiting agent is now in AWAITING_HUMAN. `_enter_awaiting_human`
+is idempotent on re-entry (preserves the existing `phase_before_awaiting`
+and `awaiting_human_since` so reminder fires don't reset the clock).
+
 `QUEUED` (v0.15.0) is the soft-queue phase entered at `oc_spawn` time
 when at least one non-terminal agent is in `RATE_LIMITED`. The new
 agent's worktree, session, and bootstrap are created normally but the
