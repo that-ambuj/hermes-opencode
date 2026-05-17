@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import enum
 import importlib.util
 import sys
 import time
@@ -28,6 +29,7 @@ heartbeat_mod = sys.modules["_oco_test_pkg.heartbeat"]
 state_mod = sys.modules["_oco_test_pkg.state"]
 config_mod = sys.modules["_oco_test_pkg.config"]
 event_loop_mod = sys.modules["_oco_test_pkg.event_loop"]
+notify_mod = sys.modules["_oco_test_pkg.notify"]
 
 
 class TestExtractBash:
@@ -209,3 +211,65 @@ class TestReviewCycleClassifier:
     def test_higher_cap_allows_more_rounds(self):
         assert event_loop_mod.decide_review_action(1, 3) == "address"
         assert event_loop_mod.decide_review_action(3, 3) == "exhausted"
+
+
+class _FakePlatform(enum.Enum):
+    BLUEBUBBLES = "bluebubbles"
+    TELEGRAM = "telegram"
+
+
+class _FakeRunner:
+    def __init__(self, adapters):
+        self.adapters = adapters
+
+
+class TestResolveLiveAdapter:
+    def test_unknown_platform_string_returns_clear_error(self):
+        adapter, err = notify_mod._resolve_live_adapter(
+            "nosuchthing",
+            runner_ref=lambda: _FakeRunner({_FakePlatform.BLUEBUBBLES: object()}),
+            platform_enum_cls=_FakePlatform,
+        )
+        assert adapter is None
+        assert err is not None and "unknown platform" in err and "nosuchthing" in err
+
+    def test_runner_unavailable_returns_clear_error(self):
+        adapter, err = notify_mod._resolve_live_adapter(
+            "bluebubbles",
+            runner_ref=lambda: None,
+            platform_enum_cls=_FakePlatform,
+        )
+        assert adapter is None
+        assert err == "no live gateway runner in this process"
+
+    def test_runner_has_no_adapter_for_platform(self):
+        adapter, err = notify_mod._resolve_live_adapter(
+            "bluebubbles",
+            runner_ref=lambda: _FakeRunner({_FakePlatform.TELEGRAM: object()}),
+            platform_enum_cls=_FakePlatform,
+        )
+        assert adapter is None
+        assert err is not None
+        assert "bluebubbles" in err and "no live adapter" in err
+
+    def test_resolves_bluebubbles_from_live_runner(self):
+        sentinel = object()
+        runner = _FakeRunner({_FakePlatform.BLUEBUBBLES: sentinel})
+        adapter, err = notify_mod._resolve_live_adapter(
+            "bluebubbles",
+            runner_ref=lambda: runner,
+            platform_enum_cls=_FakePlatform,
+        )
+        assert err is None
+        assert adapter is sentinel
+
+    def test_accepts_already_enum_value(self):
+        sentinel = object()
+        runner = _FakeRunner({_FakePlatform.BLUEBUBBLES: sentinel})
+        adapter, err = notify_mod._resolve_live_adapter(
+            _FakePlatform.BLUEBUBBLES,
+            runner_ref=lambda: runner,
+            platform_enum_cls=_FakePlatform,
+        )
+        assert err is None
+        assert adapter is sentinel

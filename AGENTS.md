@@ -289,7 +289,7 @@ update `_pre_gateway_dispatch_hook` to match the new prefixes.
 | `bootstrap.py` | Shell-bash extraction from skill SKILL.md; opencode-driven recovery on failure; `generate_bootstrap_skill` |
 | `reviewer.py` | Sister-worktree staging, `REVIEW: LGTM/REQUESTS_CHANGES` classifier, `finalize_and_open_pr` |
 | `pr.py` | `gh pr create --fill` + `gh pr view --json` wrappers; `PrInfo` dataclass |
-| `notify.py` | Sink fanout (CLI `inject_message`, gateway DM via `platform_registry.create_adapter`, dashboard JSONL append) |
+| `notify.py` | Sink fanout (CLI `inject_message`, gateway DM via the live `_gateway_runner_ref().adapters[Platform]`, dashboard JSONL append) |
 | `heartbeat.py` | Hourly report builder; phase glyphs; TZ-aware day window; `_format_age`; `next_top_of_hour` |
 | `dashboard/manifest.json` | Plugin manifest read by hermes' dashboard discovery |
 | `dashboard/plugin_api.py` | FastAPI router (READ-ONLY; mounted at `/api/plugins/hermes-opencode/`) |
