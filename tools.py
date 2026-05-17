@@ -58,106 +58,144 @@ def _ensure_server(rt: Runtime) -> None:
 
 
 PROJECT_ADD_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "additionalProperties": False,
-    "properties": {
-        "label": {"type": "string", "description": "Human-readable project label (kebab-case, e.g. 'dodo-payments')."},
-        "repo_path": {"type": "string", "description": "Absolute path to a local git repository."},
-        "base_branch": {"type": "string", "description": "Default base branch for new feature branches.", "default": "main"},
-        "abbrev": {"type": "string", "description": "2-5 char abbreviation prefix for agent ids (auto-derived if omitted)."},
-        "bootstrap_skill": {"type": "string", "description": "Qualified hermes skill name to run during worktree bootstrap (e.g. 'opencode-orchestrator:dp-bootstrap')."},
+    "name": "oc_project_add",
+    "description": "Register a project. Reads the git remote URL to derive a stable project_key; auto-derives a 2-5 char abbrev from the label unless overridden. Required before oc_spawn can be used.",
+    "parameters": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "label": {"type": "string", "description": "Human-readable project label (kebab-case, e.g. 'dodo-payments')."},
+            "repo_path": {"type": "string", "description": "Absolute path to a local git repository."},
+            "base_branch": {"type": "string", "description": "Default base branch for new feature branches.", "default": "main"},
+            "abbrev": {"type": "string", "description": "2-5 char abbreviation prefix for agent ids (auto-derived if omitted)."},
+            "bootstrap_skill": {"type": "string", "description": "Qualified hermes skill name to run during worktree bootstrap (e.g. 'opencode-orchestrator:dp-bootstrap')."},
+        },
+        "required": ["label", "repo_path"],
     },
-    "required": ["label", "repo_path"],
 }
 
 
 PROJECT_LIST_SCHEMA: dict[str, Any] = {
-    "type": "object", "properties": {}, "additionalProperties": False,
+    "name": "oc_project_list",
+    "description": "List registered projects with their abbrev, repo_path, base_branch, and whether the repo still exists locally.",
+    "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
 }
 
 
 PROJECT_SHOW_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "additionalProperties": False,
-    "properties": {"label": {"type": "string"}},
-    "required": ["label"],
+    "name": "oc_project_show",
+    "description": "Show full configuration for one registered project (project_key, remote_url, repo_path, base_branch, bootstrap_skill).",
+    "parameters": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"label": {"type": "string", "description": "Project label as passed to oc_project_add."}},
+        "required": ["label"],
+    },
 }
 
 
 PROJECT_REMOVE_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "additionalProperties": False,
-    "properties": {"label": {"type": "string"}},
-    "required": ["label"],
+    "name": "oc_project_remove",
+    "description": "Unregister a project. Refuses if any active (non-terminal) agents are still bound to it; kill them first.",
+    "parameters": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"label": {"type": "string"}},
+        "required": ["label"],
+    },
 }
 
 
 PROJECT_SET_REPO_PATH_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "additionalProperties": False,
-    "properties": {
-        "label": {"type": "string"},
-        "repo_path": {"type": "string"},
+    "name": "oc_project_set_repo_path",
+    "description": "Update the local repo path for a registered project (useful after cloning to a new machine or moving the checkout).",
+    "parameters": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "label": {"type": "string"},
+            "repo_path": {"type": "string", "description": "Absolute path to the moved repo."},
+        },
+        "required": ["label", "repo_path"],
     },
-    "required": ["label", "repo_path"],
 }
 
 
 SPAWN_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "additionalProperties": False,
-    "properties": {
-        "project": {"type": "string", "description": "Registered project label."},
-        "task": {"type": "string", "description": "2-4 kebab-case words summarizing the task; used in agent_id."},
-        "prompt": {"type": "string", "description": "Initial prompt sent VERBATIM to the executor opencode session."},
-        "branch": {"type": "string", "description": "Branch name (default: agent_id)."},
-        "base_branch": {"type": "string", "description": "Branch to fork from (default: project's base_branch)."},
-        "agent": {"type": "string", "description": "Opencode agent type (default: 'build').", "default": "build"},
+    "name": "oc_spawn",
+    "description": "Create a git worktree on a new branch, start an opencode session bound to it, and send the initial prompt VERBATIM. Returns the agent_id (format: <abbrev>/<task>, max 20 chars) and the opencode session id. The plugin's background loop will drive the executor -> reviewer -> commit -> PR cycle.",
+    "parameters": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "project": {"type": "string", "description": "Registered project label."},
+            "task": {"type": "string", "description": "2-4 kebab-case words summarizing the task; used in agent_id and as branch name."},
+            "prompt": {"type": "string", "description": "Initial prompt sent VERBATIM to the executor opencode session. Do not paraphrase or wrap."},
+            "branch": {"type": "string", "description": "Branch name (default: agent_id)."},
+            "base_branch": {"type": "string", "description": "Branch to fork from (default: project's base_branch)."},
+            "agent": {"type": "string", "description": "Opencode agent type to request (default: 'build'; opencode may resolve to a different agent if oh-my-openagent overrides are active).", "default": "build"},
+        },
+        "required": ["project", "task", "prompt"],
     },
-    "required": ["project", "task", "prompt"],
 }
 
 
 SEND_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "additionalProperties": False,
-    "properties": {
-        "agent_id": {"type": "string"},
-        "text": {"type": "string", "description": "Message sent verbatim to the agent."},
-        "timeout_sec": {"type": "number", "default": 600},
+    "name": "oc_send",
+    "description": "Send a follow-up message to a live agent's opencode session. Text is forwarded verbatim. Blocks until the agent responds or timeout elapses.",
+    "parameters": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "agent_id": {"type": "string"},
+            "text": {"type": "string", "description": "Message sent verbatim to the agent."},
+            "timeout_sec": {"type": "number", "default": 600},
+        },
+        "required": ["agent_id", "text"],
     },
-    "required": ["agent_id", "text"],
 }
 
 
 STATUS_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "additionalProperties": False,
-    "properties": {
-        "agent_id": {"type": "string", "description": "Optional. Omit to list all agents."},
+    "name": "oc_status",
+    "description": "Show one agent's full status (phase, branch, session_id, pending questions/permissions, pr_url) or a summary table of all tracked agents when agent_id is omitted.",
+    "parameters": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "agent_id": {"type": "string", "description": "Optional. Omit to list all agents."},
+        },
     },
 }
 
 
 WAIT_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "additionalProperties": False,
-    "properties": {
-        "agent_id": {"type": "string"},
-        "timeout_sec": {"type": "number", "default": 600},
+    "name": "oc_wait",
+    "description": "Block until the agent's opencode session goes idle (no more LLM turns running). Returns ok=true on idle, error on timeout. Does not advance the state machine on its own.",
+    "parameters": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "agent_id": {"type": "string"},
+            "timeout_sec": {"type": "number", "default": 600},
+        },
+        "required": ["agent_id"],
     },
-    "required": ["agent_id"],
 }
 
 
 KILL_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "additionalProperties": False,
-    "properties": {
-        "agent_id": {"type": "string"},
-        "remove_worktree": {"type": "boolean", "default": True},
+    "name": "oc_kill",
+    "description": "Abort an agent: delete its opencode session(s) (executor and reviewer), optionally remove its git worktree (default true), and drop it from the agent registry.",
+    "parameters": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "agent_id": {"type": "string"},
+            "remove_worktree": {"type": "boolean", "default": True},
+        },
+        "required": ["agent_id"],
     },
-    "required": ["agent_id"],
 }
 
 
@@ -462,54 +500,105 @@ def make_kill(rt: Runtime) -> Callable[..., Awaitable[str]]:
 
 
 ANSWER_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "additionalProperties": False,
-    "properties": {
-        "question_id": {"type": "string", "description": "Question id from /question or from the pre_llm_call injection."},
-        "answer": {"type": "string", "description": "Verbatim user reply text. Forwarded unmodified to opencode."},
-        "answers": {"type": "array", "items": {"type": "string"}, "description": "Alternative: list of selected option labels. Use this when the question listed structured options."},
-        "reject": {"type": "boolean", "default": False, "description": "Reject the question instead of answering."},
+    "name": "oc_answer",
+    "description": "Reply to (or reject) a pending opencode question raised by an agent. The user's reply text is forwarded VERBATIM to opencode. Use this when the pre_llm_call context surfaces a pending question_id and the user's message looks like a reply to it.",
+    "parameters": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "question_id": {"type": "string", "description": "Question id from /question or from the pre_llm_call injection."},
+            "answer": {"type": "string", "description": "Verbatim user reply text. Forwarded unmodified to opencode."},
+            "answers": {"type": "array", "items": {"type": "string"}, "description": "Alternative: list of selected option labels. Use this when the question listed structured options."},
+            "reject": {"type": "boolean", "default": False, "description": "Reject the question instead of answering."},
+        },
+        "required": ["question_id"],
     },
-    "required": ["question_id"],
 }
 
 
 REVIEW_NOW_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "additionalProperties": False,
-    "properties": {"agent_id": {"type": "string"}},
-    "required": ["agent_id"],
+    "name": "oc_review_now",
+    "description": "Force-trigger the reviewer phase for an agent (escape hatch when the auto idle-detector misses or you want to short-circuit waiting). The agent transitions to REVIEW_SPAWNING on the next event-loop tick.",
+    "parameters": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"agent_id": {"type": "string"}},
+        "required": ["agent_id"],
+    },
 }
 
 
-REVIEW_AGAIN_SCHEMA = REVIEW_NOW_SCHEMA
-SKIP_REVIEW_SCHEMA = REVIEW_NOW_SCHEMA
-PR_STATUS_SCHEMA = REVIEW_NOW_SCHEMA
+REVIEW_AGAIN_SCHEMA: dict[str, Any] = {
+    "name": "oc_review_again",
+    "description": "Run another review cycle on an agent. Tears down the prior reviewer worktree first, then transitions back to REVIEW_SPAWNING. Useful when the first review pass missed issues or after manual changes.",
+    "parameters": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"agent_id": {"type": "string"}},
+        "required": ["agent_id"],
+    },
+}
+
+
+SKIP_REVIEW_SCHEMA: dict[str, Any] = {
+    "name": "oc_skip_review",
+    "description": "Skip the reviewer cycle entirely and jump straight to COMMITTING + open PR. For trivial agent work that doesn't need review.",
+    "parameters": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"agent_id": {"type": "string"}},
+        "required": ["agent_id"],
+    },
+}
+
+
+PR_STATUS_SCHEMA: dict[str, Any] = {
+    "name": "oc_pr_status",
+    "description": "Live `gh pr view` for an agent's PR — returns number, url, state (OPEN/MERGED/CLOSED), and merged_at. The plugin's bg loop already polls this every 5 min after PR_OPEN; use this tool for an on-demand check.",
+    "parameters": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"agent_id": {"type": "string"}},
+        "required": ["agent_id"],
+    },
+}
 
 
 REGEN_BOOTSTRAP_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "additionalProperties": False,
-    "properties": {"label": {"type": "string"}},
-    "required": ["label"],
+    "name": "oc_project_regenerate_bootstrap",
+    "description": "Regenerate the bootstrap skill for a project by spawning a short-lived opencode introspection session that reads the repo (README, package.json, pyproject.toml, Makefile, etc.) and writes a fresh SKILL.md with an idempotent bash setup script.",
+    "parameters": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"label": {"type": "string"}},
+        "required": ["label"],
+    },
 }
 
 
 SET_NOTIFY_TARGET_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "additionalProperties": False,
-    "properties": {
-        "platform": {"type": "string", "description": "Gateway platform: telegram | discord | slack | ..."},
-        "chat_id": {"type": "string", "description": "Chat / channel id where DMs are delivered."},
-        "sinks": {"type": "array", "items": {"type": "string"}, "description": "Active sinks: any of [cli, gateway, dashboard]."},
+    "name": "oc_set_notify_target",
+    "description": "Configure where heartbeats and question alerts are delivered: the gateway DM target (platform + chat_id) and/or the active notify sinks (any combination of cli, gateway, dashboard).",
+    "parameters": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "platform": {"type": "string", "description": "Gateway platform: telegram | discord | slack | ..."},
+            "chat_id": {"type": "string", "description": "Chat / channel id where DMs are delivered."},
+            "sinks": {"type": "array", "items": {"type": "string"}, "description": "Active sinks: any of [cli, gateway, dashboard]."},
+        },
     },
 }
 
 
 HEARTBEAT_NOW_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "additionalProperties": False,
-    "properties": {"force": {"type": "boolean", "default": False, "description": "Send even if outside the day window with no pending tasks."}},
+    "name": "oc_heartbeat_send_now",
+    "description": "Send the heartbeat status report immediately to all configured sinks (CLI inject_message / gateway DM / dashboard JSONL). Useful for testing the notify pipeline or for ad-hoc status pings outside the hourly schedule.",
+    "parameters": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"force": {"type": "boolean", "default": False, "description": "Send even if outside the day window with no pending tasks."}},
+    },
 }
 
 
@@ -691,58 +780,22 @@ def make_regen_bootstrap(rt: Runtime) -> Callable[..., Awaitable[str]]:
 
 def all_tool_specs(rt: Runtime) -> list[dict[str, Any]]:
     return [
-        {"name": "oc_project_add", "toolset": "opencode_orchestrator",
-         "schema": PROJECT_ADD_SCHEMA, "handler": make_project_add(rt), "is_async": True,
-         "description": "Register a project (label, repo path, base branch, optional abbrev).", "emoji": "📁"},
-        {"name": "oc_project_list", "toolset": "opencode_orchestrator",
-         "schema": PROJECT_LIST_SCHEMA, "handler": make_project_list(rt), "is_async": True,
-         "description": "List registered projects.", "emoji": "📋"},
-        {"name": "oc_project_show", "toolset": "opencode_orchestrator",
-         "schema": PROJECT_SHOW_SCHEMA, "handler": make_project_show(rt), "is_async": True,
-         "description": "Show a single project's configuration.", "emoji": "🔍"},
-        {"name": "oc_project_remove", "toolset": "opencode_orchestrator",
-         "schema": PROJECT_REMOVE_SCHEMA, "handler": make_project_remove(rt), "is_async": True,
-         "description": "Unregister a project (refuses if active agents exist).", "emoji": "🗑️"},
-        {"name": "oc_project_set_repo_path", "toolset": "opencode_orchestrator",
-         "schema": PROJECT_SET_REPO_PATH_SCHEMA, "handler": make_project_set_repo_path(rt), "is_async": True,
-         "description": "Update a project's local repo path.", "emoji": "📍"},
-        {"name": "oc_spawn", "toolset": "opencode_orchestrator",
-         "schema": SPAWN_SCHEMA, "handler": make_spawn(rt), "is_async": True,
-         "description": "Spawn an opencode agent: create worktree, start session, send initial prompt verbatim.", "emoji": "🚀"},
-        {"name": "oc_send", "toolset": "opencode_orchestrator",
-         "schema": SEND_SCHEMA, "handler": make_send(rt), "is_async": True,
-         "description": "Send a verbatim message to a running agent.", "emoji": "💬"},
-        {"name": "oc_status", "toolset": "opencode_orchestrator",
-         "schema": STATUS_SCHEMA, "handler": make_status(rt), "is_async": True,
-         "description": "Show one agent's full status, or all agents in a summary.", "emoji": "📊"},
-        {"name": "oc_wait", "toolset": "opencode_orchestrator",
-         "schema": WAIT_SCHEMA, "handler": make_wait(rt), "is_async": True,
-         "description": "Block until an agent's opencode session goes idle.", "emoji": "⏳"},
-        {"name": "oc_kill", "toolset": "opencode_orchestrator",
-         "schema": KILL_SCHEMA, "handler": make_kill(rt), "is_async": True,
-         "description": "Abort an agent's session and (by default) remove its worktree.", "emoji": "🛑"},
-        {"name": "oc_answer", "toolset": "opencode_orchestrator",
-         "schema": ANSWER_SCHEMA, "handler": make_answer(rt), "is_async": True,
-         "description": "Reply to (or reject) a pending opencode question. The user's reply is forwarded VERBATIM.", "emoji": "✉️"},
-        {"name": "oc_review_now", "toolset": "opencode_orchestrator",
-         "schema": REVIEW_NOW_SCHEMA, "handler": make_review_now(rt), "is_async": True,
-         "description": "Force-trigger the reviewer phase for an agent (escape hatch if auto-detection misses).", "emoji": "🔎"},
-        {"name": "oc_review_again", "toolset": "opencode_orchestrator",
-         "schema": REVIEW_AGAIN_SCHEMA, "handler": make_review_again(rt), "is_async": True,
-         "description": "Run another review cycle on the agent (tears down prior reviewer worktree first).", "emoji": "🔁"},
-        {"name": "oc_skip_review", "toolset": "opencode_orchestrator",
-         "schema": SKIP_REVIEW_SCHEMA, "handler": make_skip_review(rt), "is_async": True,
-         "description": "Skip review and jump straight to commit + open PR. For trivial agents.", "emoji": "⏭️"},
-        {"name": "oc_pr_status", "toolset": "opencode_orchestrator",
-         "schema": PR_STATUS_SCHEMA, "handler": make_pr_status(rt), "is_async": True,
-         "description": "Live `gh pr view` for an agent's PR.", "emoji": "🔗"},
-        {"name": "oc_project_regenerate_bootstrap", "toolset": "opencode_orchestrator",
-         "schema": REGEN_BOOTSTRAP_SCHEMA, "handler": make_regen_bootstrap(rt), "is_async": True,
-         "description": "Regenerate the bootstrap skill for a project via an opencode introspection session.", "emoji": "🧰"},
-        {"name": "oc_set_notify_target", "toolset": "opencode_orchestrator",
-         "schema": SET_NOTIFY_TARGET_SCHEMA, "handler": make_set_notify_target(rt), "is_async": True,
-         "description": "Set the gateway DM target (platform + chat_id) and/or active notify sinks for heartbeats and question alerts.", "emoji": "📡"},
-        {"name": "oc_heartbeat_send_now", "toolset": "opencode_orchestrator",
-         "schema": HEARTBEAT_NOW_SCHEMA, "handler": make_heartbeat_send_now(rt), "is_async": True,
-         "description": "Send the heartbeat report immediately to configured sinks (CLI inject / gateway DM / dashboard).", "emoji": "💓"},
+        {"name": "oc_project_add", "toolset": "opencode_orchestrator", "schema": PROJECT_ADD_SCHEMA, "handler": make_project_add(rt), "is_async": True, "emoji": "📁"},
+        {"name": "oc_project_list", "toolset": "opencode_orchestrator", "schema": PROJECT_LIST_SCHEMA, "handler": make_project_list(rt), "is_async": True, "emoji": "📋"},
+        {"name": "oc_project_show", "toolset": "opencode_orchestrator", "schema": PROJECT_SHOW_SCHEMA, "handler": make_project_show(rt), "is_async": True, "emoji": "🔍"},
+        {"name": "oc_project_remove", "toolset": "opencode_orchestrator", "schema": PROJECT_REMOVE_SCHEMA, "handler": make_project_remove(rt), "is_async": True, "emoji": "🗑️"},
+        {"name": "oc_project_set_repo_path", "toolset": "opencode_orchestrator", "schema": PROJECT_SET_REPO_PATH_SCHEMA, "handler": make_project_set_repo_path(rt), "is_async": True, "emoji": "📍"},
+        {"name": "oc_spawn", "toolset": "opencode_orchestrator", "schema": SPAWN_SCHEMA, "handler": make_spawn(rt), "is_async": True, "emoji": "🚀"},
+        {"name": "oc_send", "toolset": "opencode_orchestrator", "schema": SEND_SCHEMA, "handler": make_send(rt), "is_async": True, "emoji": "💬"},
+        {"name": "oc_status", "toolset": "opencode_orchestrator", "schema": STATUS_SCHEMA, "handler": make_status(rt), "is_async": True, "emoji": "📊"},
+        {"name": "oc_wait", "toolset": "opencode_orchestrator", "schema": WAIT_SCHEMA, "handler": make_wait(rt), "is_async": True, "emoji": "⏳"},
+        {"name": "oc_kill", "toolset": "opencode_orchestrator", "schema": KILL_SCHEMA, "handler": make_kill(rt), "is_async": True, "emoji": "🛑"},
+        {"name": "oc_answer", "toolset": "opencode_orchestrator", "schema": ANSWER_SCHEMA, "handler": make_answer(rt), "is_async": True, "emoji": "✉️"},
+        {"name": "oc_review_now", "toolset": "opencode_orchestrator", "schema": REVIEW_NOW_SCHEMA, "handler": make_review_now(rt), "is_async": True, "emoji": "🔎"},
+        {"name": "oc_review_again", "toolset": "opencode_orchestrator", "schema": REVIEW_AGAIN_SCHEMA, "handler": make_review_again(rt), "is_async": True, "emoji": "🔁"},
+        {"name": "oc_skip_review", "toolset": "opencode_orchestrator", "schema": SKIP_REVIEW_SCHEMA, "handler": make_skip_review(rt), "is_async": True, "emoji": "⏭️"},
+        {"name": "oc_pr_status", "toolset": "opencode_orchestrator", "schema": PR_STATUS_SCHEMA, "handler": make_pr_status(rt), "is_async": True, "emoji": "🔗"},
+        {"name": "oc_project_regenerate_bootstrap", "toolset": "opencode_orchestrator", "schema": REGEN_BOOTSTRAP_SCHEMA, "handler": make_regen_bootstrap(rt), "is_async": True, "emoji": "🧰"},
+        {"name": "oc_set_notify_target", "toolset": "opencode_orchestrator", "schema": SET_NOTIFY_TARGET_SCHEMA, "handler": make_set_notify_target(rt), "is_async": True, "emoji": "📡"},
+        {"name": "oc_heartbeat_send_now", "toolset": "opencode_orchestrator", "schema": HEARTBEAT_NOW_SCHEMA, "handler": make_heartbeat_send_now(rt), "is_async": True, "emoji": "💓"},
     ]

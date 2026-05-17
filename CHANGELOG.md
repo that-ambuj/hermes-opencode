@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] — 2026-05-17
+
+### Fixed
+
+- **Tool schemas now expose `description` and `parameters` to the LLM.** The
+  original 0.3.0 release passed descriptions as a `register_tool(description=...)`
+  kwarg, which hermes' registry silently drops. Schemas also lacked the
+  `parameters` wrapper required by the OpenAI tool-call format. As a result the
+  LLM was seeing tools by name only with empty descriptions and ill-formed
+  parameter shapes. All 18 tool schemas now embed `name` + `description` +
+  `parameters` inline per the convention used by `plugins/spotify/tools.py`.
+
 ## [0.3.0] — 2026-05-17
 
 Initial public release. End-to-end orchestration of multiple opencode agents in
