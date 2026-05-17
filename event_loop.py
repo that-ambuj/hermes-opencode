@@ -37,6 +37,110 @@ _sse_stop_events: dict[str, asyncio.Event] = {}
 _question_snapshot: dict[str, list[dict]] = {}
 _permission_snapshot: dict[str, list[dict]] = {}
 _snapshot_lock = threading.Lock()
+
+_notified_questions: dict[str, set[str]] = {}
+_notified_phases: dict[str, set[str]] = {}
+_notify_dedup_lock = threading.Lock()
+
+
+_EVENT_GLYPH = {
+    "pr_opened": "🔗",
+    "done": "✓",
+    "failed": "✗",
+    "awaiting_human": "⏸",
+    "review_started": "🔎",
+}
+
+
+def _notify_event(agent: "Agent", kind: str, body: str = "") -> None:
+    if _runtime is None:
+        return
+    from . import notify as notify_mod
+    if kind not in _runtime.config.notify_events:
+        return
+    glyph = _EVENT_GLYPH.get(kind, "•")
+    title = f"{glyph} {agent.agent_id}  {kind.replace('_', ' ')}"
+    final_body = body or _default_event_body(agent, kind)
+    try:
+        _runtime.config.events_log.parent.mkdir(parents=True, exist_ok=True)
+        import json
+        line = json.dumps({
+            "ts": time.time(),
+            "kind": kind,
+            "agent_id": agent.agent_id,
+            "project": agent.project_label,
+            "phase": agent.phase,
+            "pr_url": agent.pr_url,
+            "title": title,
+            "body": final_body,
+        }, default=str)
+        with _runtime.config.events_log.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError as e:
+        logger.warning("events.log write failed: %s", e)
+    try:
+        notify_mod.fanout(
+            sinks=_runtime.config.notify_sinks,
+            title=title,
+            body=final_body,
+            meta={"kind": kind, "agent_id": agent.agent_id, "phase": agent.phase, "pr_url": agent.pr_url},
+            dashboard_path=_runtime.config.notifications_file,
+            gateway_platform=_runtime.config.notify_gateway_platform,
+            gateway_chat_id=_runtime.config.notify_gateway_chat_id,
+        )
+        logger.info("notify event %s for %s dispatched to sinks=%s", kind, agent.agent_id, _runtime.config.notify_sinks)
+    except Exception as e:
+        logger.warning("notify event %s for %s failed: %s", kind, agent.agent_id, e)
+
+
+def _default_event_body(agent: "Agent", kind: str) -> str:
+    if kind == "pr_opened":
+        return f"PR opened for `{agent.branch}`: {agent.pr_url or '(url unknown)'}"
+    if kind == "done":
+        return f"PR merged. Branch `{agent.branch}`. Worktree cleaned up."
+    if kind == "failed":
+        return f"Agent transitioned to FAILED. Last error: {agent.last_error or '(no detail)'}"
+    if kind == "awaiting_human":
+        return f"Agent paused, awaiting human input. Reply in chat to forward."
+    if kind == "review_started":
+        return f"Executor finished its turn. Reviewer session staged on `{agent.branch}` for a code-review pass."
+    return f"{kind} for {agent.agent_id}"
+
+
+def _maybe_notify_phase(agent: "Agent", kind: str, body: str = "") -> None:
+    """Notify only once per (agent_id, kind) — prevents replay on tick re-entry."""
+    with _notify_dedup_lock:
+        seen = _notified_phases.setdefault(agent.agent_id, set())
+        if kind in seen:
+            return
+        seen.add(kind)
+    _notify_event(agent, kind, body)
+
+
+def _maybe_notify_new_questions(agent: "Agent", pending_q: list[dict]) -> None:
+    if not pending_q:
+        return
+    with _notify_dedup_lock:
+        seen = _notified_questions.setdefault(agent.agent_id, set())
+        new_ids = [q.get("id") for q in pending_q if q.get("id") and q.get("id") not in seen]
+        for qid in new_ids:
+            if qid:
+                seen.add(qid)
+    if not new_ids:
+        return
+    bodies: list[str] = []
+    for q in pending_q:
+        if q.get("id") not in new_ids:
+            continue
+        inner = (q.get("questions") or [{}])[0]
+        text = (inner.get("question") or "").strip()
+        opts = inner.get("options") or []
+        bullet_lines = [f"  - {o.get('label')!r}: {o.get('description', '')}" for o in opts if isinstance(o, dict)]
+        chunk = f"[{q.get('id')}] {text}"
+        if bullet_lines:
+            chunk += "\n" + "\n".join(bullet_lines)
+        bodies.append(chunk)
+    _notify_event(agent, "awaiting_human", "Pending questions:\n\n" + "\n\n".join(bodies))
 _sse_text_buffers: dict[str, dict[str, str]] = {}
 _sse_buffer_lock = threading.Lock()
 
@@ -209,20 +313,26 @@ async def _supervisor() -> None:
 
 async def _pruner_loop() -> None:
     while not _stop_flag.is_set():
-        if _runtime is not None:
+        if _runtime is None:
+            await asyncio.sleep(5.0)
+            continue
+        try:
             now = time.time()
             for agent in list(_runtime.agents.list()):
                 if agent.phase == "DONE" and agent.done_at and (now - agent.done_at) > DONE_RETENTION_SEC:
                     _archive_done(agent)
                     _runtime.agents.remove(agent.agent_id)
                     logger.info("pruned DONE agent %s after %.0fs", agent.agent_id, now - agent.done_at)
+        except Exception as e:
+            logger.warning("pruner tick failed: %s", e)
         await asyncio.sleep(PRUNE_INTERVAL_SEC)
 
 
 async def _heartbeat_loop() -> None:
-    if _runtime is None or not _runtime.config.heartbeat_enabled:
-        return
     while not _stop_flag.is_set():
+        if _runtime is None or not _runtime.config.heartbeat_enabled:
+            await asyncio.sleep(10.0)
+            continue
         try:
             tz = heartbeat_mod._resolve_tz(_runtime.config.heartbeat_timezone)
             now_local = datetime.now(tz) if tz else datetime.now()
@@ -230,11 +340,13 @@ async def _heartbeat_loop() -> None:
         except Exception as e:
             logger.warning("heartbeat scheduler failed to compute wait: %s", e)
             wait_sec = 600.0
+        logger.info("heartbeat: next fire in %.0fs (top of hour)", wait_sec)
         await asyncio.sleep(max(wait_sec, 5.0))
         if _stop_flag.is_set():
             return
         try:
-            heartbeat_mod.send_heartbeat(_runtime)
+            result = heartbeat_mod.send_heartbeat(_runtime)
+            logger.info("heartbeat fired: sent=%s sinks=%s", result.get("sent"), [s.get("sink") for s in result.get("sinks") or []])
         except Exception as e:
             logger.warning("heartbeat send failed: %s", e)
 
@@ -344,6 +456,7 @@ async def _phase_executing(agent: Agent) -> None:
     pending_p = [p for p in permissions if p.get("sessionID") == agent.session_id]
     _update_snapshots(agent.agent_id, pending_q, pending_p)
     if pending_q or pending_p:
+        _maybe_notify_new_questions(agent, pending_q)
         return
     await asyncio.sleep(IDLE_DEBOUNCE_SEC)
     confirm = await _runtime.client.wait_idle(agent.session_id, worktree, timeout=2.0)
@@ -363,13 +476,13 @@ async def _phase_review_spawning(agent: Agent) -> None:
     assert _runtime is not None
     project = _runtime.projects.get(agent.project_label)
     if project is None:
-        _runtime.agents.update(agent.agent_id, phase="FAILED", last_error="project gone")
+        _maybe_notify_phase(_runtime.agents.update(agent.agent_id, phase="FAILED", last_error="project gone"), "failed")
         return
     executor_worktree = Path(agent.worktree_path)
     try:
         sister = reviewer_mod.stage_reviewer_worktree(project, agent, executor_worktree)
     except wt_mod.GitError as e:
-        _runtime.agents.update(agent.agent_id, phase="FAILED", last_error=f"reviewer staging: {e}")
+        _maybe_notify_phase(_runtime.agents.update(agent.agent_id, phase="FAILED", last_error=f"reviewer staging: {e}"), "failed")
         return
     try:
         session_id, reviewer_text = await reviewer_mod.spawn_reviewer_session(
@@ -377,13 +490,14 @@ async def _phase_review_spawning(agent: Agent) -> None:
         )
     except OpencodeError as e:
         reviewer_mod.teardown_reviewer_worktree(project, executor_worktree)
-        _runtime.agents.update(agent.agent_id, phase="FAILED", last_error=f"reviewer session: {e}")
+        _maybe_notify_phase(_runtime.agents.update(agent.agent_id, phase="FAILED", last_error=f"reviewer session: {e}"), "failed")
         return
-    _runtime.agents.update(
+    refreshed_for_event = _runtime.agents.update(
         agent.agent_id, phase="REVIEWING",
         reviewer_session_id=session_id,
         reviewer_worktree_path=str(sister),
     )
+    _maybe_notify_phase(refreshed_for_event, "review_started")
     refreshed = _runtime.agents.get(agent.agent_id)
     if refreshed:
         await _handle_review_text(refreshed, reviewer_text)
@@ -392,7 +506,7 @@ async def _phase_review_spawning(agent: Agent) -> None:
 async def _phase_reviewing(agent: Agent) -> None:
     assert _runtime is not None
     if not agent.reviewer_session_id or not agent.reviewer_worktree_path:
-        _runtime.agents.update(agent.agent_id, phase="FAILED", last_error="reviewer state lost")
+        _maybe_notify_phase(_runtime.agents.update(agent.agent_id, phase="FAILED", last_error="reviewer state lost"), "failed")
         return
     sister = Path(agent.reviewer_worktree_path)
     became_idle = await _runtime.client.wait_idle(agent.reviewer_session_id, sister, timeout=60.0)
@@ -431,7 +545,7 @@ async def _handle_review_text(agent: Agent, reviewer_text: str) -> None:
         try:
             await reviewer_mod.send_addressing_to_executor(_runtime.client, agent, verdict.body)
         except OpencodeError as e:
-            _runtime.agents.update(agent.agent_id, phase="FAILED", last_error=f"address dispatch: {e}")
+            _maybe_notify_phase(_runtime.agents.update(agent.agent_id, phase="FAILED", last_error=f"address dispatch: {e}"), "failed")
             return
         _runtime.agents.update(
             agent.agent_id,
@@ -462,19 +576,20 @@ async def _phase_committing(agent: Agent) -> None:
     assert _runtime is not None
     project = _runtime.projects.get(agent.project_label)
     if project is None:
-        _runtime.agents.update(agent.agent_id, phase="FAILED", last_error="project gone")
+        _maybe_notify_phase(_runtime.agents.update(agent.agent_id, phase="FAILED", last_error="project gone"), "failed")
         return
     if agent.reviewer_worktree_path:
         reviewer_mod.teardown_reviewer_worktree(project, Path(agent.worktree_path))
     try:
         info = await reviewer_mod.finalize_and_open_pr(project, agent, project.base_branch)
     except pr_mod.PrError as e:
-        _runtime.agents.update(agent.agent_id, phase="FAILED", last_error=f"pr open: {e}")
+        _maybe_notify_phase(_runtime.agents.update(agent.agent_id, phase="FAILED", last_error=f"pr open: {e}"), "failed")
         return
-    _runtime.agents.update(
+    refreshed = _runtime.agents.update(
         agent.agent_id, phase="PR_OPEN",
         pr_url=info.url, pr_number=info.number,
     )
+    _maybe_notify_phase(refreshed, "pr_opened")
 
 
 async def _phase_pr_open(agent: Agent) -> None:
@@ -489,10 +604,11 @@ async def _phase_pr_open(agent: Agent) -> None:
         await asyncio.sleep(PR_POLL_SEC)
         return
     if info.state == "MERGED" and info.merged_at:
-        _runtime.agents.update(
+        refreshed = _runtime.agents.update(
             agent.agent_id, phase="DONE",
             pr_merged_at=info.merged_at, done_at=time.time(),
         )
+        _maybe_notify_phase(refreshed, "done")
         project = _runtime.projects.get(agent.project_label)
         if project:
             wt_mod.remove_worktree(Path(project.repo_path), worktree, force=True)

@@ -57,6 +57,8 @@ class Config:
     notify_sinks: list[str] = field(default_factory=lambda: ["cli", "dashboard"])
     notify_gateway_platform: str | None = None
     notify_gateway_chat_id: str | None = None
+    notify_events: set[str] = field(default_factory=lambda: {"pr_opened", "done", "failed", "awaiting_human", "review_started"})
+    events_log: Path = field(default_factory=lambda: plugin_state_dir() / "events.log")
     heartbeat_enabled: bool = True
     heartbeat_timezone: str | None = None
     heartbeat_day_start: int = 9
@@ -71,10 +73,10 @@ class Config:
         pr = entry.get("pr") or {}
         notify = entry.get("notify") or {}
         gateway = notify.get("gateway") or {}
+        events = (notify.get("events") or {})
         heartbeat = entry.get("heartbeat") or {}
-        review = entry.get("review") or {}
-        bootstrap_cfg = entry.get("bootstrap") or {}
         day_window = heartbeat.get("unconditional_hours", [9, 23])
+        default_events = {"pr_opened", "done", "failed", "awaiting_human", "review_started"}
         return cls(
             server_url=server.get("url", DEFAULT_SERVER_URL),
             server_password=server.get("password") or os.environ.get("OPENCODE_SERVER_PASSWORD") or None,
@@ -85,12 +87,11 @@ class Config:
             notify_gateway_chat_id=gateway.get("chat_id") or os.environ.get(
                 f"{(gateway.get('platform') or '').upper()}_HOME_CHANNEL"
             ) or None,
+            notify_events=set(events.get("enabled", default_events)),
             heartbeat_enabled=bool(heartbeat.get("enabled", True)),
             heartbeat_timezone=heartbeat.get("timezone"),
             heartbeat_day_start=int(day_window[0]) if len(day_window) >= 1 else 9,
             heartbeat_day_end=int(day_window[1]) if len(day_window) >= 2 else 23,
-            review_max_cycles=max(1, int(review.get("max_cycles", 1))),
-            auto_bootstrap_on_first_spawn=bool(bootstrap_cfg.get("auto_on_first_spawn", True)),
         )
 
     def ensure_dirs(self) -> None:
