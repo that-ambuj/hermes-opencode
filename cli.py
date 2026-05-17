@@ -37,7 +37,7 @@ def build_context() -> CliContext:
     """
     config = Config.from_plugin_entry(load_entry_config())
     config.ensure_dirs()
-    client = OpencodeClient(config.server_url, config.server_password)
+    client = OpencodeClient(config.server_url, config.server_password, config.serve_hostname)
     projects = ProjectRegistry(config.projects_file)
     agents = AgentStore(config.agents_file)
     return CliContext(config=config, projects=projects, agents=agents, client=client)

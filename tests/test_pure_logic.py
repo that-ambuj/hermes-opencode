@@ -930,3 +930,56 @@ class TestAtAgentDirectDispatch:
         assert result == {"action": "skip", "reason": "/oc handled inline"}
         assert slash_called == ["list"]
         assert captured == [], "send_message_async must NOT be called for /oc"
+
+
+class TestServeHostnameConfig:
+    """v0.14.5: Config.serve_hostname overrides the `opencode serve --hostname=`
+    bind address independently of the connect URL, so a user can expose
+    opencode serve to other hosts (e.g. 0.0.0.0) while hermes itself still
+    connects via loopback.
+    """
+
+    def setup_method(self):
+        self._config_mod = sys.modules["_oco_test_pkg.config"]
+        self._transport_mod = sys.modules["_oco_test_pkg.transport"]
+
+    def test_config_default_serve_hostname_is_none(self):
+        cfg = self._config_mod.Config.from_plugin_entry({})
+        assert cfg.serve_hostname is None
+
+    def test_config_reads_yaml_serve_hostname(self):
+        cfg = self._config_mod.Config.from_plugin_entry({
+            "opencode_server": {"url": "http://127.0.0.1:4096", "serve_hostname": "0.0.0.0"},
+        })
+        assert cfg.serve_hostname == "0.0.0.0"
+
+    def test_config_reads_env_var_serve_hostname(self, monkeypatch):
+        monkeypatch.setenv("OPENCODE_SERVE_HOSTNAME", "192.168.1.10")
+        cfg = self._config_mod.Config.from_plugin_entry({})
+        assert cfg.serve_hostname == "192.168.1.10"
+
+    def test_config_yaml_overrides_env_var(self, monkeypatch):
+        monkeypatch.setenv("OPENCODE_SERVE_HOSTNAME", "from-env")
+        cfg = self._config_mod.Config.from_plugin_entry({
+            "opencode_server": {"serve_hostname": "from-yaml"},
+        })
+        assert cfg.serve_hostname == "from-yaml"
+
+    def test_client_default_serve_hostname_falls_back_to_url_host(self):
+        c = self._transport_mod.OpencodeClient("http://127.0.0.1:4096")
+        assert c._host == "127.0.0.1"
+        assert c._serve_hostname == "127.0.0.1"
+
+    def test_client_serve_hostname_override_does_not_change_connect_host(self):
+        c = self._transport_mod.OpencodeClient(
+            "http://127.0.0.1:4096", None, serve_hostname="0.0.0.0",
+        )
+        assert c._host == "127.0.0.1", "connect host stays parsed from URL"
+        assert c._serve_hostname == "0.0.0.0", "bind host honors override"
+
+    def test_client_serve_hostname_empty_falls_back_to_url_host(self):
+        c = self._transport_mod.OpencodeClient(
+            "http://10.0.0.5:9000", None, serve_hostname=None,
+        )
+        assert c._host == "10.0.0.5"
+        assert c._serve_hostname == "10.0.0.5"

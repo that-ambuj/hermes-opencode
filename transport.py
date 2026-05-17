@@ -39,7 +39,12 @@ def _wrap_transport_errors(coro: Callable[..., Awaitable[_T]]) -> Callable[..., 
 
 
 class OpencodeClient:
-    def __init__(self, base_url: str, password: str | None = None) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        password: str | None = None,
+        serve_hostname: str | None = None,
+    ) -> None:
         self.base_url = base_url.rstrip("/")
         self._headers: dict[str, str] = {}
         if password:
@@ -47,6 +52,11 @@ class OpencodeClient:
         parsed = urlparse(self.base_url)
         self._host = parsed.hostname or "127.0.0.1"
         self._port = parsed.port or 80
+        # `_host` is used to CONNECT (loopback probe + httpx target). `_serve_hostname`
+        # is what we pass to `opencode serve --hostname=...` when auto-spawning. The two
+        # diverge when the user wants opencode to bind to e.g. 0.0.0.0 (reachable from
+        # other hosts) while hermes itself still connects via 127.0.0.1.
+        self._serve_hostname = serve_hostname or self._host
         self._spawned: subprocess.Popen[str] | None = None
         self._spawn_lock = threading.Lock()
         self._last_serve_log_path: Path | None = None
@@ -94,7 +104,7 @@ class OpencodeClient:
             log_path = self._prepare_serve_log_path(log_dir)
             log_handle = self._open_serve_log(log_path)
             self._spawned = subprocess.Popen(
-                [binary, "serve", f"--hostname={self._host}", f"--port={self._port}"],
+                [binary, "serve", f"--hostname={self._serve_hostname}", f"--port={self._port}"],
                 stdout=log_handle if log_handle is not None else subprocess.DEVNULL,
                 stderr=subprocess.STDOUT if log_handle is not None else subprocess.DEVNULL,
                 text=True,

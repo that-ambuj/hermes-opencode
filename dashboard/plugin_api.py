@@ -63,6 +63,27 @@ def _state_dir() -> Path:
     return get_hermes_home() / "plugins" / PLUGIN_NAME
 
 
+def _server_url_from_config() -> str:
+    try:
+        from .. import config as cfg_mod
+        return cfg_mod.Config.from_plugin_entry(cfg_mod.load_entry_config()).server_url
+    except Exception:
+        return ""
+
+
+def _make_session_url(server_url: str, session_id: str | None) -> str | None:
+    if not server_url or not session_id:
+        return None
+    return server_url.rstrip("/") + "/session/" + session_id + "/message"
+
+
+def _inject_session_urls(rows: list[dict], server_url: str) -> None:
+    for r in rows:
+        r["session_url"] = _make_session_url(server_url, r.get("session_id"))
+        if r.get("reviewer_session_id"):
+            r["reviewer_session_url"] = _make_session_url(server_url, r.get("reviewer_session_id"))
+
+
 def _read_json(path: Path) -> dict | list:
     if not path.exists():
         return {}
@@ -102,9 +123,18 @@ async def index() -> dict[str, Any]:
             "GET  /projects/{label}",
             "GET  /heartbeats",
             "GET  /history",
+            "GET  /config",
             "GET  /health",
         ],
         "state_dir": str(_state_dir()),
+    }
+
+
+@router.get("/config")
+async def get_config() -> dict[str, Any]:
+    return {
+        "plugin": PLUGIN_NAME,
+        "server_url": _server_url_from_config(),
     }
 
 
@@ -124,7 +154,7 @@ async def health() -> dict[str, Any]:
 async def list_agents(include_archived: int = 0) -> dict[str, Any]:
     data = _read_json(_state_dir() / "agents.json")
     if not isinstance(data, dict):
-        return {"agents": [], "count": 0, "archived_hidden": 0}
+        return {"agents": [], "count": 0, "archived_hidden": 0, "server_url": ""}
     rows = list(data.values())
     hidden = 0
     if not include_archived:
@@ -136,14 +166,23 @@ async def list_agents(include_archived: int = 0) -> dict[str, Any]:
                 kept.append(r)
         rows = kept
     rows.sort(key=lambda r: r.get("last_activity_at") or 0, reverse=True)
-    return {"agents": rows, "count": len(rows), "archived_hidden": hidden}
+    server_url = _server_url_from_config()
+    _inject_session_urls(rows, server_url)
+    return {
+        "agents": rows,
+        "count": len(rows),
+        "archived_hidden": hidden,
+        "server_url": server_url,
+    }
 
 
 @router.get("/agents/{agent_id:path}")
 async def get_agent(agent_id: str) -> dict[str, Any]:
     data = _read_json(_state_dir() / "agents.json")
     if isinstance(data, dict) and agent_id in data:
-        return {"agent": data[agent_id]}
+        agent = dict(data[agent_id])
+        _inject_session_urls([agent], _server_url_from_config())
+        return {"agent": agent}
     return {"agent": None, "error": "not_found"}
 
 
@@ -215,7 +254,15 @@ def _snapshot_payload(include_archived: bool = False) -> dict[str, Any]:
         if repo_path:
             r["repo_exists"] = Path(repo_path).is_dir()
     projects_rows.sort(key=lambda r: r.get("created_at") or 0, reverse=True)
-    return {"type": "snapshot", "agents": agents_rows, "projects": projects_rows, "archived_hidden": archived_hidden}
+    server_url = _server_url_from_config()
+    _inject_session_urls(agents_rows, server_url)
+    return {
+        "type": "snapshot",
+        "agents": agents_rows,
+        "projects": projects_rows,
+        "archived_hidden": archived_hidden,
+        "server_url": server_url,
+    }
 
 
 def _read_jsonl_since(path: Path, byte_offset: int) -> tuple[list[dict], int]:
@@ -283,7 +330,12 @@ async def events_ws(websocket: "WebSocket") -> None:
                 agents_mtime = new_agents_mtime
                 payload = _snapshot_payload(include_archived)
                 try:
-                    await websocket.send_json({"type": "agents", "agents": payload["agents"], "archived_hidden": payload.get("archived_hidden", 0)})
+                    await websocket.send_json({
+                        "type": "agents",
+                        "agents": payload["agents"],
+                        "archived_hidden": payload.get("archived_hidden", 0),
+                        "server_url": payload.get("server_url", ""),
+                    })
                 except Exception:
                     return
             items, new_offset = _read_jsonl_since(notif_path, notif_offset)

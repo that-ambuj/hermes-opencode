@@ -116,14 +116,32 @@
             },
             "\u2715"
           )),
-          /* @__PURE__ */ React.createElement("div", { className: "oco-modal-body" }, /* @__PURE__ */ React.createElement(DetailRow, { label: "Project", value: agent.project_label }), /* @__PURE__ */ React.createElement(DetailRow, { label: "Branch", value: agent.branch, mono: true }), /* @__PURE__ */ React.createElement(DetailRow, { label: "Session", value: agent.session_id, mono: true }), /* @__PURE__ */ React.createElement(DetailRow, { label: "Worktree", value: agent.worktree_path, mono: true }), agent.reviewer_session_id && /* @__PURE__ */ React.createElement(
+          /* @__PURE__ */ React.createElement("div", { className: "oco-modal-body" }, /* @__PURE__ */ React.createElement(DetailRow, { label: "Project", value: agent.project_label }), /* @__PURE__ */ React.createElement(DetailRow, { label: "Branch", value: agent.branch, mono: true }), /* @__PURE__ */ React.createElement(DetailRow, { label: "Session", value: agent.session_id, mono: true }), agent.session_url && /* @__PURE__ */ React.createElement(DetailRow, { label: "Session URL" }, /* @__PURE__ */ React.createElement(
+            "a",
+            {
+              className: "oco-mono",
+              href: agent.session_url,
+              target: "_blank",
+              rel: "noopener noreferrer"
+            },
+            agent.session_url
+          )), /* @__PURE__ */ React.createElement(DetailRow, { label: "Worktree", value: agent.worktree_path, mono: true }), agent.reviewer_session_id && /* @__PURE__ */ React.createElement(
             DetailRow,
             {
               label: "Reviewer session",
               value: agent.reviewer_session_id,
               mono: true
             }
-          ), agent.reviewer_worktree_path && /* @__PURE__ */ React.createElement(
+          ), agent.reviewer_session_url && /* @__PURE__ */ React.createElement(DetailRow, { label: "Reviewer session URL" }, /* @__PURE__ */ React.createElement(
+            "a",
+            {
+              className: "oco-mono",
+              href: agent.reviewer_session_url,
+              target: "_blank",
+              rel: "noopener noreferrer"
+            },
+            agent.reviewer_session_url
+          )), agent.reviewer_worktree_path && /* @__PURE__ */ React.createElement(
             DetailRow,
             {
               label: "Reviewer worktree",
@@ -221,6 +239,7 @@
       const [selectedAgentId, setSelectedAgentId] = React.useState(null);
       const [includeArchived, setIncludeArchived] = React.useState(false);
       const [archivedHidden, setArchivedHidden] = React.useState(0);
+      const [serverUrl, setServerUrl] = React.useState("");
       const selectedAgent = React.useMemo(
         () => agents.find((a) => a.agent_id === selectedAgentId) || null,
         [agents, selectedAgentId]
@@ -237,6 +256,7 @@
             ]);
             setAgents(a && a.agents || []);
             setArchivedHidden(a && a.archived_hidden || 0);
+            if (a && typeof a.server_url === "string") setServerUrl(a.server_url);
             setProjects(p && p.projects || []);
             setHeartbeats(h && h.items || []);
             setError(null);
@@ -281,10 +301,12 @@
                   if (Array.isArray(msg.agents)) setAgents(msg.agents);
                   if (Array.isArray(msg.projects)) setProjects(msg.projects);
                   if (typeof msg.archived_hidden === "number") setArchivedHidden(msg.archived_hidden);
+                  if (typeof msg.server_url === "string") setServerUrl(msg.server_url);
                   setLastRefreshAt(Date.now() / 1e3);
                 } else if (msg.type === "agents") {
                   if (Array.isArray(msg.agents)) setAgents(msg.agents);
                   if (typeof msg.archived_hidden === "number") setArchivedHidden(msg.archived_hidden);
+                  if (typeof msg.server_url === "string") setServerUrl(msg.server_url);
                   setLastRefreshAt(Date.now() / 1e3);
                 } else if (msg.type === "heartbeat") {
                   if (Array.isArray(msg.items)) {
@@ -332,7 +354,16 @@
           refreshing,
           lastRefreshAt
         }
-      ))), /* @__PURE__ */ React.createElement("div", { className: "oco-stats" }, /* @__PURE__ */ React.createElement("span", null, agents.length, " agent", agents.length === 1 ? "" : "s"), /* @__PURE__ */ React.createElement("span", { className: "oco-sep" }, "\xB7"), /* @__PURE__ */ React.createElement("span", null, projects.length, " project", projects.length === 1 ? "" : "s"), /* @__PURE__ */ React.createElement("span", { className: "oco-sep" }, "\xB7"), /* @__PURE__ */ React.createElement("span", { className: "oco-transport oco-transport-" + transport }, transport), lastRefreshAt && /* @__PURE__ */ React.createElement("span", { className: "oco-sep" }, "\xB7"), lastRefreshAt && /* @__PURE__ */ React.createElement("span", { className: "oco-loading" }, "updated ", formatAge(lastRefreshAt), " ago")), error && /* @__PURE__ */ React.createElement("div", { className: "oco-error" }, error)), /* @__PURE__ */ React.createElement("section", { className: "oco-section" }, /* @__PURE__ */ React.createElement("h2", null, "Agents"), /* @__PURE__ */ React.createElement(AgentsTable, { agents, onSelect: setSelectedAgentId })), /* @__PURE__ */ React.createElement("section", { className: "oco-section" }, /* @__PURE__ */ React.createElement("h2", null, "Projects"), /* @__PURE__ */ React.createElement(ProjectsTable, { projects })), /* @__PURE__ */ React.createElement("section", { className: "oco-section" }, /* @__PURE__ */ React.createElement("h2", null, "Recent heartbeats"), /* @__PURE__ */ React.createElement(HeartbeatsList, { items: heartbeats })), selectedAgent && /* @__PURE__ */ React.createElement(
+      ))), /* @__PURE__ */ React.createElement("div", { className: "oco-stats" }, /* @__PURE__ */ React.createElement("span", null, agents.length, " agent", agents.length === 1 ? "" : "s"), /* @__PURE__ */ React.createElement("span", { className: "oco-sep" }, "\xB7"), /* @__PURE__ */ React.createElement("span", null, projects.length, " project", projects.length === 1 ? "" : "s"), /* @__PURE__ */ React.createElement("span", { className: "oco-sep" }, "\xB7"), /* @__PURE__ */ React.createElement("span", { className: "oco-transport oco-transport-" + transport }, transport), lastRefreshAt && /* @__PURE__ */ React.createElement("span", { className: "oco-sep" }, "\xB7"), lastRefreshAt && /* @__PURE__ */ React.createElement("span", { className: "oco-loading" }, "updated ", formatAge(lastRefreshAt), " ago")), serverUrl && /* @__PURE__ */ React.createElement("div", { className: "oco-server-url" }, /* @__PURE__ */ React.createElement("span", { className: "oco-server-url-label" }, "opencode serve:"), " ", /* @__PURE__ */ React.createElement(
+        "a",
+        {
+          className: "oco-mono",
+          href: serverUrl,
+          target: "_blank",
+          rel: "noopener noreferrer"
+        },
+        serverUrl
+      )), error && /* @__PURE__ */ React.createElement("div", { className: "oco-error" }, error)), /* @__PURE__ */ React.createElement("section", { className: "oco-section" }, /* @__PURE__ */ React.createElement("h2", null, "Agents"), /* @__PURE__ */ React.createElement(AgentsTable, { agents, onSelect: setSelectedAgentId })), /* @__PURE__ */ React.createElement("section", { className: "oco-section" }, /* @__PURE__ */ React.createElement("h2", null, "Projects"), /* @__PURE__ */ React.createElement(ProjectsTable, { projects })), /* @__PURE__ */ React.createElement("section", { className: "oco-section" }, /* @__PURE__ */ React.createElement("h2", null, "Recent heartbeats"), /* @__PURE__ */ React.createElement(HeartbeatsList, { items: heartbeats })), selectedAgent && /* @__PURE__ */ React.createElement(
         AgentDetailModal,
         {
           agent: selectedAgent,

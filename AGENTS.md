@@ -71,6 +71,18 @@ hermes main session for 30 s – several minutes while the executor's first
 turn streamed. Fixed by switching to `send_message_async`; the bg loop
 picks up first-turn completion via `/wait` + question polling.
 
+v0.14.5 added `Config.serve_hostname` (YAML
+`plugins.entries.hermes-opencode.opencode_server.serve_hostname` or env
+`OPENCODE_SERVE_HOSTNAME`) so a user can pin the `--hostname=` value
+`opencode serve` binds to independently of `server_url`. Default `None`
+falls back to the host parsed out of `server_url` (existing v0.3.0+
+behaviour). Typical use: bind to `0.0.0.0` so other machines on the LAN
+can reach the server while hermes itself keeps connecting via the
+loopback `server_url`. `OpencodeClient.__init__` stores the connect host
+in `self._host` (used for the readiness probe + httpx target) and the
+bind host in `self._serve_hostname` (used for the `--hostname=` spawn
+flag); the two diverge only when this knob is set.
+
 The 0.14.3 → 0.14.4 regression: the same anti-pattern survived in `oc_send`
 all the way until v0.14.3 — `make_send` was awaiting the blocking
 `send_message` with `timeout_sec=600`, so any chat-side `oc_send` call
@@ -318,6 +330,37 @@ tmp.replace(path)
 Never write directly with `path.write_text(...)`. Locks are
 `threading.Lock` instances per registry/store instance — guards in-process
 contention only, not multi-process.
+
+## Dashboard API surface
+
+`dashboard/plugin_api.py` exposes a read-only FastAPI router mounted at
+`/api/plugins/hermes-opencode/`. Every endpoint is informational; mutation
+goes through the tool surface. Endpoints:
+
+| Path | Returns |
+|---|---|
+| `GET /` | Plugin info + endpoint enumeration |
+| `GET /health` | State directory + file existence checks |
+| `GET /config` | `{plugin, server_url}` — the configured `opencode serve` URL surfaced for the dashboard header |
+| `GET /agents?include_archived=0` | `{agents[], count, archived_hidden, server_url}` — each row carries `session_url` (and `reviewer_session_url` when applicable), constructed as `<server_url>/session/<session_id>/message` |
+| `GET /agents/{agent_id}` | `{agent}` with the same `session_url` injection |
+| `GET /projects` | `{projects[], count}` |
+| `GET /projects/{label}` | `{project}` |
+| `GET /heartbeats?n=20` | Recent `notifications.jsonl` entries |
+| `GET /history?n=50` | Archived agents from `history.jsonl` |
+| `WS /events?token=...&include_archived=0` | Streaming snapshot + agents/heartbeat deltas. The initial `"snapshot"` payload and subsequent `"agents"` pushes carry `server_url` so the frontend can render the dashboard header even when never hitting the REST endpoints. |
+
+The session URL is a real opencode HTTP endpoint (returns the session's
+message list as JSON) — opening it in a browser without the
+`x-opencode-directory` header will fail, but the URL is the canonical
+copyable handle for `curl` / API inspection. There is no opencode HTML
+session UI to link to; the agent-detail modal in the dashboard is the
+human-facing inspection surface and is opened by clicking an agent row.
+
+`_server_url_from_config()` lazily imports `..config` inside the dashboard
+package. If the import fails (e.g. plugin_api is loaded out of context),
+the helper returns `""` and downstream `_make_session_url` returns `None`
+so the frontend skips rendering broken links.
 
 ## Dashboard development
 

@@ -184,6 +184,18 @@
             <DetailRow label="Project" value={agent.project_label} />
             <DetailRow label="Branch" value={agent.branch} mono />
             <DetailRow label="Session" value={agent.session_id} mono />
+            {agent.session_url && (
+              <DetailRow label="Session URL">
+                <a
+                  className="oco-mono"
+                  href={agent.session_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  {agent.session_url}
+                </a>
+              </DetailRow>
+            )}
             <DetailRow label="Worktree" value={agent.worktree_path} mono />
             {agent.reviewer_session_id && (
               <DetailRow
@@ -191,6 +203,18 @@
                 value={agent.reviewer_session_id}
                 mono
               />
+            )}
+            {agent.reviewer_session_url && (
+              <DetailRow label="Reviewer session URL">
+                <a
+                  className="oco-mono"
+                  href={agent.reviewer_session_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  {agent.reviewer_session_url}
+                </a>
+              </DetailRow>
             )}
             {agent.reviewer_worktree_path && (
               <DetailRow
@@ -357,6 +381,7 @@
     const [selectedAgentId, setSelectedAgentId] = React.useState(null);
     const [includeArchived, setIncludeArchived] = React.useState(false);
     const [archivedHidden, setArchivedHidden] = React.useState(0);
+    const [serverUrl, setServerUrl] = React.useState("");
     const selectedAgent = React.useMemo(
       () => agents.find((a) => a.agent_id === selectedAgentId) || null,
       [agents, selectedAgentId]
@@ -376,6 +401,7 @@
           ]);
           setAgents((a && a.agents) || []);
           setArchivedHidden((a && a.archived_hidden) || 0);
+          if (a && typeof a.server_url === "string") setServerUrl(a.server_url);
           setProjects((p && p.projects) || []);
           setHeartbeats((h && h.items) || []);
           setError(null);
@@ -429,10 +455,12 @@
                 if (Array.isArray(msg.agents)) setAgents(msg.agents);
                 if (Array.isArray(msg.projects)) setProjects(msg.projects);
                 if (typeof msg.archived_hidden === "number") setArchivedHidden(msg.archived_hidden);
+                if (typeof msg.server_url === "string") setServerUrl(msg.server_url);
                 setLastRefreshAt(Date.now() / 1000);
               } else if (msg.type === "agents") {
                 if (Array.isArray(msg.agents)) setAgents(msg.agents);
                 if (typeof msg.archived_hidden === "number") setArchivedHidden(msg.archived_hidden);
+                if (typeof msg.server_url === "string") setServerUrl(msg.server_url);
                 setLastRefreshAt(Date.now() / 1000);
               } else if (msg.type === "heartbeat") {
                 if (Array.isArray(msg.items)) {
@@ -508,6 +536,19 @@
               </span>
             )}
           </div>
+          {serverUrl && (
+            <div className="oco-server-url">
+              <span className="oco-server-url-label">opencode serve:</span>{" "}
+              <a
+                className="oco-mono"
+                href={serverUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                {serverUrl}
+              </a>
+            </div>
+          )}
           {error && <div className="oco-error">{error}</div>}
         </header>
         <section className="oco-section">

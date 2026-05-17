@@ -5,6 +5,70 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.5] - 2026-05-17
+
+### Added
+
+- **`opencode_server.serve_hostname` config knob.** New `Config.serve_hostname`
+  field, configurable via
+  `plugins.entries.hermes-opencode.opencode_server.serve_hostname` in
+  `~/.hermes/config.yaml` or the `OPENCODE_SERVE_HOSTNAME` env var.
+  When set, the value is passed to `opencode serve --hostname=...`
+  instead of the host parsed out of `server_url`. Lets a user bind
+  opencode to `0.0.0.0` (reachable from other hosts on the LAN) while
+  keeping `server_url` on loopback for local connects. Default `None`
+  preserves the v0.3.0+ behaviour (bind matches the connect URL host).
+
+  `OpencodeClient.__init__` now takes an optional third `serve_hostname`
+  argument and stores the connect host in `self._host` (used for the
+  TCP readiness probe and as the httpx target) and the bind host in
+  `self._serve_hostname` (used for the `--hostname=` spawn flag). The
+  two diverge only when the knob is set; otherwise `serve_hostname`
+  falls back to `_host`.
+
+- **Dashboard surfaces the configured opencode serve URL** in the page
+  header. Frontend pulls it from the new `/api/plugins/hermes-opencode/config`
+  endpoint (and from the `server_url` field on `/agents`,
+  `/agents/{id}`, and the WebSocket `snapshot` / `agents` payloads, so
+  it stays in sync across transports without a separate fetch).
+
+- **Per-agent session URLs in the dashboard.** Each agent row now
+  carries a `session_url` (and `reviewer_session_url` when applicable),
+  constructed as `<server_url>/session/<session_id>/message`. The
+  agent-detail modal renders both as clickable anchors. The URL points
+  at the opencode HTTP API endpoint that returns the session's message
+  list as JSON; opening it in a browser without the
+  `x-opencode-directory` header will 4xx, but the URL is the canonical
+  copyable handle for `curl` / API inspection. Opencode has no HTML
+  session UI, so the dashboard's own modal is the human-facing surface
+  (click an agent row to open it).
+
+- **15 new regression tests:**
+  - `tests/test_pure_logic.py::TestServeHostnameConfig` (7 cases):
+    default `serve_hostname` is `None`; YAML key reads through;
+    `OPENCODE_SERVE_HOSTNAME` env var reads through; YAML overrides env;
+    `OpencodeClient` default `_serve_hostname` falls back to URL host;
+    explicit override doesn't change connect host; empty override falls
+    back.
+  - `tests/test_dashboard_ws.py::TestDashboardServerUrlAndSessionUrls` (8
+    cases): `_make_session_url` constructs the URL correctly, strips
+    trailing slash, returns `None` on missing inputs; `_inject_session_urls`
+    handles reviewer rows + missing session_ids; `/agents` carries
+    `server_url` + `session_url`; `/agents/{id}` carries `session_url`;
+    `/config` returns the expected shape; WebSocket snapshot carries
+    `server_url` + per-row `session_url`.
+
+  Full suite: 259 passed, 0 skipped (was 242 at v0.14.4).
+
+### Changed
+
+- `dashboard/dist/index.js` rebuilt from `src/index.jsx` via
+  `bun run build`. Source-of-truth remains `src/index.jsx`.
+- `dashboard/dist/style.css` gained `.oco-server-url` + label rules.
+- `AGENTS.md` gained a new `Dashboard API surface` section enumerating
+  every endpoint and its JSON shape, and the `Sync vs async opencode
+  endpoints` section now records the v0.14.5 `serve_hostname` knob.
+
 ## [0.14.4] - 2026-05-17
 
 ### Fixed

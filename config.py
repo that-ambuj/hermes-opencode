@@ -72,6 +72,7 @@ def load_entry_config() -> dict:
 class Config:
     server_url: str = DEFAULT_SERVER_URL
     server_password: str | None = None
+    serve_hostname: str | None = None
     default_base_branch: str = "main"
     worktrees_root: Path = field(default_factory=lambda: plugin_state_dir() / "wt")
     projects_file: Path = field(default_factory=lambda: plugin_state_dir() / "projects.json")
@@ -137,6 +138,7 @@ class Config:
         return cls(
             server_url=server.get("url", DEFAULT_SERVER_URL),
             server_password=server.get("password") or os.environ.get("OPENCODE_SERVER_PASSWORD") or None,
+            serve_hostname=server.get("serve_hostname") or os.environ.get("OPENCODE_SERVE_HOSTNAME") or None,
             default_base_branch=pr.get("base_branch", "main"),
             auto_spawn_server=bool(entry.get("auto_spawn_server", True)),
             notify_sinks=sinks,
