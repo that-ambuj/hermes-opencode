@@ -22,6 +22,7 @@ def _load_plugin():
 
 
 _load_plugin()
+plugin_mod = sys.modules["_oco_test_pkg"]
 bootstrap_mod = sys.modules["_oco_test_pkg.bootstrap"]
 reviewer_mod = sys.modules["_oco_test_pkg.reviewer"]
 heartbeat_mod = sys.modules["_oco_test_pkg.heartbeat"]
@@ -515,3 +516,115 @@ class TestPrunerArchivesCancelled:
             assert (time.time() - done_ts) < event_loop_mod.ARCHIVE_AFTER_SEC
         after = store.get("ma/recent")
         assert after.archived is False
+
+
+class TestPreLlmCallHookDispatcherDirective:
+    """v0.14.3: pre_llm_call hook injects DISPATCHER MODE directive so the
+    hermes chat LLM forwards the human's task to opencode verbatim instead
+    of planning/decomposing first. The same hook still carries the pending
+    questions/permissions block when those exist.
+    """
+
+    def setup_method(self):
+        self._saved_runtime = plugin_mod._runtime
+        self._saved_snapshot = event_loop_mod.get_pending_snapshot
+
+    def teardown_method(self):
+        plugin_mod._runtime = self._saved_runtime
+        event_loop_mod.get_pending_snapshot = self._saved_snapshot
+
+    def test_no_runtime_returns_none(self):
+        plugin_mod._runtime = None
+        assert plugin_mod._build_pre_llm_context() is None
+        assert plugin_mod._pre_llm_call_hook() is None
+
+    def test_runtime_set_no_pending_returns_directive_only(self):
+        plugin_mod._runtime = object()
+        event_loop_mod.get_pending_snapshot = lambda: ({}, {})
+        ctx = plugin_mod._build_pre_llm_context()
+        assert ctx is not None
+        assert "DISPATCHER MODE" in ctx
+        assert "FULL authority" in ctx
+        assert "VERBATIM" in ctx
+        assert "Do NOT plan" in ctx
+        assert "ASK THE HUMAN" in ctx
+        assert "pending items" not in ctx
+        # hook wraps context in {"context": ...}
+        assert plugin_mod._pre_llm_call_hook() == {"context": ctx}
+
+    def test_runtime_set_with_pending_directive_precedes_pending(self):
+        plugin_mod._runtime = object()
+        event_loop_mod.get_pending_snapshot = lambda: (
+            {
+                "oco/fix-x": [
+                    {
+                        "id": "q1",
+                        "questions": [
+                            {
+                                "question": "Use option A or B?",
+                                "options": [
+                                    {"label": "A", "description": "first"},
+                                    {"label": "B", "description": "second"},
+                                ],
+                                "multiple": False,
+                                "custom": False,
+                            }
+                        ],
+                    }
+                ],
+            },
+            {
+                "oco/fix-x": [
+                    {"id": "p1", "permission": "bash", "patterns": ["rm -rf *"]}
+                ],
+            },
+        )
+        ctx = plugin_mod._build_pre_llm_context()
+        assert ctx is not None
+        assert "DISPATCHER MODE" in ctx
+        assert "pending items" in ctx
+        assert "q1" in ctx and "p1" in ctx
+        assert "Use option A or B?" in ctx
+        # directive must come FIRST so it's not buried under pending noise
+        assert ctx.index("DISPATCHER MODE") < ctx.index("pending items")
+        # blocks separated by blank line
+        assert "\n\n[hermes-opencode] pending items" in ctx
+
+    def test_directive_has_no_em_dash(self):
+        # AGENTS.md anti-pattern: em-dashes in code. Blocking violation.
+        assert "\u2014" not in plugin_mod._DISPATCHER_DIRECTIVE
+
+
+class TestSpawnSchemaDispatcherWording:
+    """v0.14.3: oc_spawn / oc_send tool descriptions explicitly forbid
+    the hermes chat LLM from planning/paraphrasing/decomposing the prompt.
+    """
+
+    def setup_method(self):
+        self._tools_mod = sys.modules["_oco_test_pkg.tools"]
+
+    def test_spawn_schema_forbids_planning(self):
+        desc = self._tools_mod.SPAWN_SCHEMA["description"]
+        assert "VERBATIM" in desc
+        assert "FULL authority" in desc
+        assert "DISPATCHER" in desc
+        for forbidden_verb in ["plan, analyze", "paraphrase", "improve"]:
+            assert forbidden_verb in desc, f"missing forbidden-verb wording: {forbidden_verb}"
+
+    def test_spawn_prompt_param_forbids_planning(self):
+        pd = self._tools_mod.SPAWN_SCHEMA["parameters"]["properties"]["prompt"]["description"]
+        assert "VERBATIM" in pd
+        assert "No planning" in pd
+        assert "literal words" in pd
+        assert "ASK the human" in pd
+
+    def test_send_schema_forbids_planning(self):
+        desc = self._tools_mod.SEND_SCHEMA["description"]
+        assert "VERBATIM" in desc
+        assert "dispatcher" in desc
+        assert "opencode owns the task" in desc
+
+    def test_send_text_param_forbids_planning(self):
+        td = self._tools_mod.SEND_SCHEMA["parameters"]["properties"]["text"]["description"]
+        assert "VERBATIM" in td
+        assert "No planning" in td

@@ -24,9 +24,20 @@ from .transport import OpencodeClient
 _runtime: Runtime | None = None
 
 
-def _build_pre_llm_context() -> str | None:
-    if _runtime is None:
-        return None
+_DISPATCHER_DIRECTIVE = (
+    "[hermes-opencode] DISPATCHER MODE. When calling oc_spawn or oc_send, "
+    "the opencode agent has FULL authority over its task: it plans its own "
+    "work, scopes its own files, designs its own approach. You are a "
+    "dispatcher, NOT a planner.\n"
+    "  - Forward the human's words VERBATIM in the `prompt` / `text` arg. "
+    "Do NOT plan, decompose, analyze, paraphrase, add file hints, prepend "
+    "background, or insert your own framing.\n"
+    "  - If the human's request is unclear, ASK THE HUMAN a clarifying "
+    "question first. Never fill in gaps on opencode's behalf."
+)
+
+
+def _build_pending_items_block() -> str | None:
     questions, permissions = event_loop.get_pending_snapshot()
     if not questions and not permissions:
         return None
@@ -66,6 +77,16 @@ def _build_pre_llm_context() -> str | None:
         "answer normally.",
     ])
     return "\n".join(lines)
+
+
+def _build_pre_llm_context() -> str | None:
+    if _runtime is None:
+        return None
+    blocks: list[str] = [_DISPATCHER_DIRECTIVE]
+    pending = _build_pending_items_block()
+    if pending:
+        blocks.append(pending)
+    return "\n\n".join(blocks)
 
 
 def _pre_llm_call_hook(**_: Any) -> dict[str, Any] | None:

@@ -151,14 +151,51 @@ PROJECT_SET_REPO_PATH_SCHEMA: dict[str, Any] = {
 
 SPAWN_SCHEMA: dict[str, Any] = {
     "name": "oc_spawn",
-    "description": "Create a git worktree on a new branch, start an opencode session bound to it, and send the initial prompt VERBATIM. Returns the agent_id (format: <abbrev>/<task>, max 20 chars) and the opencode session id. The plugin's background loop will drive the executor -> reviewer -> commit -> PR cycle.",
+    "description": (
+        "Create a git worktree on a new branch, start an opencode session "
+        "bound to it, and forward the human's task to opencode VERBATIM. "
+        "Returns the agent_id (format: <abbrev>/<task>, max 20 chars) and "
+        "the opencode session id. The plugin's background loop will drive "
+        "the executor -> reviewer -> commit -> PR cycle.\n"
+        "\n"
+        "AUTHORITY MODEL: opencode has FULL authority over the task it "
+        "receives. Opencode does its own planning, scoping, decomposition, "
+        "file exploration, design, and execution. You (the caller) are a "
+        "DISPATCHER, not a planner.\n"
+        "\n"
+        "You MUST NOT, when constructing the `prompt` arg:\n"
+        "  - plan, analyze, or decompose the human's task into steps\n"
+        "  - add context, hints, file paths, module names, or suggested approaches\n"
+        "  - rewrite, paraphrase, summarize, or 'improve' the human's wording\n"
+        "  - prepend background or your own framing\n"
+        "  - guess at details the human did not state\n"
+        "\n"
+        "If the human said 'fix the login bug', the `prompt` is literally "
+        "'fix the login bug' and nothing more. Opencode investigates from "
+        "there.\n"
+        "\n"
+        "If the human's task is too vague or ambiguous to act on, do NOT "
+        "fill in the gaps yourself. Ask the human a clarifying question "
+        "FIRST, then call oc_spawn once they answer."
+    ),
     "parameters": {
         "type": "object",
         "additionalProperties": False,
         "properties": {
             "project": {"type": "string", "description": "Registered project label."},
             "task": {"type": "string", "description": "2-4 kebab-case words summarizing the task; used in agent_id and as branch name."},
-            "prompt": {"type": "string", "description": "Initial prompt sent VERBATIM to the executor opencode session. Do not paraphrase or wrap."},
+            "prompt": {
+                "type": "string",
+                "description": (
+                    "The human's task message, forwarded to opencode VERBATIM. "
+                    "Pass the human's literal words. No planning, no analysis, "
+                    "no decomposition, no added context, no file hints, no "
+                    "suggested approach, no rewriting. Opencode plans its own "
+                    "work. If the human's message is unclear, ASK the human "
+                    "for clarification before calling this tool. Never fill "
+                    "in gaps on opencode's behalf."
+                ),
+            },
             "branch": {"type": "string", "description": "Branch name (default: agent_id)."},
             "base_branch": {"type": "string", "description": "Branch to fork from (default: project's base_branch)."},
             "agent": {"type": "string", "description": "Opencode agent type to request (default: 'build'; opencode may resolve to a different agent if oh-my-openagent overrides are active).", "default": "build"},
@@ -170,13 +207,29 @@ SPAWN_SCHEMA: dict[str, Any] = {
 
 SEND_SCHEMA: dict[str, Any] = {
     "name": "oc_send",
-    "description": "Send a follow-up message to a live agent's opencode session. Text is forwarded verbatim. Blocks until the agent responds or timeout elapses.",
+    "description": (
+        "Send a follow-up message to a live agent's opencode session. Text "
+        "is forwarded VERBATIM. Blocks until the agent responds or timeout "
+        "elapses.\n"
+        "\n"
+        "Same authority model as oc_spawn: opencode owns the task. You are "
+        "a dispatcher. Forward the human's words literally. Do NOT plan, "
+        "analyze, paraphrase, add hints, or inject your own framing. If "
+        "the human's follow-up is unclear, ask THEM, not opencode."
+    ),
     "parameters": {
         "type": "object",
         "additionalProperties": False,
         "properties": {
             "agent_id": {"type": "string"},
-            "text": {"type": "string", "description": "Message sent verbatim to the agent."},
+            "text": {
+                "type": "string",
+                "description": (
+                    "The human's follow-up message, forwarded to opencode "
+                    "VERBATIM. No planning, no rewriting, no added context. "
+                    "Opencode has full authority over how to act on it."
+                ),
+            },
             "timeout_sec": {"type": "number", "default": 600},
         },
         "required": ["agent_id", "text"],

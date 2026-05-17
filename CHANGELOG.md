@@ -5,6 +5,63 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.3] - 2026-05-17
+
+### Changed
+
+- **Dispatcher discipline for the hermes chat LLM.** Two coordinated
+  surfaces now tell the hermes chat session that it is a DISPATCHER
+  when calling `oc_spawn` / `oc_send`, not a planner. The opencode agent
+  it spawns has full authority over its own task: planning, scoping,
+  file exploration, design, execution. The hermes chat LLM's job is to
+  forward the human's words verbatim, nothing more.
+
+  1. **Tool-description hardening** (`tools.py`). `oc_spawn` and `oc_send`
+     descriptions explicitly forbid planning, decomposition, analysis,
+     paraphrasing, file hints, prepended background, and "improving" the
+     prompt. Both `prompt` and `text` parameter descriptions repeat the
+     constraint. If the human's request is unclear, the chat LLM must
+     ASK the human for clarification before calling the tool, never fill
+     in gaps on opencode's behalf. The `description` for `oc_spawn` went
+     from 154 chars (one sentence) to ~1180 chars (full authority model
+     + explicit MUST-NOT list + clarification escape hatch).
+
+  2. **`pre_llm_call` hook injects the dispatcher directive** every turn
+     (`__init__.py`). The plugin already used `pre_llm_call` to surface
+     pending opencode questions/permissions to the chat LLM; that path
+     now also carries a short `[hermes-opencode] DISPATCHER MODE` block
+     that restates the authority model. The directive always precedes
+     the pending-items block when both are present, and the hook returns
+     `None` only when the plugin runtime has not yet been initialized
+     (so the directive is otherwise unconditional and stays visible to
+     the chat LLM on every turn). Cost: ~530 chars per LLM call.
+
+  Why both surfaces: tool descriptions are seen at tool-selection time
+  but can be ignored once the LLM commits to a call; the per-turn hook
+  injection keeps the rule top-of-mind across the whole conversation.
+  The two surfaces use distinct wording so the chat LLM doesn't pattern-
+  match-deduplicate them away.
+
+  Non-invasive by design. Both surfaces live entirely inside the
+  hermes-opencode plugin. No edits to `hermes-agent` core, no new plugin
+  hook types, no new skill-auto-load mechanism (none exists in hermes-
+  agent anyway, per the v0.14.3 investigation: skills are explicit-only,
+  system prompts are immutable mid-session, `pre_llm_call` is the only
+  plugin-owned lever that reaches the chat LLM's user-message context).
+
+### Added
+
+- `tests/test_pure_logic.py::TestPreLlmCallHookDispatcherDirective` (4
+  cases) covers: no-runtime returns None; runtime-set-no-pending returns
+  directive only; runtime-set-with-pending puts directive before pending
+  block separated by a blank line; directive contains no em-dash
+  (AGENTS.md anti-pattern).
+- `tests/test_pure_logic.py::TestSpawnSchemaDispatcherWording` (4 cases)
+  asserts `oc_spawn` / `oc_send` schemas and their `prompt` / `text`
+  parameter descriptions all contain the VERBATIM / FULL authority /
+  No planning / ASK the human wording. Catches future regressions if
+  someone shortens the descriptions back.
+
 ## [0.14.2] - 2026-05-17
 
 ### Fixed
