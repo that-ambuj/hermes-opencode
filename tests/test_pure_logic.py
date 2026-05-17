@@ -2924,3 +2924,130 @@ class TestAwaitingContextNotTruncated:
         event_loop_mod._run_awaiting_input_reminders()
         body = next(b for (k, b) in self._notified if k == "awaiting_human")
         assert long_text in body, "reminder loop must include full last_assistant_text"
+
+
+class TestLoadEntryConfigReadsUserYaml:
+    """v0.16.3 regression guard.
+
+    `load_entry_config()` shipped from day-one calling
+    `cfg_get(f"plugins.entries.{PLUGIN_NAME}", {})` which silently
+    returned `{}` because `hermes_cli.config.cfg_get`'s signature is
+    `(cfg_dict, *positional_path_keys, default=...)`, not a
+    dotted-string lookup. The bug caused EVERY user-set value in the
+    plugin's YAML entry (host, review.max_cycles, notify.*,
+    classifier.*, etc.) to be silently masked by the Config dataclass
+    defaults. v0.16.3 walks the path with positional keys via
+    `load_config()` and adds a raw-YAML fallback that bypasses
+    `hermes_cli` entirely.
+
+    These tests pin both code paths so the bug cannot recur.
+    """
+
+    def test_raw_yaml_fallback_walks_positional_path(self, tmp_path, monkeypatch):
+        config_mod_local = sys.modules["_oco_test_pkg.config"]
+        import yaml
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(yaml.safe_dump({
+            "plugins": {
+                "entries": {
+                    "hermes-opencode": {
+                        "opencode_server": {"host": "0.0.0.0", "url": "http://127.0.0.1:9999"},
+                        "review": {"max_cycles": 3},
+                    },
+                    "other-plugin": {"ignored": True},
+                },
+            },
+            "unrelated_top_level": "ignored",
+        }))
+        monkeypatch.setattr(config_mod_local, "_resolve_hermes_home", lambda: tmp_path)
+
+        def _force_raw(*args, **kwargs):
+            raise ImportError("force fallback path")
+        import builtins
+        original_import = builtins.__import__
+        def _gated_import(name, *args, **kwargs):
+            if name == "hermes_cli.config" or name.startswith("hermes_cli."):
+                raise ImportError("simulate no hermes_cli")
+            return original_import(name, *args, **kwargs)
+        monkeypatch.setattr(builtins, "__import__", _gated_import)
+
+        entry = config_mod_local.load_entry_config()
+        assert entry == {
+            "opencode_server": {"host": "0.0.0.0", "url": "http://127.0.0.1:9999"},
+            "review": {"max_cycles": 3},
+        }, entry
+
+    def test_raw_yaml_fallback_missing_plugin_returns_empty(self, tmp_path, monkeypatch):
+        config_mod_local = sys.modules["_oco_test_pkg.config"]
+        import yaml
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(yaml.safe_dump({
+            "plugins": {"entries": {"other-plugin": {"ignored": True}}},
+        }))
+        monkeypatch.setattr(config_mod_local, "_resolve_hermes_home", lambda: tmp_path)
+        import builtins
+        original_import = builtins.__import__
+        def _gated_import(name, *args, **kwargs):
+            if name == "hermes_cli.config" or name.startswith("hermes_cli."):
+                raise ImportError("simulate no hermes_cli")
+            return original_import(name, *args, **kwargs)
+        monkeypatch.setattr(builtins, "__import__", _gated_import)
+        assert config_mod_local.load_entry_config() == {}
+
+    def test_raw_yaml_fallback_missing_file_returns_empty(self, tmp_path, monkeypatch):
+        config_mod_local = sys.modules["_oco_test_pkg.config"]
+        monkeypatch.setattr(config_mod_local, "_resolve_hermes_home", lambda: tmp_path)
+        import builtins
+        original_import = builtins.__import__
+        def _gated_import(name, *args, **kwargs):
+            if name == "hermes_cli.config" or name.startswith("hermes_cli."):
+                raise ImportError("simulate no hermes_cli")
+            return original_import(name, *args, **kwargs)
+        monkeypatch.setattr(builtins, "__import__", _gated_import)
+        assert config_mod_local.load_entry_config() == {}
+
+    def test_hermes_cli_path_uses_positional_keys_not_dotted_string(self, monkeypatch):
+        """Even when hermes_cli IS importable, the call must walk
+        positional path keys; passing a dotted-string would return
+        the dataclass default (None) and silently mask the user's
+        YAML config.
+        """
+        config_mod_local = sys.modules["_oco_test_pkg.config"]
+        fake_user_cfg = {
+            "plugins": {"entries": {"hermes-opencode": {
+                "opencode_server": {"host": "0.0.0.0"},
+            }}},
+        }
+        cfg_get_calls: list = []
+
+        def _fake_cfg_get(cfg, *keys, default=None):
+            cfg_get_calls.append((cfg, keys, default))
+            node = cfg
+            for key in keys:
+                if not isinstance(node, dict) or key not in node:
+                    return default
+                node = node[key]
+            return node if isinstance(node, dict) else default
+
+        def _fake_load_config():
+            return fake_user_cfg
+
+        fake_module = type(sys)("hermes_cli.config")
+        fake_module.cfg_get = _fake_cfg_get
+        fake_module.load_config = _fake_load_config
+        fake_pkg = type(sys)("hermes_cli")
+        fake_pkg.config = fake_module
+        monkeypatch.setitem(sys.modules, "hermes_cli", fake_pkg)
+        monkeypatch.setitem(sys.modules, "hermes_cli.config", fake_module)
+
+        entry = config_mod_local.load_entry_config()
+        assert entry == {"opencode_server": {"host": "0.0.0.0"}}, entry
+        assert len(cfg_get_calls) == 1
+        cfg_arg, keys_arg, _default = cfg_get_calls[0]
+        assert isinstance(cfg_arg, dict), (
+            "first arg to cfg_get must be the loaded config DICT, "
+            "never a dotted-string path"
+        )
+        assert keys_arg == ("plugins", "entries", "hermes-opencode"), (
+            f"path keys must be POSITIONAL; got: {keys_arg}"
+        )

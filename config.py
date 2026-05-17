@@ -58,19 +58,53 @@ def plugin_state_dir() -> Path:
 
 
 def load_entry_config() -> dict:
-    """Read this plugin's entry from ~/.hermes/config.yaml.
+    """Read this plugin's entry from ``~/.hermes/config.yaml``.
 
-    Importable from both ``__init__.py`` (in-session) and ``cli.py`` (out-of-
-    session CLI subcommands) without a circular import.
+    Returns the dict under ``plugins.entries.hermes-opencode`` or an
+    empty dict on any read/parse failure. Importable from both
+    ``__init__.py`` (in-session) and ``cli.py`` (out-of-session CLI
+    subcommands) without a circular import.
+
+    v0.16.3 bugfix: previous versions called
+    ``cfg_get(f"plugins.entries.{PLUGIN_NAME}", {})`` which silently
+    returned ``{}`` because ``hermes_cli.config.cfg_get`` takes
+    ``(cfg_dict, *positional_path_keys, default=...)`` not a dotted
+    string. The bug masked every user-set value in the plugin's YAML
+    entry (host, review.max_cycles, notify.*, classifier.*, etc.) so
+    only the dataclass defaults ever applied. The fix walks the path
+    with positional keys.
     """
     try:
-        from hermes_cli.config import cfg_get  # type: ignore
+        from hermes_cli.config import cfg_get, load_config  # type: ignore
+    except ImportError:
+        return _load_entry_from_raw_yaml()
+    try:
+        cfg = load_config()
+    except Exception:
+        return _load_entry_from_raw_yaml()
+    entry = cfg_get(cfg, "plugins", "entries", PLUGIN_NAME, default={})
+    return entry if isinstance(entry, dict) else {}
+
+
+def _load_entry_from_raw_yaml() -> dict:
+    try:
+        import yaml  # type: ignore
     except ImportError:
         return {}
+    config_path = _resolve_hermes_home() / "config.yaml"
+    if not config_path.exists():
+        return {}
     try:
-        return cfg_get(f"plugins.entries.{PLUGIN_NAME}", {}) or {}
+        with open(config_path, encoding="utf-8-sig") as f:
+            data = yaml.safe_load(f) or {}
     except Exception:
         return {}
+    node: object = data
+    for key in ("plugins", "entries", PLUGIN_NAME):
+        if not isinstance(node, dict) or key not in node:
+            return {}
+        node = node[key]
+    return node if isinstance(node, dict) else {}
 
 
 @dataclass

@@ -5,6 +5,75 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.3] - 2026-05-18
+
+Day-one bugfix surfaced by v0.16.2: `load_entry_config()` has been
+silently returning `{}` since the plugin was first written, so every
+user-set value in `plugins.entries.hermes-opencode.*` was ignored
+and only the `Config` dataclass defaults ever applied. The user's
+`opencode_server.host: 0.0.0.0` setting from the v0.16.2 host-rename
+work would have had no effect on the actual spawn flag even after
+the CLI flag was correct, because `host` was never read.
+
+### Fixed
+
+- **`load_entry_config()` now correctly reads the plugin's YAML
+  entry.** The original implementation called
+  `cfg_get(f"plugins.entries.{PLUGIN_NAME}", {})` against
+  `hermes_cli.config.cfg_get`, whose signature is
+  `(cfg_dict, *positional_path_keys, default=...)`. Passing a
+  dotted-string path made `cfg_get` see a non-dict first arg and
+  return the default (`None`); the `or {}` then converted that to
+  `{}`, so `Config.from_plugin_entry({})` ran with no user input and
+  returned an all-defaults Config object.
+
+  v0.16.3 walks the path correctly:
+
+  ```python
+  cfg = load_config()
+  entry = cfg_get(cfg, "plugins", "entries", PLUGIN_NAME, default={})
+  ```
+
+  Plus a raw `yaml.safe_load` fallback for environments where
+  `hermes_cli.config` is not importable. Both paths are pinned by
+  `TestLoadEntryConfigReadsUserYaml` (4 tests).
+
+  Settings that have ALWAYS been silently ignored and now finally
+  take effect:
+
+  - `opencode_server.url` / `opencode_server.host` /
+    `opencode_server.password` / `opencode_server.pr_fallback_models`
+  - `pr.base_branch`
+  - `auto_spawn_server`
+  - `review.max_cycles` (and every other review.* knob)
+  - `notify.sinks` / `notify.gateway.platform` / `notify.gateway.chat_id`
+    / `notify.events.enabled`
+  - `heartbeat.enabled` / `heartbeat.timezone` /
+    `heartbeat.unconditional_hours`
+  - `classifier.enabled` / `classifier.task` /
+    `classifier.max_input_chars` / `classifier.max_output_tokens` /
+    `classifier.timeout_sec`
+  - `awaiting_input.stall_timeout_sec` /
+    `awaiting_input.reminder_interval_sec`
+
+  Users who had any of these set in their YAML have been running on
+  the dataclass defaults since v0.3.0. After v0.16.3 the user's
+  config takes effect for the first time. Behaviour may change for
+  users who set any of these values; the change is correctness, not
+  regression. Review your `~/.hermes/config.yaml` plugin entry
+  before upgrading if you've relied on the previous (broken)
+  silent-default behaviour.
+
+### Added
+
+- 4 new tests in `TestLoadEntryConfigReadsUserYaml`:
+  - hermes_cli path passes positional keys (not dotted string).
+  - raw-YAML fallback walks the path correctly.
+  - raw-YAML fallback returns `{}` when the plugin entry is absent.
+  - raw-YAML fallback returns `{}` when the config file is absent.
+
+  Full suite: 358 passed (was 354 at v0.16.2).
+
 ## [0.16.2] - 2026-05-18
 
 Two bugfixes shipped together: (1) opencode CLI spawn flag regression
