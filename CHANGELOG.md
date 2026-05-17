@@ -5,6 +5,156 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.0] - 2026-05-17
+
+Minor bump: introduces two new phases (`QUEUED`, `RATE_LIMITED`),
+spawn-time gating semantics, and a configurable non-Anthropic model
+fallback list for PR creation. Replaces the v0.14.6 slug+initial_prompt
+PR-fallback with iterative model-fallback `oneshot_open_pr`.
+
+### Added
+
+- **Provider rate-limit detection + wait-and-resume.** When the
+  executor's upstream provider rate-limits (most often Anthropic Claude
+  HTTP 429), opencode marks the assistant turn with
+  `message.error = { name: "APIError", statusCode: 429, ... }` (per
+  opencode/packages/opencode/src/session/message-v2.ts).
+
+  New `_message_is_rate_limited(item)` extracts the retry-after window
+  from `responseHeaders.retry-after`, `responseHeaders.x-ratelimit-reset-after`,
+  or `metadata.retryAfterMs` — falling back to a `RATE_LIMIT_MIN_WAIT_SEC =
+  30s` floor when none are present. Also accepts textual markers
+  ("rate limit", "quota exceeded", "too many requests", "429") on the
+  error message body as a defensive fallback.
+
+  New `_check_executor_rate_limited(agent)` runs at the top of
+  `_phase_executing`, `_phase_executor_addressing`, and twice in
+  `_phase_committing` (before and after `executor_open_pr`). On a hit,
+  it transitions the agent to `phase=RATE_LIMITED`, saves the prior
+  phase to `phase_before_rate_limit`, records the retry-at timestamp,
+  and fires the new `rate_limited` notification.
+
+  New `_phase_rate_limited(agent)` handler polls until
+  `rate_limit_retry_after_at` elapses, then restores the saved phase,
+  clears the rate-limit fields, fires `rate_limit_cleared`. The agent
+  continues through its own normal flow (review, executor-addressing,
+  committing) — review is NOT bypassed. This matches the v0.15.0 design
+  choice: wait for the limit to reset and let the task go through its
+  own flow.
+
+- **Concurrent spawn gating via `QUEUED` phase.** While any non-terminal
+  agent is in `RATE_LIMITED`, `oc_spawn` parks new agents at
+  `phase=QUEUED` with `queued_blocked_by=[<ids>]`. The worktree, session,
+  and bootstrap run normally — only the initial prompt is deferred. New
+  `_phase_queued(agent)` handler polls (every `QUEUE_POLL_SEC = 5s`)
+  until no `RATE_LIMITED` agents remain, then sends the wrapped initial
+  prompt and transitions to `EXECUTING`, firing `queue_drained`. The
+  blocked_by list self-heals across ticks when a different agent
+  rate-limits.
+
+  `oc_spawn` result shape gains `blocked_by: list[str]` when queued.
+  Existing `queued: true` return field is retained (it was already used
+  for "first turn queued asynchronously").
+
+- **Configurable non-Anthropic PR-fallback model list.** New
+  `Config.pr_fallback_models: list[str]` (default
+  `["openai/gpt-5.5", "opencode/deepseek-v4-flash-free"]`). Read from
+  YAML `plugins.entries.hermes-opencode.opencode_server.pr_fallback_models`
+  (preferred) or env `OPENCODE_PR_FALLBACK_MODELS` (comma-separated
+  fallback). YAML list wins; empty/missing falls through to env then
+  to the default.
+
+  New `reviewer.parse_model_id(spec)` converts the `provider/model[/variant]`
+  spec into opencode's POST `/session` model struct
+  `{ "id": ..., "providerID": ..., "variant"?: ... }`. Returns `None`
+  for malformed input (no slash, only one segment, etc).
+
+  `OpencodeClient.create_session(directory, agent, model=None)` extended
+  to accept the model struct as an optional third arg and pass it
+  through in the POST body.
+
+- **`reviewer.oneshot_open_pr(client, agent, base_branch, model_specs)`**
+  replaces v0.14.6's `finalize_and_open_pr` slug+initial_prompt fallback
+  in `_phase_committing`. Iterates `pr_fallback_models` and for each:
+
+  1. `parse_model_id(spec)` (skipped with attempt-log entry if invalid)
+  2. `client.create_session(worktree, agent="build", model=model)`
+  3. Sends the new `oneshot_open_pr_prompt(branch, base_branch, initial_prompt)`
+     to the fresh session (a focused PR-authoring prompt that mentions
+     the staging-commit amend option and forbids `--fill`).
+  4. Parses the response for the `PR_OPENED:` sentinel using
+     `parse_pr_opened` (existing widened parser from v0.14.6).
+
+  First successful sentinel wins. All models exhausted → agent
+  transitions to `FAILED` with
+  `last_error="all PR-fallback models exhausted: <attempts>"`.
+  Returns `(PrInfo | None, attempts: list[str])` so the caller can
+  produce the audit-log line.
+
+- **31 new regression tests:**
+  - `TestParseModelId` (7): two-part, three-part with variant, opencode
+    provider, missing slash, empty, only-provider edge cases, whitespace
+    stripping.
+  - `TestPrFallbackModelsConfig` (4): defaults; YAML beats env; env-only
+    comma-separated; empty YAML falls through to env to default.
+  - `TestMessageIsRateLimited` (7): no-error returns None; non-APIError
+    returns None; statusCode==429 matches; textual fallback when
+    statusCode != 429; retry-after header parsed; retryAfterMs metadata
+    parsed; non-rate-limit APIError (e.g. 401) returns None.
+  - `TestCheckExecutorRateLimited` (4): no-error returns False;
+    rate-limit transitions to RATE_LIMITED with phase_before saved;
+    already-RATE_LIMITED is noop; min-wait floor applied when retry-after
+    missing.
+  - `TestPhaseRateLimited` (2): restores prior phase when retry-at
+    elapsed; defaults to EXECUTING when no prior_phase saved.
+  - `TestPhaseQueued` (3): drains when no blockers; remains QUEUED with
+    blocked_by populated when RATE_LIMITED exists; blocked_by list
+    self-heals across drift.
+  - `TestOneshotOpenPr` (4): first model succeeds; first-fails-second-wins;
+    all exhausted returns None with full attempt log; invalid model spec
+    skipped without consuming a session create.
+
+  Full suite: 314 passed (was 283 at v0.14.6).
+
+### Changed
+
+- **`_phase_committing`** no longer calls
+  `reviewer.finalize_and_open_pr` as the fallback. New flow:
+  `executor_open_pr` → if returns None and not rate-limited →
+  `oneshot_open_pr(pr_fallback_models)` → if all exhausted → FAILED.
+  The slug+initial_prompt fallback path is fully removed from the
+  state-machine. `finalize_and_open_pr` survives as an importable
+  module-level function for CLI / manual recovery use.
+
+- **`PHASES` set** gained `QUEUED` and `RATE_LIMITED` (state.py).
+- **`_PHASE_HANDLERS` dispatch table** gained `QUEUED → _phase_queued`
+  and `RATE_LIMITED → _phase_rate_limited`.
+- **`Agent` dataclass** gained 4 new fields: `rate_limited_at`,
+  `rate_limit_retry_after_at`, `phase_before_rate_limit`,
+  `queued_blocked_by`.
+- **`Config.notify_events`** default set gained 4 new kinds:
+  `rate_limited`, `rate_limit_cleared`, `queued`, `queue_drained`.
+- **`_EVENT_GLYPH`** gained glyphs for the 4 new kinds (`⏳` for
+  rate_limited/queued; `▶` for rate_limit_cleared/queue_drained).
+- **`_default_event_body`** gained body templates for the 4 new kinds.
+
+### AGENTS.md
+
+- New `Rate limits and queue (LOAD-BEARING)` section documenting the
+  detection signal, retry-after parsing, two-phase additions, queue
+  gating, and the precedence rule (call
+  `_check_executor_rate_limited` BEFORE `_check_executor_abort` in any
+  new handler that touches the executor session).
+- State-machine diagram updated to show the new phases.
+
+### Known gaps (deferred to v0.15.x)
+
+- Reviewer session rate-limit detection: if the reviewer hits a 429,
+  `_phase_reviewing` does not yet route through the same RATE_LIMITED
+  path. The fix is to factor `_check_executor_rate_limited` into a
+  generic `_check_session_rate_limited(agent, session_id, worktree)`
+  and call it from `_phase_reviewing` as well. Tracked for v0.15.1.
+
 ## [0.14.6] - 2026-05-17
 
 ### Fixed

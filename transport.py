@@ -190,9 +190,17 @@ class OpencodeClient:
             self._spawned = None
 
     @_wrap_transport_errors
-    async def create_session(self, directory: Path, agent: str = "build") -> dict[str, Any]:
+    async def create_session(
+        self,
+        directory: Path,
+        agent: str = "build",
+        model: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"agent": agent}
+        if model:
+            body["model"] = model
         async with self._client(directory) as c:
-            r = await c.post("/session", json={"agent": agent})
+            r = await c.post("/session", json=body)
             if r.status_code >= 400:
                 raise OpencodeError(f"POST /session failed: {r.status_code} {r.text[:200]}")
             return r.json()

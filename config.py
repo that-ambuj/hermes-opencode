@@ -3,9 +3,14 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 PLUGIN_NAME = "hermes-opencode"
 DEFAULT_SERVER_URL = "http://127.0.0.1:4096"
+DEFAULT_PR_FALLBACK_MODELS: tuple[str, ...] = (
+    "openai/gpt-5.5",
+    "opencode/deepseek-v4-flash-free",
+)
 
 HOME_CHANNEL_PLATFORMS = (
     "bluebubbles",
@@ -73,6 +78,7 @@ class Config:
     server_url: str = DEFAULT_SERVER_URL
     server_password: str | None = None
     serve_hostname: str | None = None
+    pr_fallback_models: list[str] = field(default_factory=lambda: list(DEFAULT_PR_FALLBACK_MODELS))
     default_base_branch: str = "main"
     worktrees_root: Path = field(default_factory=lambda: plugin_state_dir() / "wt")
     projects_file: Path = field(default_factory=lambda: plugin_state_dir() / "projects.json")
@@ -84,7 +90,7 @@ class Config:
     notify_gateway_platform: str | None = None
     notify_gateway_chat_id: str | None = None
     notify_discovery_source: str | None = None
-    notify_events: set[str] = field(default_factory=lambda: {"pr_opened", "done", "failed", "awaiting_human", "review_started", "cancelled", "tick_error", "aborted"})
+    notify_events: set[str] = field(default_factory=lambda: {"pr_opened", "done", "failed", "awaiting_human", "review_started", "cancelled", "tick_error", "aborted", "rate_limited", "rate_limit_cleared", "queued", "queue_drained"})
     events_log: Path = field(default_factory=lambda: plugin_state_dir() / "events.log")
     heartbeat_enabled: bool = True
     heartbeat_timezone: str | None = None
@@ -112,7 +118,7 @@ class Config:
         classifier = entry.get("classifier") or {}
         awaiting = entry.get("awaiting_input") or {}
         day_window = heartbeat.get("unconditional_hours", [9, 23])
-        default_events = {"pr_opened", "done", "failed", "awaiting_human", "review_started", "cancelled", "tick_error", "aborted"}
+        default_events = {"pr_opened", "done", "failed", "awaiting_human", "review_started", "cancelled", "tick_error", "aborted", "rate_limited", "rate_limit_cleared", "queued", "queue_drained"}
 
         platform = gateway.get("platform")
         explicit_chat_id = gateway.get("chat_id")
@@ -139,6 +145,7 @@ class Config:
             server_url=server.get("url", DEFAULT_SERVER_URL),
             server_password=server.get("password") or os.environ.get("OPENCODE_SERVER_PASSWORD") or None,
             serve_hostname=server.get("serve_hostname") or os.environ.get("OPENCODE_SERVE_HOSTNAME") or None,
+            pr_fallback_models=cls._resolve_pr_fallback_models(server.get("pr_fallback_models")),
             default_base_branch=pr.get("base_branch", "main"),
             auto_spawn_server=bool(entry.get("auto_spawn_server", True)),
             notify_sinks=sinks,
@@ -162,3 +169,14 @@ class Config:
     def ensure_dirs(self) -> None:
         for p in (self.worktrees_root, self.logs_dir, self.projects_file.parent):
             p.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _resolve_pr_fallback_models(yaml_value: Any) -> list[str]:
+        if isinstance(yaml_value, list) and yaml_value:
+            return [str(x).strip() for x in yaml_value if str(x).strip()]
+        env_value = os.environ.get("OPENCODE_PR_FALLBACK_MODELS")
+        if env_value:
+            parsed = [x.strip() for x in env_value.split(",") if x.strip()]
+            if parsed:
+                return parsed
+        return list(DEFAULT_PR_FALLBACK_MODELS)

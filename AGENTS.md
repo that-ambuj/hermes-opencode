@@ -101,13 +101,32 @@ Each agent transitions through phases driven by `event_loop._phase_*`
 handlers. Phases (see `state.py::PHASES`):
 
 ```
-CREATED → BOOTSTRAPPING → EXECUTING → IDLE_TASK_COMPLETE →
-REVIEW_SPAWNING → REVIEWING → REVIEW_DELIVERED → EXECUTOR_ADDRESSING →
-IDLE_REVIEW_ADDRESSED → COMMITTING → PR_OPEN → DONE
+CREATED → QUEUED?→ BOOTSTRAPPING → EXECUTING ⇄ RATE_LIMITED →
+IDLE_TASK_COMPLETE → REVIEW_SPAWNING → REVIEWING → REVIEW_DELIVERED →
+EXECUTOR_ADDRESSING → IDLE_REVIEW_ADDRESSED → COMMITTING ⇄ RATE_LIMITED →
+PR_OPEN → DONE
 ```
 
-Terminal phases: `DONE`, `FAILED`, `KILLED`. The pruner removes `DONE`
-agents 4 h after merge.
+Terminal phases: `DONE`, `FAILED`, `KILLED`, `CANCELLED`. The pruner
+archives terminal agents after `ARCHIVE_AFTER_SEC = 12h`.
+
+`QUEUED` (v0.15.0) is the soft-queue phase entered at `oc_spawn` time
+when at least one non-terminal agent is in `RATE_LIMITED`. The new
+agent's worktree, session, and bootstrap are created normally but the
+first turn is NOT sent. `_phase_queued` polls (every `QUEUE_POLL_SEC`)
+until no `RATE_LIMITED` agents remain, then sends the wrapped initial
+prompt and transitions to `EXECUTING`.
+
+`RATE_LIMITED` (v0.15.0) is entered from `_phase_executing`,
+`_phase_executor_addressing`, and `_phase_committing` whenever
+`_check_executor_rate_limited(agent)` detects opencode's structured
+`APIError statusCode=429` (or fallback textual marker) on the
+executor's latest assistant turn. The agent saves
+`phase_before_rate_limit`, records `rate_limit_retry_after_at` from
+the response headers / metadata (or `RATE_LIMIT_MIN_WAIT_SEC` floor),
+and `_phase_rate_limited` polls until the retry-after elapses, then
+restores the saved phase. Review is NOT bypassed; the agent continues
+through its own normal flow when the limit clears.
 
 Critical idle-detection rule in `_phase_executing`:
 - `session.status.type == "idle"`
@@ -210,6 +229,69 @@ When extending the state machine: any phase that wants to gate review
 or commit on "executor is plausibly done" must call
 `_awaiting_input_blocks_review(agent)` before transitioning. Do NOT
 re-implement the cascade inline.
+
+## Rate limits and queue (LOAD-BEARING)
+
+When opencode's upstream provider rate-limits the executor (most common
+on Anthropic Claude), opencode emits the error as a structured field on
+the assistant message:
+
+```json
+{
+  "name": "APIError",
+  "statusCode": 429,
+  "message": "...",
+  "isRetryable": true,
+  "responseHeaders": { "retry-after": "60", ... },
+  "metadata": { "retryAfterMs": 60000, ... }
+}
+```
+
+`_message_is_rate_limited(item)` (event_loop.py) extracts the
+retry-after window. `_check_executor_rate_limited(agent)` calls it
+against the latest assistant message and, on a hit, transitions the
+agent to `phase=RATE_LIMITED` with `phase_before_rate_limit` saved.
+
+`_phase_rate_limited` (the wait-and-resume handler) polls until
+`rate_limit_retry_after_at` elapses, then restores the saved phase and
+fires `rate_limit_cleared`. The agent continues through its own normal
+flow — review, executor-addressing, committing, all preserved. This
+choice is intentional: review is NOT bypassed.
+
+Concurrent spawn gating: while any agent is in `RATE_LIMITED`,
+`oc_spawn` parks new agents at `phase=QUEUED` with
+`queued_blocked_by=[<rate-limited agent_ids>]`. The new agent's
+worktree, session, and bootstrap run normally — only the initial
+prompt is deferred. `_phase_queued` polls until the registry has zero
+`RATE_LIMITED` agents, then sends the wrapped initial prompt and
+transitions to `EXECUTING`, firing `queue_drained`.
+
+Notification events added in v0.15.0 (all default-on):
+- `rate_limited` — agent entered RATE_LIMITED with retry-after window.
+- `rate_limit_cleared` — agent restored to its prior phase.
+- `queued` — new spawn parked (default body via _default_event_body).
+- `queue_drained` — queued agent promoted to EXECUTING.
+
+PR fallback when executor doesn't emit `PR_OPENED:` (separate from
+rate-limit, but using the same configurable model list):
+`reviewer.oneshot_open_pr(client, agent, base_branch, model_specs)`
+iterates `Config.pr_fallback_models` (configurable; default
+`["openai/gpt-5.5", "opencode/deepseek-v4-flash-free"]`). Each iteration
+creates a FRESH opencode session in the executor's worktree with an
+explicit model struct `{id, providerID, variant?}` (parsed by
+`reviewer.parse_model_id` from the `provider/model[/variant]` spec
+string and passed to `OpencodeClient.create_session(..., model=...)`).
+First successful `PR_OPENED:` sentinel wins. All models exhausted →
+agent escalates to `FAILED`. The old slug+initial_prompt fallback
+(`reviewer.finalize_and_open_pr`) is no longer called from
+`_phase_committing`; it survives only as a CLI-callable helper for
+manual recovery.
+
+When adding new phases: if they touch the executor session, call
+`_check_executor_rate_limited` BEFORE `_check_executor_abort` at the
+top of the handler. Rate-limit takes precedence over abort because
+the abort detector would also fire on 429s but with less useful
+context (no retry-after).
 
 ## Error surfacing (LOAD-BEARING)
 

@@ -197,6 +197,128 @@ def parse_pr_opened(text: str) -> tuple[str, int] | None:
     return None
 
 
+def parse_model_id(spec: str) -> dict[str, str] | None:
+    """Parse a `provider/model[/variant]` string into the opencode create_session model struct.
+
+    Returns None for empty / malformed input. The provider segment is the
+    first path component, the model id is the second, and an optional third
+    segment is treated as a variant.
+    """
+    if not spec or "/" not in spec:
+        return None
+    parts = [p.strip() for p in spec.split("/", 2) if p.strip()]
+    if len(parts) < 2:
+        return None
+    provider_id, model_id = parts[0], parts[1]
+    out: dict[str, str] = {"id": model_id, "providerID": provider_id}
+    if len(parts) == 3:
+        out["variant"] = parts[2]
+    return out
+
+
+def oneshot_open_pr_prompt(branch: str, base_branch: str, initial_prompt: str) -> str:
+    return (
+        "You are a one-shot PR-summary author. A peer agent did some work on this "
+        f"branch `{branch}` but failed to author its own PR. Your job is to inspect "
+        "the diff, author a concise title and a markdown body, then open the PR.\n\n"
+        "Steps (run them in your shell tool, in order):\n"
+        f"  1. Run `git diff origin/{base_branch}..HEAD --stat` and "
+        f"`git diff origin/{base_branch}..HEAD` to see what changed.\n"
+        "  2. Author a concise PR title (<= 72 chars) describing the change.\n"
+        "  3. Author a short markdown body summarizing what changed and why; "
+        "reference notable files if helpful. Do NOT paste the original task prompt "
+        "verbatim into the body.\n"
+        "  4. If `git status --porcelain` shows uncommitted changes (e.g. the "
+        "pre-review `chore: <slug>` staging commit needs an amend), commit them "
+        "under the user's git identity. You MAY use `git commit --amend -m "
+        "\"<your real message>\"` to replace the slug placeholder.\n"
+        f"  5. Push the branch: `git push -u origin {branch}` (use `--force-with-lease` "
+        "if you amended).\n"
+        f"  6. Open the PR: `gh pr create --base {base_branch} --title \"<your title>\" "
+        "--body \"<your body>\"`. Do NOT use `--fill`.\n"
+        f"  7. If the PR already exists for `{branch}`, fetch it with "
+        "`gh pr view --json url,number` instead of failing.\n\n"
+        "After the PR exists, you MUST emit ONE line in this EXACT format on its "
+        "own line:\n\n"
+        "  PR_OPENED: https://github.com/<owner>/<repo>/pull/<number>\n\n"
+        "Concrete example: PR_OPENED: https://github.com/octocat/hello-world/pull/42\n\n"
+        "The literal `PR_OPENED:` prefix is REQUIRED. Then stop.\n\n"
+        "For context only (do NOT paste this into the PR body), the original task "
+        "was:\n\n<<<TASK\n"
+        f"{initial_prompt}\n"
+        "TASK>>>"
+    )
+
+
+async def oneshot_open_pr(
+    client: OpencodeClient,
+    agent: Agent,
+    base_branch: str,
+    model_specs: list[str],
+    *,
+    timeout_sec: float = 600.0,
+) -> tuple[pr.PrInfo | None, list[str]]:
+    """Spawn a fresh opencode session in the executor's worktree, iterating
+    through `model_specs` until one successfully emits `PR_OPENED:`.
+
+    Returns `(info, attempts)`. `info` is the opened-PR info or None if all
+    models exhausted. `attempts` lists every model spec tried + outcome (used
+    for the FAILED last_error message and the audit log).
+    """
+    worktree = Path(agent.worktree_path)
+    attempts: list[str] = []
+    for spec in model_specs:
+        model = parse_model_id(spec)
+        if model is None:
+            attempts.append(f"{spec}: invalid spec, skipped")
+            logger.warning("oneshot_open_pr: skipping invalid model spec %r", spec)
+            continue
+        logger.info(
+            "oneshot_open_pr: %s trying model %s (provider=%s id=%s variant=%s)",
+            agent.agent_id, spec, model["providerID"], model["id"], model.get("variant", ""),
+        )
+        try:
+            session = await client.create_session(worktree, agent="build", model=model)
+        except OpencodeError as e:
+            attempts.append(f"{spec}: create_session failed: {e}")
+            logger.warning("oneshot_open_pr: %s create_session(%s) failed: %s", agent.agent_id, spec, e)
+            continue
+        session_id = session.get("id") or session.get("sessionID") or ""
+        if not session_id:
+            attempts.append(f"{spec}: create_session returned no id")
+            continue
+        prompt = oneshot_open_pr_prompt(agent.branch, base_branch, agent.initial_prompt)
+        try:
+            resp = await client.send_message(session_id, worktree, prompt, timeout=timeout_sec)
+        except OpencodeError as e:
+            attempts.append(f"{spec}: send_message failed: {e}")
+            logger.warning("oneshot_open_pr: %s send_message(%s) failed: %s", agent.agent_id, spec, e)
+            continue
+        final_text = OpencodeClient.extract_assistant_text(resp) or ""
+        logger.info(
+            "oneshot_open_pr: %s model=%s response (%d chars, first 800: %s)",
+            agent.agent_id, spec, len(final_text), final_text[:800],
+        )
+        parsed = parse_pr_opened(final_text)
+        if not parsed:
+            attempts.append(f"{spec}: no PR_OPENED sentinel in response")
+            logger.warning(
+                "oneshot_open_pr: %s model=%s emitted no PR_OPENED sentinel. Response (4KB):\n%s",
+                agent.agent_id, spec, final_text[:4000],
+            )
+            continue
+        url, number = parsed
+        attempts.append(f"{spec}: ok PR #{number}")
+        try:
+            info = pr.pr_state(worktree, number)
+            if info.url:
+                return info, attempts
+            return pr.PrInfo(number=number, url=url, state="OPEN", merged_at=None), attempts
+        except pr.PrError:
+            return pr.PrInfo(number=number, url=url, state="OPEN", merged_at=None), attempts
+    return None, attempts
+
+
 async def executor_open_pr(
     client: OpencodeClient, agent: Agent, base_branch: str, *, timeout_sec: float = 900.0,
 ) -> pr.PrInfo | None:

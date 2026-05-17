@@ -42,6 +42,9 @@ SERVE_DOWN_NOTIFY_SINKS = ("cli", "dashboard", "gateway")
 TICK_FAILURE_ESCALATION_THRESHOLD = 3
 ABORT_ESCALATION_THRESHOLD = 3
 ABORT_AUTO_CONTINUE_MESSAGE = "continue"
+RATE_LIMIT_MIN_WAIT_SEC = 30.0
+RATE_LIMIT_MAX_TICK_WAIT_SEC = 15.0
+QUEUE_POLL_SEC = 5.0
 
 _state_lock = threading.Lock()
 _thread: threading.Thread | None = None
@@ -73,6 +76,10 @@ _EVENT_GLYPH = {
     "cancelled": "🚫",
     "tick_error": "⚠",
     "aborted": "⏹",
+    "rate_limited": "⏳",
+    "rate_limit_cleared": "▶",
+    "queued": "⏳",
+    "queue_drained": "▶",
 }
 
 
@@ -135,6 +142,14 @@ def _default_event_body(agent: "Agent", kind: str) -> str:
         return f"Tick failed: {agent.last_tick_error or '(no detail)'}"
     if kind == "aborted":
         return f"Executor turn aborted. Last error: {agent.last_error or '(no detail)'}"
+    if kind == "rate_limited":
+        return f"Agent rate-limited by provider. New tasks queued until clear."
+    if kind == "rate_limit_cleared":
+        return f"Rate limit cleared; agent resumed."
+    if kind == "queued":
+        return f"Task queued; waiting for rate-limited agents to clear."
+    if kind == "queue_drained":
+        return f"Queue drained: agent started."
     return f"{kind} for {agent.agent_id}"
 
 
@@ -949,6 +964,102 @@ def _message_error(item: dict) -> tuple[str, str] | None:
     return name, err.get("message") or ""
 
 
+def _message_is_rate_limited(item: dict) -> float | None:
+    """Return retry-after seconds when opencode's structured error on this
+    message indicates a provider rate-limit (HTTP 429 or textual marker).
+    Returns None when not rate-limited.
+
+    Opencode wraps provider 429s as `message.error = { name: "APIError",
+    statusCode: 429, isRetryable, responseHeaders, metadata, ... }` per
+    opencode/packages/opencode/src/session/message-v2.ts. We also accept
+    textual patterns as a defensive fallback when statusCode is absent.
+    """
+    message = item.get("message") or {}
+    err = message.get("error") or item.get("error")
+    if not isinstance(err, dict):
+        return None
+    if err.get("name") != "APIError":
+        return None
+    matched = err.get("statusCode") == 429
+    if not matched:
+        text = (err.get("message") or "").lower()
+        for pat in (
+            "rate limit", "rate_limit", "too many requests",
+            "quota exceeded", "quota_exceeded",
+            "insufficient quota", "insufficient_quota", "429",
+        ):
+            if pat in text:
+                matched = True
+                break
+    if not matched:
+        return None
+    retry_after_sec = 0.0
+    headers = err.get("responseHeaders") or {}
+    if isinstance(headers, dict):
+        for header_name in ("retry-after", "Retry-After", "x-ratelimit-reset-after"):
+            raw = headers.get(header_name)
+            if raw:
+                try:
+                    retry_after_sec = max(retry_after_sec, float(raw))
+                except (TypeError, ValueError):
+                    pass
+    metadata = err.get("metadata") or {}
+    if isinstance(metadata, dict):
+        for k in ("retryAfterMs", "retry_after_ms"):
+            raw = metadata.get(k)
+            if raw:
+                try:
+                    retry_after_sec = max(retry_after_sec, float(raw) / 1000.0)
+                except (TypeError, ValueError):
+                    pass
+    return retry_after_sec
+
+
+async def _check_executor_rate_limited(agent: Agent) -> bool:
+    """If opencode's latest assistant turn on the executor session is a
+    provider rate-limit error, transition the agent to RATE_LIMITED,
+    record the retry-after window, and notify. Returns True when the
+    agent was transitioned (caller MUST NOT continue this tick's normal
+    flow).
+
+    The wait-and-resume path is intentional per v0.15.0 design: review
+    is NOT bypassed; the original task continues through its own flow
+    once the limit clears, including any pending review cycle.
+    """
+    if _runtime is None or agent.phase == "RATE_LIMITED":
+        return False
+    worktree = Path(agent.worktree_path)
+    try:
+        body = await _runtime.client.get_messages(agent.session_id, worktree)
+    except OpencodeError:
+        return False
+    items = body.get("items") or []
+    for item in reversed(items):
+        message = item.get("message") or {}
+        if message.get("role") != "assistant" and message.get("type") != "assistant":
+            continue
+        retry_after = _message_is_rate_limited(item)
+        if retry_after is None:
+            return False
+        wait_for = max(retry_after, RATE_LIMIT_MIN_WAIT_SEC)
+        retry_at = time.time() + wait_for
+        updated = _runtime.agents.update(
+            agent.agent_id,
+            phase="RATE_LIMITED",
+            phase_before_rate_limit=agent.phase,
+            rate_limited_at=time.time(),
+            rate_limit_retry_after_at=retry_at,
+            last_error=f"rate-limited; retry after ~{int(wait_for)}s",
+        )
+        body_text = (
+            f"Agent rate-limited by provider. Will retry in ~{int(wait_for)}s. "
+            f"New tasks queued until clear."
+        )
+        _notify_event(updated, "rate_limited", body_text)
+        return True
+    return False
+
+
 async def _check_executor_abort(agent: Agent) -> bool:
     """Detect a structured error on the executor's latest assistant turn.
 
@@ -1024,6 +1135,58 @@ async def _check_executor_abort(agent: Agent) -> bool:
     return True
 
 
+async def _phase_rate_limited(agent: Agent) -> None:
+    assert _runtime is not None
+    now = time.time()
+    if agent.rate_limit_retry_after_at and now < agent.rate_limit_retry_after_at:
+        wait_remaining = agent.rate_limit_retry_after_at - now
+        await asyncio.sleep(min(RATE_LIMIT_MAX_TICK_WAIT_SEC, max(1.0, wait_remaining)))
+        return
+    restored = agent.phase_before_rate_limit or "EXECUTING"
+    duration = now - (agent.rate_limited_at or now)
+    refreshed = _runtime.agents.update(
+        agent.agent_id, phase=restored,
+        rate_limited_at=None,
+        rate_limit_retry_after_at=None,
+        phase_before_rate_limit=None,
+        last_error=None,
+    )
+    _notify_event(
+        refreshed, "rate_limit_cleared",
+        f"Rate limit cleared after {int(duration)}s; agent resumed at phase={restored}.",
+    )
+
+
+async def _phase_queued(agent: Agent) -> None:
+    assert _runtime is not None
+    rate_limited = [
+        a for a in _runtime.agents.list()
+        if a.phase == "RATE_LIMITED" and a.agent_id != agent.agent_id
+    ]
+    if rate_limited:
+        new_blocked = [a.agent_id for a in rate_limited]
+        if new_blocked != (agent.queued_blocked_by or []):
+            _runtime.agents.update(agent.agent_id, queued_blocked_by=new_blocked)
+        await asyncio.sleep(QUEUE_POLL_SEC)
+        return
+    worktree = Path(agent.worktree_path)
+    from .tools import wrap_initial_prompt
+    prompt = wrap_initial_prompt(agent.initial_prompt)
+    try:
+        await _runtime.client.send_message_async(agent.session_id, worktree, prompt)
+    except OpencodeError as e:
+        _maybe_notify_phase(
+            _runtime.agents.update(agent.agent_id, phase="FAILED", last_error=f"queued send: {e}"),
+            "failed",
+        )
+        return
+    refreshed = _runtime.agents.update(agent.agent_id, phase="EXECUTING", queued_blocked_by=[])
+    _notify_event(
+        refreshed, "queue_drained",
+        f"Queue drained: {agent.agent_id} resumed.",
+    )
+
+
 async def _phase_executing(agent: Agent) -> None:
     assert _runtime is not None
     worktree = Path(agent.worktree_path)
@@ -1034,6 +1197,8 @@ async def _phase_executing(agent: Agent) -> None:
         await asyncio.sleep(5.0)
         return
     if not became_idle:
+        return
+    if await _check_executor_rate_limited(agent):
         return
     if await _check_executor_abort(agent):
         return
@@ -1152,6 +1317,8 @@ async def _phase_executor_addressing(agent: Agent) -> None:
     became_idle = await _runtime.client.wait_idle(agent.session_id, worktree, timeout=60.0)
     if not became_idle:
         return
+    if await _check_executor_rate_limited(agent):
+        return
     if await _check_executor_abort(agent):
         return
     questions = await _runtime.client.list_questions(worktree)
@@ -1179,14 +1346,25 @@ async def _phase_committing(agent: Agent) -> None:
     if agent.reviewer_worktree_path:
         reviewer_mod.teardown_reviewer_worktree(project, Path(agent.worktree_path))
 
+    if await _check_executor_rate_limited(agent):
+        return
+
     info = await reviewer_mod.executor_open_pr(
         _runtime.client, agent, project.base_branch, timeout_sec=PR_OPEN_TIMEOUT_SEC,
     )
     if info is None:
-        try:
-            info = await reviewer_mod.finalize_and_open_pr(project, agent, project.base_branch)
-        except pr_mod.PrError as e:
-            _maybe_notify_phase(_runtime.agents.update(agent.agent_id, phase="FAILED", last_error=f"pr open: {e}"), "failed")
+        if await _check_executor_rate_limited(agent):
+            return
+        info, attempts = await reviewer_mod.oneshot_open_pr(
+            _runtime.client, agent, project.base_branch,
+            _runtime.config.pr_fallback_models,
+        )
+        if info is None:
+            attempts_str = "; ".join(attempts) if attempts else "(no attempts)"
+            _maybe_notify_phase(_runtime.agents.update(
+                agent.agent_id, phase="FAILED",
+                last_error=f"all PR-fallback models exhausted: {attempts_str}",
+            ), "failed")
             return
     refreshed = _runtime.agents.update(
         agent.agent_id, phase="PR_OPEN",
@@ -1250,6 +1428,7 @@ async def _cleanup_worktrees(agent: Agent, worktree: Path) -> None:
 
 
 _PHASE_HANDLERS = {
+    "QUEUED": _phase_queued,
     "EXECUTING": _phase_executing,
     "IDLE_TASK_COMPLETE": _phase_idle_task_complete,
     "REVIEW_SPAWNING": _phase_review_spawning,
@@ -1258,6 +1437,7 @@ _PHASE_HANDLERS = {
     "IDLE_REVIEW_ADDRESSED": _phase_idle_task_complete,
     "COMMITTING": _phase_committing,
     "PR_OPEN": _phase_pr_open,
+    "RATE_LIMITED": _phase_rate_limited,
 }
 
 

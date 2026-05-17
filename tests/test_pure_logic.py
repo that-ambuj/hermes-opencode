@@ -1336,3 +1336,531 @@ class TestCheckExecutorAbort:
         final = agents.get("bck/test")
         assert final.phase == "FAILED"
         assert "aborted 3" in (final.last_error or "")
+
+
+class TestParseModelId:
+    """v0.15.0: parse_model_id converts "provider/model[/variant]" config
+    strings into opencode's POST /session model struct {id, providerID, variant?}.
+    """
+
+    def test_simple_two_parts(self):
+        result = reviewer_mod.parse_model_id("openai/gpt-5.5")
+        assert result == {"id": "gpt-5.5", "providerID": "openai"}
+
+    def test_three_parts_treats_third_as_variant(self):
+        result = reviewer_mod.parse_model_id("anthropic/claude-opus-4-7/max")
+        assert result == {"id": "claude-opus-4-7", "providerID": "anthropic", "variant": "max"}
+
+    def test_opencode_provider_id(self):
+        result = reviewer_mod.parse_model_id("opencode/deepseek-v4-flash-free")
+        assert result == {"id": "deepseek-v4-flash-free", "providerID": "opencode"}
+
+    def test_missing_slash_returns_none(self):
+        assert reviewer_mod.parse_model_id("gpt-5.5") is None
+
+    def test_empty_returns_none(self):
+        assert reviewer_mod.parse_model_id("") is None
+        assert reviewer_mod.parse_model_id("   ") is None
+
+    def test_only_provider_returns_none(self):
+        assert reviewer_mod.parse_model_id("openai/") is None
+        assert reviewer_mod.parse_model_id("/gpt-5.5") is None
+
+    def test_strips_whitespace_segments(self):
+        result = reviewer_mod.parse_model_id("  openai  / gpt-5.5 ")
+        assert result == {"id": "gpt-5.5", "providerID": "openai"}
+
+
+class TestPrFallbackModelsConfig:
+    """v0.15.0: Config.pr_fallback_models supports YAML list, env var
+    (comma-separated), or a sane default. YAML beats env.
+    """
+
+    def test_default_when_nothing_configured(self, monkeypatch):
+        monkeypatch.delenv("OPENCODE_PR_FALLBACK_MODELS", raising=False)
+        cfg = config_mod.Config.from_plugin_entry({})
+        assert cfg.pr_fallback_models == [
+            "openai/gpt-5.5",
+            "opencode/deepseek-v4-flash-free",
+        ]
+
+    def test_yaml_list_wins(self, monkeypatch):
+        monkeypatch.setenv("OPENCODE_PR_FALLBACK_MODELS", "x/y,z/w")
+        cfg = config_mod.Config.from_plugin_entry({
+            "opencode_server": {
+                "pr_fallback_models": ["a/b", "c/d/v"],
+            },
+        })
+        assert cfg.pr_fallback_models == ["a/b", "c/d/v"]
+
+    def test_env_var_comma_separated(self, monkeypatch):
+        monkeypatch.setenv("OPENCODE_PR_FALLBACK_MODELS", "openai/gpt-5,deepseek/r2 ,foo/bar")
+        cfg = config_mod.Config.from_plugin_entry({})
+        assert cfg.pr_fallback_models == ["openai/gpt-5", "deepseek/r2", "foo/bar"]
+
+    def test_empty_yaml_list_falls_back_to_env_then_default(self, monkeypatch):
+        monkeypatch.delenv("OPENCODE_PR_FALLBACK_MODELS", raising=False)
+        cfg = config_mod.Config.from_plugin_entry({
+            "opencode_server": {"pr_fallback_models": []},
+        })
+        assert cfg.pr_fallback_models == [
+            "openai/gpt-5.5", "opencode/deepseek-v4-flash-free",
+        ]
+
+
+class TestMessageIsRateLimited:
+    """v0.15.0: _message_is_rate_limited extracts retry-after seconds
+    from opencode's structured APIError on assistant messages.
+    """
+
+    def test_none_when_no_error(self):
+        assert event_loop_mod._message_is_rate_limited({"message": {"role": "assistant"}}) is None
+
+    def test_none_when_error_not_apierror(self):
+        item = {"message": {"role": "assistant", "error": {"name": "MessageAbortedError"}}}
+        assert event_loop_mod._message_is_rate_limited(item) is None
+
+    def test_status_code_429_matches(self):
+        item = {
+            "message": {
+                "role": "assistant",
+                "error": {"name": "APIError", "statusCode": 429, "message": "rate limited", "isRetryable": True},
+            }
+        }
+        result = event_loop_mod._message_is_rate_limited(item)
+        assert result is not None
+        assert result == 0.0
+
+    def test_status_code_other_with_text_pattern_matches(self):
+        item = {
+            "message": {
+                "role": "assistant",
+                "error": {"name": "APIError", "statusCode": 500, "message": "quota exceeded for this account"},
+            }
+        }
+        result = event_loop_mod._message_is_rate_limited(item)
+        assert result is not None
+
+    def test_retry_after_header_parsed(self):
+        item = {
+            "message": {
+                "role": "assistant",
+                "error": {
+                    "name": "APIError", "statusCode": 429,
+                    "message": "rate limited",
+                    "responseHeaders": {"retry-after": "120"},
+                },
+            }
+        }
+        assert event_loop_mod._message_is_rate_limited(item) == 120.0
+
+    def test_retry_after_ms_metadata_parsed(self):
+        item = {
+            "message": {
+                "role": "assistant",
+                "error": {
+                    "name": "APIError", "statusCode": 429,
+                    "message": "...",
+                    "metadata": {"retryAfterMs": 60000},
+                },
+            }
+        }
+        assert event_loop_mod._message_is_rate_limited(item) == 60.0
+
+    def test_no_429_no_text_pattern_returns_none(self):
+        item = {
+            "message": {
+                "role": "assistant",
+                "error": {"name": "APIError", "statusCode": 401, "message": "unauthorized"},
+            }
+        }
+        assert event_loop_mod._message_is_rate_limited(item) is None
+
+
+class TestCheckExecutorRateLimited:
+    """v0.15.0: _check_executor_rate_limited transitions the agent to
+    RATE_LIMITED on a provider 429 and saves the prior phase so the
+    wait-and-resume path can restore it. Idempotent on already-RATE_LIMITED.
+    """
+
+    def setup_method(self):
+        self._notified: list = []
+        self._saved_pkg_runtime = plugin_mod._runtime
+        self._saved_evloop_runtime = event_loop_mod._runtime
+        self._saved_notify = event_loop_mod._notify_event
+        event_loop_mod._notify_event = lambda agent, kind, body="": self._notified.append((kind, body))
+
+    def teardown_method(self):
+        plugin_mod._runtime = self._saved_pkg_runtime
+        event_loop_mod._runtime = self._saved_evloop_runtime
+        event_loop_mod._notify_event = self._saved_notify
+
+    def _setup(self, tmp_path, messages_items, phase="EXECUTING"):
+        cfg = config_mod.Config(
+            projects_file=tmp_path / "projects.json",
+            agents_file=tmp_path / "agents.json",
+            worktrees_root=tmp_path / "wt",
+            logs_dir=tmp_path / "logs",
+            notifications_file=tmp_path / "notifications.jsonl",
+        )
+        cfg.ensure_dirs()
+        agents = state_mod.AgentStore(cfg.agents_file)
+        agent = state_mod.Agent(
+            agent_id="bck/test", project_label="bck",
+            worktree_path=str(tmp_path), session_id="s",
+            branch="bck/test", initial_prompt="p", phase=phase,
+        )
+        agents.add(agent)
+        box = [messages_items]
+        class FakeClient:
+            async def get_messages(self_inner, session_id, directory, cursor=None):
+                return {"items": box[0]}
+        tools_mod = sys.modules["_oco_test_pkg.tools"]
+        rt = tools_mod.Runtime(config=cfg, client=FakeClient(), projects=None, agents=agents)
+        plugin_mod._runtime = rt
+        event_loop_mod._runtime = rt
+        return agents
+
+    def _run(self, agent):
+        import asyncio
+        return asyncio.run(event_loop_mod._check_executor_rate_limited(agent))
+
+    def test_no_error_returns_false(self, tmp_path: Path):
+        agents = self._setup(tmp_path, [{
+            "message": {"role": "assistant", "id": "m1"},
+            "parts": [{"type": "text", "text": "all good"}],
+        }])
+        agent = agents.get("bck/test")
+        assert self._run(agent) is False
+        assert agents.get("bck/test").phase == "EXECUTING"
+
+    def test_rate_limit_transitions_to_RATE_LIMITED(self, tmp_path: Path):
+        agents = self._setup(tmp_path, [{
+            "message": {
+                "role": "assistant", "id": "m1",
+                "error": {
+                    "name": "APIError", "statusCode": 429, "message": "rate limited",
+                    "responseHeaders": {"retry-after": "90"},
+                },
+            },
+        }])
+        agent = agents.get("bck/test")
+        assert self._run(agent) is True
+        refreshed = agents.get("bck/test")
+        assert refreshed.phase == "RATE_LIMITED"
+        assert refreshed.phase_before_rate_limit == "EXECUTING"
+        assert refreshed.rate_limited_at is not None
+        assert refreshed.rate_limit_retry_after_at is not None
+        kinds = [k for (k, _b) in self._notified]
+        assert "rate_limited" in kinds
+
+    def test_already_RATE_LIMITED_is_noop(self, tmp_path: Path):
+        agents = self._setup(tmp_path, [{
+            "message": {
+                "role": "assistant", "id": "m1",
+                "error": {"name": "APIError", "statusCode": 429, "message": "rate limited"},
+            },
+        }], phase="RATE_LIMITED")
+        agent = agents.get("bck/test")
+        assert self._run(agent) is False
+        assert self._notified == []
+
+    def test_min_wait_floor_applied_when_retry_after_missing(self, tmp_path: Path):
+        agents = self._setup(tmp_path, [{
+            "message": {
+                "role": "assistant", "id": "m1",
+                "error": {"name": "APIError", "statusCode": 429, "message": "rate limited"},
+            },
+        }])
+        agent = agents.get("bck/test")
+        self._run(agent)
+        refreshed = agents.get("bck/test")
+        wait = refreshed.rate_limit_retry_after_at - refreshed.rate_limited_at
+        assert wait >= event_loop_mod.RATE_LIMIT_MIN_WAIT_SEC - 0.5
+
+
+class TestPhaseRateLimited:
+    """v0.15.0: _phase_rate_limited waits for retry_after_at then restores
+    the saved phase_before_rate_limit, fires `rate_limit_cleared`.
+    """
+
+    def setup_method(self):
+        self._notified: list = []
+        self._saved_pkg_runtime = plugin_mod._runtime
+        self._saved_evloop_runtime = event_loop_mod._runtime
+        self._saved_notify = event_loop_mod._notify_event
+        event_loop_mod._notify_event = lambda agent, kind, body="": self._notified.append((kind, body))
+
+    def teardown_method(self):
+        plugin_mod._runtime = self._saved_pkg_runtime
+        event_loop_mod._runtime = self._saved_evloop_runtime
+        event_loop_mod._notify_event = self._saved_notify
+
+    def _setup(self, tmp_path, retry_after_at, prior_phase="EXECUTING"):
+        cfg = config_mod.Config(
+            projects_file=tmp_path / "projects.json",
+            agents_file=tmp_path / "agents.json",
+            worktrees_root=tmp_path / "wt",
+            logs_dir=tmp_path / "logs",
+            notifications_file=tmp_path / "notifications.jsonl",
+        )
+        cfg.ensure_dirs()
+        agents = state_mod.AgentStore(cfg.agents_file)
+        agent = state_mod.Agent(
+            agent_id="bck/test", project_label="bck",
+            worktree_path=str(tmp_path), session_id="s",
+            branch="bck/test", initial_prompt="p", phase="RATE_LIMITED",
+            rate_limited_at=time.time(),
+            rate_limit_retry_after_at=retry_after_at,
+            phase_before_rate_limit=prior_phase,
+            last_error="rate-limited",
+        )
+        agents.add(agent)
+        tools_mod = sys.modules["_oco_test_pkg.tools"]
+        rt = tools_mod.Runtime(config=cfg, client=None, projects=None, agents=agents)
+        plugin_mod._runtime = rt
+        event_loop_mod._runtime = rt
+        return agents
+
+    def test_restores_phase_after_retry_after_elapsed(self, tmp_path: Path):
+        agents = self._setup(tmp_path, retry_after_at=time.time() - 1.0, prior_phase="COMMITTING")
+        agent = agents.get("bck/test")
+        import asyncio
+        asyncio.run(event_loop_mod._phase_rate_limited(agent))
+        refreshed = agents.get("bck/test")
+        assert refreshed.phase == "COMMITTING"
+        assert refreshed.rate_limited_at is None
+        assert refreshed.rate_limit_retry_after_at is None
+        assert refreshed.phase_before_rate_limit is None
+        assert refreshed.last_error is None
+        assert any(k == "rate_limit_cleared" for (k, _b) in self._notified)
+
+    def test_defaults_to_EXECUTING_when_no_prior_saved(self, tmp_path: Path):
+        agents = self._setup(tmp_path, retry_after_at=time.time() - 1.0, prior_phase=None)
+        agent = agents.get("bck/test")
+        import asyncio
+        asyncio.run(event_loop_mod._phase_rate_limited(agent))
+        assert agents.get("bck/test").phase == "EXECUTING"
+
+
+class TestPhaseQueued:
+    """v0.15.0: _phase_queued waits while any RATE_LIMITED agent exists,
+    then sends the wrapped initial prompt and transitions to EXECUTING.
+    """
+
+    def setup_method(self):
+        self._notified: list = []
+        self._sent: list = []
+        self._saved_pkg_runtime = plugin_mod._runtime
+        self._saved_evloop_runtime = event_loop_mod._runtime
+        self._saved_notify = event_loop_mod._notify_event
+        self._saved_maybe_notify = event_loop_mod._maybe_notify_phase
+        event_loop_mod._notify_event = lambda agent, kind, body="": self._notified.append((kind, body))
+        event_loop_mod._maybe_notify_phase = lambda agent, kind, body="": self._notified.append(("phase:" + kind, body))
+
+    def teardown_method(self):
+        plugin_mod._runtime = self._saved_pkg_runtime
+        event_loop_mod._runtime = self._saved_evloop_runtime
+        event_loop_mod._notify_event = self._saved_notify
+        event_loop_mod._maybe_notify_phase = self._saved_maybe_notify
+
+    def _setup(self, tmp_path, other_agents: list):
+        cfg = config_mod.Config(
+            projects_file=tmp_path / "projects.json",
+            agents_file=tmp_path / "agents.json",
+            worktrees_root=tmp_path / "wt",
+            logs_dir=tmp_path / "logs",
+            notifications_file=tmp_path / "notifications.jsonl",
+        )
+        cfg.ensure_dirs()
+        agents = state_mod.AgentStore(cfg.agents_file)
+        queued = state_mod.Agent(
+            agent_id="bck/queued", project_label="bck",
+            worktree_path=str(tmp_path), session_id="qs",
+            branch="bck/queued", initial_prompt="please do the thing",
+            phase="QUEUED", queued_blocked_by=[],
+        )
+        agents.add(queued)
+        for a in other_agents:
+            agents.add(a)
+        captured = self._sent
+        class FakeClient:
+            async def send_message_async(self_inner, session_id, directory, text, timeout=30.0):
+                captured.append({"session_id": session_id, "text": text})
+                return {"queued": True}
+        tools_mod = sys.modules["_oco_test_pkg.tools"]
+        rt = tools_mod.Runtime(config=cfg, client=FakeClient(), projects=None, agents=agents)
+        plugin_mod._runtime = rt
+        event_loop_mod._runtime = rt
+        return agents
+
+    def test_no_blockers_drains_and_transitions(self, tmp_path: Path):
+        import asyncio
+        agents = self._setup(tmp_path, other_agents=[])
+        agent = agents.get("bck/queued")
+        asyncio.run(event_loop_mod._phase_queued(agent))
+        refreshed = agents.get("bck/queued")
+        assert refreshed.phase == "EXECUTING"
+        assert refreshed.queued_blocked_by == []
+        assert len(self._sent) == 1
+        assert "please do the thing" in self._sent[0]["text"]
+        assert any(k == "queue_drained" for (k, _b) in self._notified)
+
+    def test_other_RATE_LIMITED_blocks_drain(self, tmp_path: Path):
+        import asyncio
+        blocker = state_mod.Agent(
+            agent_id="bck/blocker", project_label="bck",
+            worktree_path=str(tmp_path / "x"), session_id="bs",
+            branch="bck/blocker", initial_prompt="...", phase="RATE_LIMITED",
+        )
+        agents = self._setup(tmp_path, other_agents=[blocker])
+        agent = agents.get("bck/queued")
+        async def _run_with_short_sleep():
+            event_loop_mod.QUEUE_POLL_SEC = 0.0
+            await event_loop_mod._phase_queued(agent)
+        asyncio.run(_run_with_short_sleep())
+        refreshed = agents.get("bck/queued")
+        assert refreshed.phase == "QUEUED"
+        assert refreshed.queued_blocked_by == ["bck/blocker"]
+        assert self._sent == []
+
+    def test_blocked_by_list_updated_when_drifted(self, tmp_path: Path):
+        import asyncio
+        blocker = state_mod.Agent(
+            agent_id="bck/blocker", project_label="bck",
+            worktree_path=str(tmp_path / "x"), session_id="bs",
+            branch="bck/blocker", initial_prompt="...", phase="RATE_LIMITED",
+        )
+        agents = self._setup(tmp_path, other_agents=[blocker])
+        agents.update("bck/queued", queued_blocked_by=["stale-id"])
+        agent = agents.get("bck/queued")
+        async def _run():
+            event_loop_mod.QUEUE_POLL_SEC = 0.0
+            await event_loop_mod._phase_queued(agent)
+        asyncio.run(_run())
+        assert agents.get("bck/queued").queued_blocked_by == ["bck/blocker"]
+
+
+class TestOneshotOpenPr:
+    """v0.15.0: oneshot_open_pr iterates pr_fallback_models, creating a
+    fresh session per attempt. First successful sentinel emit wins;
+    returns None when all models exhausted.
+    """
+
+    def setup_method(self):
+        self._created_sessions: list = []
+        self._sends: list = []
+        self._reviewer_mod = reviewer_mod
+        self._state_mod = state_mod
+        self._OpencodeClient = sys.modules["_oco_test_pkg.transport"].OpencodeClient
+
+    def _agent(self, tmp_path: Path):
+        wt = tmp_path / "wt"
+        wt.mkdir(parents=True, exist_ok=True)
+        return self._state_mod.Agent(
+            agent_id="bck/test", project_label="bck",
+            worktree_path=str(wt), session_id="executor-s",
+            branch="bck/test", initial_prompt="please do the thing",
+            phase="COMMITTING",
+        )
+
+    def _build_client(self, responses: list):
+        created = self._created_sessions
+        sends = self._sends
+        # responses[i] is the assistant text for the i-th model attempt;
+        # use sentinel "PR_OPENED: https://github.com/o/r/pull/<N>" to succeed
+        idx = [0]
+        class FakeClient:
+            async def create_session(self_inner, directory, agent="build", model=None):
+                created.append({"agent": agent, "model": model, "directory": str(directory)})
+                return {"id": f"oneshot-{len(created)}"}
+            async def send_message(self_inner, session_id, directory, text, timeout=600.0):
+                resp_text = responses[idx[0]] if idx[0] < len(responses) else ""
+                idx[0] += 1
+                sends.append({"session_id": session_id, "text": text})
+                return {
+                    "info": {},
+                    "parts": [{"type": "text", "text": resp_text}],
+                }
+        # Patch the OpencodeClient.extract_assistant_text helper to handle our shape
+        return FakeClient()
+
+    def test_first_model_succeeds(self, tmp_path: Path, monkeypatch):
+        import asyncio
+        agent = self._agent(tmp_path)
+        monkeypatch.setattr(
+            self._OpencodeClient, "extract_assistant_text",
+            staticmethod(lambda resp: resp["parts"][0]["text"]),
+        )
+        client = self._build_client([
+            "Done. PR_OPENED: https://github.com/o/r/pull/7",
+        ])
+        pr_mod_test = sys.modules["_oco_test_pkg.pr"]
+        monkeypatch.setattr(pr_mod_test, "pr_state", lambda *a, **kw: (_ for _ in ()).throw(pr_mod_test.PrError("no gh")))
+        info, attempts = asyncio.run(self._reviewer_mod.oneshot_open_pr(
+            client, agent, "main", ["openai/gpt-5.5", "opencode/deepseek-v4-flash-free"],
+            timeout_sec=10.0,
+        ))
+        assert info is not None
+        assert info.number == 7
+        assert "openai" in attempts[0] and "ok PR #7" in attempts[0]
+        assert len(self._created_sessions) == 1
+        assert self._created_sessions[0]["model"] == {"id": "gpt-5.5", "providerID": "openai"}
+
+    def test_first_fails_no_sentinel_second_succeeds(self, tmp_path: Path, monkeypatch):
+        import asyncio
+        agent = self._agent(tmp_path)
+        monkeypatch.setattr(
+            self._OpencodeClient, "extract_assistant_text",
+            staticmethod(lambda resp: resp["parts"][0]["text"]),
+        )
+        client = self._build_client([
+            "I tried but couldn't open the PR.",
+            "Done. PR_OPENED: https://github.com/o/r/pull/42",
+        ])
+        pr_mod_test = sys.modules["_oco_test_pkg.pr"]
+        monkeypatch.setattr(pr_mod_test, "pr_state", lambda *a, **kw: (_ for _ in ()).throw(pr_mod_test.PrError("no gh")))
+        info, attempts = asyncio.run(self._reviewer_mod.oneshot_open_pr(
+            client, agent, "main", ["openai/gpt-5.5", "opencode/deepseek-v4-flash-free"],
+        ))
+        assert info is not None
+        assert info.number == 42
+        assert len(self._created_sessions) == 2
+        assert "no PR_OPENED sentinel" in attempts[0]
+        assert "ok PR #42" in attempts[1]
+
+    def test_all_models_exhausted_returns_none(self, tmp_path: Path, monkeypatch):
+        import asyncio
+        agent = self._agent(tmp_path)
+        monkeypatch.setattr(
+            self._OpencodeClient, "extract_assistant_text",
+            staticmethod(lambda resp: resp["parts"][0]["text"]),
+        )
+        client = self._build_client(["nope", "still nope"])
+        info, attempts = asyncio.run(self._reviewer_mod.oneshot_open_pr(
+            client, agent, "main", ["a/b", "c/d"],
+        ))
+        assert info is None
+        assert len(attempts) == 2
+        assert all("no PR_OPENED sentinel" in a for a in attempts)
+
+    def test_invalid_model_spec_is_skipped(self, tmp_path: Path, monkeypatch):
+        import asyncio
+        agent = self._agent(tmp_path)
+        monkeypatch.setattr(
+            self._OpencodeClient, "extract_assistant_text",
+            staticmethod(lambda resp: resp["parts"][0]["text"]),
+        )
+        client = self._build_client([
+            "Done. PR_OPENED: https://github.com/o/r/pull/99",
+        ])
+        pr_mod_test = sys.modules["_oco_test_pkg.pr"]
+        monkeypatch.setattr(pr_mod_test, "pr_state", lambda *a, **kw: (_ for _ in ()).throw(pr_mod_test.PrError("no gh")))
+        info, attempts = asyncio.run(self._reviewer_mod.oneshot_open_pr(
+            client, agent, "main", ["no-slash", "openai/gpt-5.5"],
+        ))
+        assert info is not None
+        assert info.number == 99
+        assert "invalid spec" in attempts[0]
+        assert "openai" in attempts[1]
+        assert len(self._created_sessions) == 1

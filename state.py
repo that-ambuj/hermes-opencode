@@ -9,6 +9,7 @@ from pathlib import Path
 
 PHASES = {
     "CREATED",
+    "QUEUED",
     "BOOTSTRAPPING",
     "EXECUTING",
     "IDLE_TASK_COMPLETE",
@@ -19,6 +20,7 @@ PHASES = {
     "IDLE_REVIEW_ADDRESSED",
     "COMMITTING",
     "PR_OPEN",
+    "RATE_LIMITED",
     "DONE",
     "FAILED",
     "KILLED",
@@ -58,6 +60,10 @@ class Agent:
     consecutive_tick_failures: int = 0
     last_abort_msg_id: str | None = None
     consecutive_aborts: int = 0
+    rate_limited_at: float | None = None
+    rate_limit_retry_after_at: float | None = None
+    phase_before_rate_limit: str | None = None
+    queued_blocked_by: list[str] = field(default_factory=list)
 
 
 class AgentExists(ValueError):

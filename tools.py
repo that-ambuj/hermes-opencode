@@ -469,6 +469,30 @@ def make_spawn(rt: Runtime) -> Callable[..., Awaitable[str]]:
         )
         rt.agents.add(agent)
 
+        rate_limited_agents = [
+            a for a in rt.agents.list() if a.phase == "RATE_LIMITED"
+        ]
+        if rate_limited_agents:
+            blocked_by = [a.agent_id for a in rate_limited_agents]
+            rt.agents.update(
+                agent_id, phase="QUEUED", queued_blocked_by=blocked_by,
+            )
+            event_loop.start(rt)
+            event_loop.ensure_agent_task(agent_id)
+            return _ok({
+                "agent_id": agent_id,
+                "session_id": session_id,
+                "worktree_path": str(worktree_path),
+                "branch": branch,
+                "queued": True,
+                "blocked_by": blocked_by,
+                "note": (
+                    f"task queued (phase=QUEUED); waiting for {len(blocked_by)} "
+                    "rate-limited agent(s) to clear before first turn fires"
+                ),
+                "bootstrap": {"ok": boot.ok, "method": boot.method, "skill_updated": boot.skill_updated},
+            })
+
         wrapped_prompt = wrap_initial_prompt(prompt)
         try:
             await rt.client.send_message_async(session_id, worktree_path, wrapped_prompt)
