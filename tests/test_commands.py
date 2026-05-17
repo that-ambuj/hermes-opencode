@@ -380,3 +380,202 @@ class TestPhaseGlyphCancelled:
         assert "🚫" in body
         assert "CANCELLED" in body
         assert "cancelled: PR #1 closed without merge" in body
+
+
+class TestOcAttachInsideRunningLoop:
+    """Regression: `/oc attach` was crashing with
+    `RuntimeError: asyncio.run() cannot be called from a running event loop`
+    when the slash-command dispatcher was invoked from hermes' running
+    asyncio loop (the TUI dispatch path and the `pre_gateway_dispatch`
+    hook path). The fix routes opencode HTTP calls through the plugin's
+    background event loop via `event_loop.run_blocking`.
+    """
+
+    def test_attach_handler_does_not_call_asyncio_run_when_loop_running(self, tmp_path: Path):
+        import asyncio
+        import threading
+
+        state = sys.modules["_oco_test_pkg.state"]
+        event_loop_mod = sys.modules["_oco_test_pkg.event_loop"]
+
+        store = state.AgentStore(tmp_path / "agents.json")
+        store.add(_agent(
+            agent_id="dp/x", project_label="dodo-payments", branch="dp/x",
+            session_id="ses_abc", worktree_path=str(tmp_path / "wt"),
+        ))
+
+        class _FakeClient:
+            calls: list[tuple] = []
+
+            async def get_messages(self, session_id, worktree):
+                _FakeClient.calls.append((session_id, str(worktree)))
+                return {"items": [{"id": "m1", "parts": [{"type": "text", "text": "hello world"}]}]}
+
+        class _StubRuntime:
+            def __init__(self):
+                self.agents = store
+                self.client = _FakeClient()
+
+        bg_loop = asyncio.new_event_loop()
+        bg_loop_running = threading.Event()
+
+        def _run_bg():
+            asyncio.set_event_loop(bg_loop)
+            bg_loop_running.set()
+            bg_loop.run_forever()
+
+        bg_thread = threading.Thread(target=_run_bg, daemon=True)
+        bg_thread.start()
+        bg_loop_running.wait(timeout=2.0)
+        with event_loop_mod._state_lock:
+            event_loop_mod._loop = bg_loop
+
+        try:
+            handler = commands_mod.make_oc_attach(_StubRuntime())
+
+            async def _from_running_loop():
+                return handler("dp/x")
+
+            outer_loop = asyncio.new_event_loop()
+            try:
+                result = outer_loop.run_until_complete(_from_running_loop())
+            finally:
+                outer_loop.close()
+
+            assert result == "hello world", f"unexpected handler output: {result!r}"
+            assert _FakeClient.calls == [("ses_abc", str(tmp_path / "wt"))]
+        finally:
+            with event_loop_mod._state_lock:
+                event_loop_mod._loop = None
+            bg_loop.call_soon_threadsafe(bg_loop.stop)
+            bg_thread.join(timeout=2.0)
+            bg_loop.close()
+
+
+class TestOcCancelInsideRunningLoop:
+    """Regression: same `asyncio.run() cannot be called from a running event loop`
+    bug class as `TestOcAttachInsideRunningLoop`, but for the cancel handler.
+    `make_oc_cancel` was also a sync function that called `asyncio.run` on the
+    cancel coroutine, so invoking `/oc cancel` from the TUI dispatch path or
+    the `pre_gateway_dispatch` hook crashed with the same RuntimeError.
+
+    This test fakes out `tools.make_cancel` with a trivial async stub so the
+    test stays focused on the slash-command-layer loop-handling fix; the
+    full cancel pipeline (delete_session / cleanup_skill / remove_worktree)
+    is covered by other tests.
+    """
+
+    def test_cancel_handler_does_not_call_asyncio_run_when_loop_running(self, tmp_path: Path, monkeypatch):
+        import asyncio
+        import json
+        import threading
+
+        state = sys.modules["_oco_test_pkg.state"]
+        event_loop_mod = sys.modules["_oco_test_pkg.event_loop"]
+        tools_mod = sys.modules["_oco_test_pkg.tools"]
+
+        store = state.AgentStore(tmp_path / "agents.json")
+        store.add(_agent(
+            agent_id="dp/x", project_label="dodo-payments", branch="dp/x",
+            session_id="ses_abc", worktree_path=str(tmp_path / "wt"),
+            phase="EXECUTING",
+        ))
+
+        cancel_calls: list[dict] = []
+
+        def _fake_make_cancel(_rt):
+            async def _handler(args, **_kw):
+                cancel_calls.append(args)
+                return json.dumps({
+                    "ok": True,
+                    "data": {
+                        "agent_id": args.get("agent_id"),
+                        "phase": "CANCELLED",
+                        "reason": args.get("reason"),
+                        "errors": [],
+                    },
+                })
+            return _handler
+
+        monkeypatch.setattr(tools_mod, "make_cancel", _fake_make_cancel)
+
+        class _StubRuntime:
+            def __init__(self):
+                self.agents = store
+                self.client = None
+
+        bg_loop = asyncio.new_event_loop()
+        bg_loop_running = threading.Event()
+
+        def _run_bg():
+            asyncio.set_event_loop(bg_loop)
+            bg_loop_running.set()
+            bg_loop.run_forever()
+
+        bg_thread = threading.Thread(target=_run_bg, daemon=True)
+        bg_thread.start()
+        bg_loop_running.wait(timeout=2.0)
+        with event_loop_mod._state_lock:
+            event_loop_mod._loop = bg_loop
+
+        try:
+            handler = commands_mod.make_oc_cancel(_StubRuntime())
+
+            async def _from_running_loop():
+                return handler("dp/x PR was closed without merge")
+
+            outer_loop = asyncio.new_event_loop()
+            try:
+                result = outer_loop.run_until_complete(_from_running_loop())
+            finally:
+                outer_loop.close()
+
+            assert "cancelled dp/x" in result, f"unexpected handler output: {result!r}"
+            assert "PR was closed without merge" in result
+            assert cancel_calls == [{
+                "agent_id": "dp/x",
+                "reason": "PR was closed without merge",
+            }]
+        finally:
+            with event_loop_mod._state_lock:
+                event_loop_mod._loop = None
+            bg_loop.call_soon_threadsafe(bg_loop.stop)
+            bg_thread.join(timeout=2.0)
+            bg_loop.close()
+
+
+class TestRunBlocking:
+    def test_falls_back_to_asyncio_run_when_no_bg_loop_and_no_running_loop(self):
+        event_loop_mod = sys.modules["_oco_test_pkg.event_loop"]
+
+        async def _coro():
+            return 42
+
+        with event_loop_mod._state_lock:
+            assert event_loop_mod._loop is None, "test precondition: no bg loop"
+
+        assert event_loop_mod.run_blocking(lambda: _coro()) == 42
+
+    def test_raises_when_inside_running_loop_with_no_bg_loop(self):
+        import asyncio
+        event_loop_mod = sys.modules["_oco_test_pkg.event_loop"]
+
+        async def _coro():
+            return 1
+
+        async def _outer():
+            return event_loop_mod.run_blocking(lambda: _coro())
+
+        with event_loop_mod._state_lock:
+            assert event_loop_mod._loop is None
+
+        outer_loop = asyncio.new_event_loop()
+        try:
+            try:
+                outer_loop.run_until_complete(_outer())
+            except RuntimeError as e:
+                assert "background loop is not running" in str(e)
+            else:
+                raise AssertionError("expected RuntimeError")
+        finally:
+            outer_loop.close()

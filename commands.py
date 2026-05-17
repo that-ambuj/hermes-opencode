@@ -297,9 +297,13 @@ def make_oc_attach(runtime: "Runtime") -> Callable[[str], str]:
             return f"unknown agent: {agent_id}"
         worktree = Path(agent.worktree_path)
         try:
-            body = asyncio.run(runtime.client.get_messages(agent.session_id, worktree))
+            body = event_loop.run_blocking(
+                lambda: runtime.client.get_messages(agent.session_id, worktree)
+            )
         except OpencodeError as e:
             return f"transport error: {e}"
+        except RuntimeError as e:
+            return f"plugin error (background loop unavailable): {e}"
         items = body.get("items") or []
         if not items:
             return "no transcript yet"
@@ -332,7 +336,9 @@ def make_oc_cancel(runtime: "Runtime") -> Callable[[str], str]:
         try:
             from . import tools as tools_mod
             spawn_fn = tools_mod.make_cancel(runtime)
-            result = asyncio.run(spawn_fn({"agent_id": agent_id, "reason": reason}))
+            result = event_loop.run_blocking(
+                lambda: spawn_fn({"agent_id": agent_id, "reason": reason})
+            )
         except RuntimeError as e:
             return f"cancel failed: {e}"
         import json
