@@ -54,31 +54,49 @@ def _send_dashboard(title: str, body: str, meta: dict[str, Any], path: Path) -> 
         return NotifyResult("dashboard", False, repr(e))
 
 
+def _resolve_live_adapter(
+    platform: str,
+    *,
+    runner_ref: Callable[[], Any] | None = None,
+    platform_enum_cls: Any = None,
+) -> tuple[Any | None, str | None]:
+    """Return (adapter, err) for the live in-process gateway adapter; exactly one side is non-None."""
+    if runner_ref is None or platform_enum_cls is None:
+        try:
+            from gateway.run import _gateway_runner_ref as _runner  # type: ignore
+            from gateway.config import Platform as _Platform  # type: ignore
+        except ImportError as e:
+            return None, f"gateway not importable: {e}"
+        if runner_ref is None:
+            runner_ref = _runner
+        if platform_enum_cls is None:
+            platform_enum_cls = _Platform
+
+    try:
+        platform_enum = (
+            platform
+            if isinstance(platform, platform_enum_cls)
+            else platform_enum_cls(platform)
+        )
+    except Exception as e:
+        return None, f"unknown platform {platform!r}: {e}"
+
+    runner = runner_ref()
+    if runner is None:
+        return None, "no live gateway runner in this process"
+    adapter = getattr(runner, "adapters", {}).get(platform_enum)
+    if adapter is None:
+        name = getattr(platform_enum, "value", platform_enum)
+        return None, f"no live adapter for {name!r} (gateway not running this platform)"
+    return adapter, None
+
+
 def _send_gateway(title: str, body: str, _meta: dict[str, Any], platform: str | None, chat_id: str | None) -> NotifyResult:
     if not platform or not chat_id:
         return NotifyResult("gateway", False, "platform or chat_id not configured")
-    try:
-        from gateway.platform_registry import platform_registry  # type: ignore
-        from gateway.config import Platform, load_gateway_config  # type: ignore
-    except ImportError as e:
-        return NotifyResult("gateway", False, f"gateway not importable: {e}")
-    try:
-        platform_enum = Platform(platform) if not isinstance(platform, Platform) else platform
-    except Exception as e:
-        return NotifyResult("gateway", False, f"unknown platform {platform!r}: {e}")
-    try:
-        gconfig = load_gateway_config()
-    except Exception as e:
-        return NotifyResult("gateway", False, f"load_gateway_config failed: {e}")
-    pconfig = (gconfig.platforms or {}).get(platform_enum)
-    if pconfig is None:
-        return NotifyResult("gateway", False, f"no platform config for {platform_enum!r} in gateway config")
-    try:
-        adapter = platform_registry.create_adapter(str(platform_enum.value if hasattr(platform_enum, 'value') else platform_enum), pconfig)
-    except Exception as e:
-        return NotifyResult("gateway", False, f"create_adapter failed: {e}")
+    adapter, err = _resolve_live_adapter(platform)
     if adapter is None:
-        return NotifyResult("gateway", False, f"create_adapter returned None for {platform_enum!r}")
+        return NotifyResult("gateway", False, err or "adapter resolution failed")
     content = f"*{title}*\n{body}"
     try:
         from model_tools import _run_async  # type: ignore
@@ -91,8 +109,11 @@ def _send_gateway(title: str, body: str, _meta: dict[str, Any], platform: str | 
             return NotifyResult("gateway", False, f"asyncio.run failed: {e}")
     except Exception as e:
         return NotifyResult("gateway", False, repr(e))
-    ok = bool(getattr(result, "ok", True) if result is not None else False)
-    return NotifyResult("gateway", ok, "" if ok else "send returned non-ok")
+    if result is None:
+        return NotifyResult("gateway", False, "send returned None")
+    ok = bool(getattr(result, "success", getattr(result, "ok", False)))
+    detail = "" if ok else (str(getattr(result, "error", "") or "") or "send returned non-ok")
+    return NotifyResult("gateway", ok, detail)
 
 
 def fanout(
