@@ -248,6 +248,84 @@ def _write_project_skill(
     return skill_path
 
 
+async def generate_cleanup_skill(
+    client: OpencodeClient, project: Project, throwaway_worktree: Path, registry: ProjectRegistry,
+    *, agent: str = "build", timeout_sec: float = 600.0,
+) -> BootstrapResult:
+    bootstrap_md = ""
+    if project.bootstrap_skill:
+        bp = _resolve_skill_path(project.bootstrap_skill)
+        if bp:
+            try:
+                bootstrap_md = bp.read_text(encoding="utf-8")
+            except OSError:
+                bootstrap_md = ""
+
+    bootstrap_ref = (
+        f"Existing bootstrap skill:\n{bootstrap_md}"
+        if bootstrap_md
+        else "No bootstrap skill on file. Infer the right tear-down from the repo itself."
+    )
+    prompt = (
+        "Generate ONLY a cleanup script that INVERSES this project's bootstrap. Read the repo "
+        "(docker-compose.yml, scripts/, Makefile, etc.) and the existing bootstrap (if any) to "
+        "decide the right tear-down.\n\n"
+        f"{bootstrap_ref}\n\n"
+        f"Output:\n"
+        f"  1. A line containing only {_CLEANUP_BEGIN}, then a self-contained bash block (no "
+        f"     language tag, no fences inside) that runs idempotently and reverses the bootstrap "
+        f"     (stop docker compose services started by bootstrap, drop ephemeral databases, "
+        f"     remove generated .env files, etc.), then a line containing only {_CLEANUP_END}.\n"
+        f"  2. {_RECOVERED_MARKER} on its own line, indicating you finished.\n\n"
+        f"The script runs with cwd=<worktree>. If the bootstrap has no persistent side effects "
+        f"worth reversing, emit an empty bash block (just whitespace between the markers)."
+    )
+    try:
+        session = await client.create_session(throwaway_worktree, agent=agent)
+    except OpencodeError as e:
+        return BootstrapResult(ok=False, method="opencode", detail=f"cleanup session create failed: {e}")
+    sid = session.get("id") or session.get("sessionID") or ""
+    try:
+        resp = await client.send_message(sid, throwaway_worktree, prompt, timeout=timeout_sec)
+    except OpencodeError as e:
+        return BootstrapResult(ok=False, method="opencode", detail=f"cleanup send failed: {e}")
+    try:
+        await client.wait_idle(sid, throwaway_worktree, timeout=timeout_sec)
+    except OpencodeError:
+        pass
+
+    final_text = OpencodeClient.extract_assistant_text(resp)
+    try:
+        await client.delete_session(sid, throwaway_worktree)
+    except OpencodeError:
+        pass
+
+    cleanup_match = re.search(rf"{_CLEANUP_BEGIN}\s*\n(.*?)\n{_CLEANUP_END}", final_text, re.DOTALL)
+    if not cleanup_match:
+        return BootstrapResult(ok=False, method="opencode", detail=f"no {_CLEANUP_BEGIN}/{_CLEANUP_END} block in output")
+    cleanup_bash = cleanup_match.group(1).strip()
+
+    cleanup_skill_name = f"hermes-opencode:{project.abbrev}-cleanup"
+    timestamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+    if not cleanup_bash:
+        registry.update(project.label, cleanup_skill=cleanup_skill_name)
+        _write_project_skill(
+            project, cleanup_skill_name, "cleanup",
+            f"Tear down a worktree of {project.label} (no-op: bootstrap has no persistent side effects).",
+            "", timestamp,
+        )
+        return BootstrapResult(ok=True, method="opencode", skill_updated=True, detail=f"{cleanup_skill_name} (no-op)")
+
+    _write_project_skill(
+        project, cleanup_skill_name, "cleanup",
+        f"Tear down a worktree of {project.label} (inverses {project.abbrev}-bootstrap).",
+        cleanup_bash, timestamp,
+    )
+    registry.update(project.label, cleanup_skill=cleanup_skill_name)
+    return BootstrapResult(ok=True, method="opencode", skill_updated=True, detail=cleanup_skill_name)
+
+
 async def run_project_cleanup(
     client: OpencodeClient, project: Project, worktree: Path,
     *, timeout_sec: float = 300.0,

@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0] - 2026-05-17
+
+### Added
+
+- **`oc_project_regenerate_cleanup` tool.** Generates (or regenerates)
+  ONLY the per-project cleanup skill, leaving the bootstrap skill
+  untouched. Useful for projects registered before cleanup-skill support
+  landed (v0.6.0 and earlier) where `Project.cleanup_skill` is still
+  `None`, or when the bootstrap has been hand-edited and you want a
+  fresh cleanup that reverses it without re-running the full bootstrap
+  generation. Backed by a new `bootstrap.generate_cleanup_skill(...)`
+  helper that reads the existing bootstrap (if any) and the repo, then
+  writes only `~/.hermes/skills/hermes-opencode__<abbrev>-cleanup/SKILL.md`
+  and updates `Project.cleanup_skill` in the registry.
+
+### Changed
+
+- **Flag renamed to `--archived`.** `/oc list --archived` and
+  `hermes oco list --archived` are now the documented form. `--all` and
+  `-a` remain accepted as aliases so anyone who picked up the v0.10.0
+  hint string keeps working.
+- The `no agents tracked` hint when everything visible is archived now
+  reads `(use --archived to include archived)`.
+
+### Internal
+
+- `bootstrap.generate_cleanup_skill(client, project, throwaway_worktree, registry)`:
+  scoped opencode round-trip that asks for ONLY a
+  `CLEANUP_BEGIN/CLEANUP_END` block; handles empty-block no-op case
+  (writes a no-op skill rather than skipping registry update); returns
+  typed `BootstrapResult` matching the existing surface.
+- New tool count: 20 (was 19). `provides_tools` in `plugin.yaml` now
+  also lists `oc_output` which was previously omitted.
+- 4 new tests in `test_spawn_auto_bootstrap.py` cover: cleanup-only
+  generation persisting to registry + writing the SKILL.md file, the
+  bootstrap-skill-unchanged invariant, the empty-block no-op path, and
+  the missing-block error path.
+
 ## [0.10.0] - 2026-05-17
 
 ### Added

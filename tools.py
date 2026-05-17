@@ -612,6 +612,18 @@ REGEN_BOOTSTRAP_SCHEMA: dict[str, Any] = {
 }
 
 
+REGEN_CLEANUP_SCHEMA: dict[str, Any] = {
+    "name": "oc_project_regenerate_cleanup",
+    "description": "Generate (or regenerate) ONLY the cleanup skill for a project, leaving the bootstrap skill untouched. Useful for projects registered before cleanup-skill support landed, or when you've customized the bootstrap and want a fresh cleanup that reverses it. Spawns a short-lived opencode introspection session that reads the existing bootstrap (if any) and the repo, then writes the per-project cleanup SKILL.md.",
+    "parameters": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"label": {"type": "string"}},
+        "required": ["label"],
+    },
+}
+
+
 SET_NOTIFY_TARGET_SCHEMA: dict[str, Any] = {
     "name": "oc_set_notify_target",
     "description": "Configure where heartbeats and question alerts are delivered: the gateway DM target (platform + chat_id) and/or the active notify sinks (any combination of cli, gateway, dashboard).",
@@ -874,6 +886,44 @@ def make_regen_bootstrap(rt: Runtime) -> Callable[..., Awaitable[str]]:
     return handler
 
 
+def make_regen_cleanup(rt: Runtime) -> Callable[..., Awaitable[str]]:
+    async def handler(args: dict, **_: Any) -> str:
+        label = args.get("label")
+        if not label:
+            return _err("label required")
+        project = rt.projects.get(label)
+        if not project:
+            return _err(f"unknown project: {label}")
+        repo_path = Path(project.repo_path)
+        if not (repo_path / ".git").exists():
+            return _err(f"project repo missing: {repo_path}")
+        throwaway = Path(tempfile.mkdtemp(prefix=f"oc-orch-gencleanup-{project.abbrev}-"))
+        try:
+            wt.create_worktree(repo_path, throwaway, branch=f"oc-orch-gencleanup-{project.abbrev}-{int(time.time())}", base=project.base_branch)
+        except wt.GitError as e:
+            shutil.rmtree(throwaway, ignore_errors=True)
+            return _err(f"throwaway worktree create failed: {e}")
+        try:
+            try:
+                rt.client.ensure_server()
+            except OpencodeError as e:
+                return _err(f"opencode server unavailable: {e}")
+            result = await bootstrap_mod.generate_cleanup_skill(rt.client, project, throwaway, rt.projects)
+            if not result.ok:
+                return _err(f"generation failed: {result.detail}")
+            updated = rt.projects.get(label)
+            return _ok({
+                "label": label,
+                "method": result.method,
+                "skill_detail": result.detail,
+                "cleanup_skill": updated.cleanup_skill if updated else None,
+                "bootstrap_skill_unchanged": True,
+            })
+        finally:
+            wt.remove_worktree(repo_path, throwaway, force=True)
+    return handler
+
+
 def all_tool_specs(rt: Runtime) -> list[dict[str, Any]]:
     return [
         {"name": "oc_project_add", "toolset": "hermes_opencode", "schema": PROJECT_ADD_SCHEMA, "handler": make_project_add(rt), "is_async": True, "emoji": "📁"},
@@ -893,6 +943,7 @@ def all_tool_specs(rt: Runtime) -> list[dict[str, Any]]:
         {"name": "oc_skip_review", "toolset": "hermes_opencode", "schema": SKIP_REVIEW_SCHEMA, "handler": make_skip_review(rt), "is_async": True, "emoji": "⏭️"},
         {"name": "oc_pr_status", "toolset": "hermes_opencode", "schema": PR_STATUS_SCHEMA, "handler": make_pr_status(rt), "is_async": True, "emoji": "🔗"},
         {"name": "oc_project_regenerate_bootstrap", "toolset": "hermes_opencode", "schema": REGEN_BOOTSTRAP_SCHEMA, "handler": make_regen_bootstrap(rt), "is_async": True, "emoji": "🧰"},
+        {"name": "oc_project_regenerate_cleanup", "toolset": "hermes_opencode", "schema": REGEN_CLEANUP_SCHEMA, "handler": make_regen_cleanup(rt), "is_async": True, "emoji": "🧹"},
         {"name": "oc_set_notify_target", "toolset": "hermes_opencode", "schema": SET_NOTIFY_TARGET_SCHEMA, "handler": make_set_notify_target(rt), "is_async": True, "emoji": "📡"},
         {"name": "oc_heartbeat_send_now", "toolset": "hermes_opencode", "schema": HEARTBEAT_NOW_SCHEMA, "handler": make_heartbeat_send_now(rt), "is_async": True, "emoji": "💓"},
     ]

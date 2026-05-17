@@ -46,13 +46,13 @@ def setup(subparser: argparse.ArgumentParser) -> None:
     subs = subparser.add_subparsers(dest="oco_command")
 
     list_p = subs.add_parser("list", help="List tracked agents (same as /oc list).")
-    list_p.add_argument("--all", "-a", dest="include_archived", action="store_true",
+    list_p.add_argument("--archived", "--all", "-a", dest="include_archived", action="store_true",
                         help="Also include archived (DONE > 12h) agents.")
 
     status_p = subs.add_parser("status", help="Show status for one or all agents.")
     status_p.add_argument("agent_id", nargs="?", default=None)
     status_p.add_argument("--json", dest="as_json", action="store_true", help="Emit raw JSON.")
-    status_p.add_argument("--all", "-a", dest="include_archived", action="store_true",
+    status_p.add_argument("--archived", "--all", "-a", dest="include_archived", action="store_true",
                           help="Include archived agents when listing all.")
 
     attach_p = subs.add_parser("attach", help="Print the last N lines of an agent transcript.")

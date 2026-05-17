@@ -94,7 +94,7 @@ class TestFmtList:
     def test_only_archived_hidden_returns_hint(self):
         archived = _agent(agent_id="ma/old", phase="DONE", archived=True)
         body = commands_mod._fmt_list([archived])
-        assert "--all" in body
+        assert "--archived" in body
 
     def test_failed_includes_error_continuation(self):
         body = commands_mod._fmt_list([_agent(phase="FAILED", last_error="reviewer staging: not a git repo")])
@@ -261,7 +261,7 @@ class TestOcListHandler:
         assert "ma/x" in out
         assert "EXECUTING" in out or "DONE" in out or "FAILED" in out
 
-    def test_all_flag_includes_archived(self, tmp_path: Path):
+    def test_archived_flag_includes_archived(self, tmp_path: Path):
         state = sys.modules["_oco_test_pkg.state"]
         store = state.AgentStore(tmp_path / "agents.json")
         store.add(_agent(agent_id="dp/live", project_label="dodo-payments", branch="dp/live"))
@@ -275,9 +275,10 @@ class TestOcListHandler:
         assert "dp/live" in out_default
         assert "dp/old" not in out_default
 
-        out_all = commands_mod.make_oc_list(_Stub())("--all")
-        assert "dp/live" in out_all
-        assert "dp/old" in out_all
+        for flag in ("--archived", "--all", "-a"):
+            out = commands_mod.make_oc_list(_Stub())(flag)
+            assert "dp/live" in out, f"flag={flag}"
+            assert "dp/old" in out, f"flag={flag}"
 
     def test_unknown_list_arg_returns_usage(self, tmp_path: Path):
         state = sys.modules["_oco_test_pkg.state"]

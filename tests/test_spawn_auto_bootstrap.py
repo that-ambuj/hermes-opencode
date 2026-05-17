@@ -148,3 +148,140 @@ class TestAutoBootstrapOnFirstSpawn:
             loop.close()
         assert res["ok"] is True, res
         assert call_count["n"] == 0
+
+
+class _CleanupGenStubClient:
+    def __init__(self, response_text: str) -> None:
+        self.response_text = response_text
+        self.created: list[Path] = []
+        self.sent: list[tuple[str, str]] = []
+        self.deleted: list[str] = []
+
+    def ensure_server(self) -> None:
+        return None
+
+    async def create_session(self, directory: Path, agent: str = "build") -> dict:
+        self.created.append(Path(directory))
+        return {"id": f"sess_cleanup_{len(self.created)}"}
+
+    async def send_message(self, session_id: str, directory: Path, text: str, timeout: float = 600.0) -> dict:
+        self.sent.append((session_id, text))
+        return {
+            "info": {"agent": "build", "finish": "stop"},
+            "parts": [{"type": "text", "text": self.response_text}],
+        }
+
+    async def wait_idle(self, session_id: str, directory: Path, timeout: float = 60.0) -> bool:
+        return True
+
+    async def delete_session(self, session_id: str, directory: Path) -> None:
+        self.deleted.append(session_id)
+
+
+class TestGenerateCleanupSkill:
+    def _project_and_registry(self, tmp_path: Path, git_repo: Path, with_bootstrap: bool):
+        cfg = config_mod.Config(
+            projects_file=tmp_path / "projects.json",
+            agents_file=tmp_path / "agents.json",
+            worktrees_root=tmp_path / "wt",
+            logs_dir=tmp_path / "logs",
+            notifications_file=tmp_path / "notifications.jsonl",
+        )
+        cfg.ensure_dirs()
+        projects = projects_mod.ProjectRegistry(cfg.projects_file)
+        projects.add(label="my-app", repo_path=git_repo)
+        if with_bootstrap:
+            projects.update("my-app", bootstrap_skill="hermes-opencode:ma-bootstrap")
+        return projects, projects.get("my-app")
+
+    def test_generates_cleanup_only_and_persists_to_registry(self, tmp_path: Path, git_repo: Path, monkeypatch):
+        projects, project = self._project_and_registry(tmp_path, git_repo, with_bootstrap=False)
+        monkeypatch.setattr(bootstrap_mod, "hermes_home", lambda: tmp_path / "hermes_home")
+        client = _CleanupGenStubClient(
+            response_text=(
+                "Inspecting the repo...\n\n"
+                "CLEANUP_BEGIN\n"
+                "docker compose down -v\n"
+                "rm -f .env\n"
+                "CLEANUP_END\n\n"
+                "BOOTSTRAP_RECOVERED\n"
+            )
+        )
+        throwaway = tmp_path / "throwaway"
+        throwaway.mkdir()
+        loop = asyncio.new_event_loop()
+        try:
+            result = loop.run_until_complete(
+                bootstrap_mod.generate_cleanup_skill(client, project, throwaway, projects)
+            )
+        finally:
+            loop.close()
+        assert result.ok is True
+        assert result.method == "opencode"
+        assert result.detail == "hermes-opencode:ma-bootstrap" or "cleanup" in result.detail
+        updated = projects.get("my-app")
+        assert updated.cleanup_skill == f"hermes-opencode:{project.abbrev}-cleanup"
+        skill_path = (tmp_path / "hermes_home" / "skills" / f"hermes-opencode__{project.abbrev}-cleanup" / "SKILL.md")
+        assert skill_path.exists()
+        body = skill_path.read_text(encoding="utf-8")
+        assert "docker compose down" in body
+        assert "rm -f .env" in body
+
+    def test_does_not_clobber_bootstrap(self, tmp_path: Path, git_repo: Path, monkeypatch):
+        projects, project = self._project_and_registry(tmp_path, git_repo, with_bootstrap=True)
+        monkeypatch.setattr(bootstrap_mod, "hermes_home", lambda: tmp_path / "hermes_home")
+        client = _CleanupGenStubClient(
+            response_text="CLEANUP_BEGIN\necho done\nCLEANUP_END\n\nBOOTSTRAP_RECOVERED\n"
+        )
+        throwaway = tmp_path / "throwaway2"
+        throwaway.mkdir()
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(
+                bootstrap_mod.generate_cleanup_skill(client, project, throwaway, projects)
+            )
+        finally:
+            loop.close()
+        updated = projects.get("my-app")
+        assert updated.bootstrap_skill == "hermes-opencode:ma-bootstrap"
+        assert updated.cleanup_skill == f"hermes-opencode:{project.abbrev}-cleanup"
+
+    def test_empty_cleanup_block_writes_noop_skill(self, tmp_path: Path, git_repo: Path, monkeypatch):
+        projects, project = self._project_and_registry(tmp_path, git_repo, with_bootstrap=False)
+        monkeypatch.setattr(bootstrap_mod, "hermes_home", lambda: tmp_path / "hermes_home")
+        client = _CleanupGenStubClient(
+            response_text="CLEANUP_BEGIN\n\nCLEANUP_END\n\nBOOTSTRAP_RECOVERED\n"
+        )
+        throwaway = tmp_path / "throwaway3"
+        throwaway.mkdir()
+        loop = asyncio.new_event_loop()
+        try:
+            result = loop.run_until_complete(
+                bootstrap_mod.generate_cleanup_skill(client, project, throwaway, projects)
+            )
+        finally:
+            loop.close()
+        assert result.ok is True
+        assert "no-op" in result.detail
+        updated = projects.get("my-app")
+        assert updated.cleanup_skill == f"hermes-opencode:{project.abbrev}-cleanup"
+
+    def test_missing_cleanup_block_returns_error(self, tmp_path: Path, git_repo: Path, monkeypatch):
+        projects, project = self._project_and_registry(tmp_path, git_repo, with_bootstrap=False)
+        monkeypatch.setattr(bootstrap_mod, "hermes_home", lambda: tmp_path / "hermes_home")
+        client = _CleanupGenStubClient(
+            response_text="Sorry, I couldn't figure it out.\n"
+        )
+        throwaway = tmp_path / "throwaway4"
+        throwaway.mkdir()
+        loop = asyncio.new_event_loop()
+        try:
+            result = loop.run_until_complete(
+                bootstrap_mod.generate_cleanup_skill(client, project, throwaway, projects)
+            )
+        finally:
+            loop.close()
+        assert result.ok is False
+        assert "CLEANUP_BEGIN" in result.detail
+        updated = projects.get("my-app")
+        assert updated.cleanup_skill is None
