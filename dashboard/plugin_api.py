@@ -6,7 +6,11 @@ notifications.jsonl). Destructive actions stay in the main tool surface.
 """
 from __future__ import annotations
 
+import asyncio
+import hmac
 import json
+import logging
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -22,14 +26,34 @@ except ImportError:
 
 
 try:
-    from fastapi import APIRouter
+    from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status as http_status
+    _FASTAPI_AVAILABLE = True
 except ImportError:
+    _FASTAPI_AVAILABLE = False
+
     class APIRouter:  # type: ignore[no-redef]
         def get(self, *_a, **_k):
             return lambda fn: fn
 
         def post(self, *_a, **_k):
             return lambda fn: fn
+
+        def websocket(self, *_a, **_k):
+            return lambda fn: fn
+
+    class WebSocket:  # type: ignore[no-redef]
+        pass
+
+    class WebSocketDisconnect(Exception):  # type: ignore[no-redef]
+        pass
+
+    class _StatusStub:
+        WS_1008_POLICY_VIOLATION = 1008
+
+    http_status = _StatusStub()  # type: ignore[assignment]
+
+
+log = logging.getLogger("opencode_orchestrator.dashboard")
 
 
 PLUGIN_NAME = "opencode-orchestrator"
@@ -150,3 +174,114 @@ async def history(n: int = 50) -> dict[str, Any]:
     records = _tail_jsonl(_state_dir() / "history.jsonl", n=n)
     records.sort(key=lambda r: r.get("archived_at") or 0, reverse=True)
     return {"items": records, "count": len(records)}
+
+
+def _check_ws_token(provided: str | None) -> bool:
+    expected = os.environ.get("HERMES_DASHBOARD_TOKEN")
+    if not expected:
+        return True
+    if not provided:
+        return False
+    return hmac.compare_digest(str(provided), str(expected))
+
+
+def _snapshot_payload() -> dict[str, Any]:
+    sd = _state_dir()
+    agents_data = _read_json(sd / "agents.json")
+    projects_data = _read_json(sd / "projects.json")
+    agents_rows = list(agents_data.values()) if isinstance(agents_data, dict) else []
+    agents_rows.sort(key=lambda r: r.get("last_activity_at") or 0, reverse=True)
+    projects_rows = list(projects_data.values()) if isinstance(projects_data, dict) else []
+    for r in projects_rows:
+        repo_path = r.get("repo_path")
+        if repo_path:
+            r["repo_exists"] = Path(repo_path).is_dir()
+    projects_rows.sort(key=lambda r: r.get("created_at") or 0, reverse=True)
+    return {"type": "snapshot", "agents": agents_rows, "projects": projects_rows}
+
+
+def _read_jsonl_since(path: Path, byte_offset: int) -> tuple[list[dict], int]:
+    if not path.exists():
+        return [], 0
+    try:
+        size = path.stat().st_size
+        if size <= byte_offset:
+            return [], size
+        with path.open("rb") as f:
+            f.seek(byte_offset)
+            chunk = f.read()
+        text = chunk.decode("utf-8", errors="replace")
+        items: list[dict] = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                items.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        return items, size
+    except OSError:
+        return [], byte_offset
+
+
+def _file_mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+@router.websocket("/events")
+async def events_ws(websocket: "WebSocket") -> None:
+    if not _FASTAPI_AVAILABLE:
+        return
+    token = websocket.query_params.get("token")
+    if not _check_ws_token(token):
+        await websocket.close(code=http_status.WS_1008_POLICY_VIOLATION)
+        return
+    await websocket.accept()
+    sd = _state_dir()
+    agents_path = sd / "agents.json"
+    notif_path = sd / "notifications.jsonl"
+    try:
+        await websocket.send_json(_snapshot_payload())
+    except Exception:
+        return
+    agents_mtime = _file_mtime(agents_path)
+    notif_offset = notif_path.stat().st_size if notif_path.exists() else 0
+    try:
+        while True:
+            try:
+                await asyncio.wait_for(websocket.receive_text(), timeout=1.0)
+            except asyncio.TimeoutError:
+                pass
+            except WebSocketDisconnect:
+                return
+            new_agents_mtime = _file_mtime(agents_path)
+            if new_agents_mtime != agents_mtime:
+                agents_mtime = new_agents_mtime
+                payload = _snapshot_payload()
+                try:
+                    await websocket.send_json({"type": "agents", "agents": payload["agents"]})
+                except Exception:
+                    return
+            items, new_offset = _read_jsonl_since(notif_path, notif_offset)
+            if items:
+                notif_offset = new_offset
+                try:
+                    await websocket.send_json({"type": "heartbeat", "items": items})
+                except Exception:
+                    return
+            elif new_offset != notif_offset:
+                notif_offset = new_offset
+    except WebSocketDisconnect:
+        return
+    except asyncio.CancelledError:
+        return
+    except Exception as e:
+        log.debug("events_ws error: %s", e)
+        try:
+            await websocket.close()
+        except Exception:
+            pass

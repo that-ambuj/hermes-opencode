@@ -216,6 +216,7 @@
       const [, setLoading] = React.useState(true);
       const [refreshing, setRefreshing] = React.useState(false);
       const [lastRefreshAt, setLastRefreshAt] = React.useState(null);
+      const [transport, setTransport] = React.useState("poll");
       const [selectedAgentId, setSelectedAgentId] = React.useState(null);
       const selectedAgent = React.useMemo(
         () => agents.find((a) => a.agent_id === selectedAgentId) || null,
@@ -244,9 +245,64 @@
       React.useEffect(
         function() {
           refresh();
-          const id = setInterval(refresh, 5e3);
+          let pollId = null;
+          let ws = null;
+          let connectedAt = 0;
+          let startedPolling = false;
+          function startPolling() {
+            if (startedPolling) return;
+            startedPolling = true;
+            setTransport("poll");
+            pollId = setInterval(refresh, 5e3);
+          }
+          try {
+            const token = window.__HERMES_SESSION_TOKEN__ || "";
+            const proto = location.protocol === "https:" ? "wss:" : "ws:";
+            const url = proto + "//" + location.host + "/api/plugins/opencode-orchestrator/events?token=" + encodeURIComponent(token);
+            ws = new WebSocket(url);
+            ws.onopen = function() {
+              connectedAt = Date.now();
+              setTransport("ws");
+            };
+            ws.onmessage = function(ev) {
+              try {
+                const msg = JSON.parse(ev.data);
+                if (!msg || !msg.type) return;
+                if (msg.type === "snapshot") {
+                  if (Array.isArray(msg.agents)) setAgents(msg.agents);
+                  if (Array.isArray(msg.projects)) setProjects(msg.projects);
+                  setLastRefreshAt(Date.now() / 1e3);
+                } else if (msg.type === "agents") {
+                  if (Array.isArray(msg.agents)) setAgents(msg.agents);
+                  setLastRefreshAt(Date.now() / 1e3);
+                } else if (msg.type === "heartbeat") {
+                  if (Array.isArray(msg.items)) {
+                    setHeartbeats(
+                      (prev) => msg.items.concat(prev || []).slice(0, 5)
+                    );
+                  }
+                  setLastRefreshAt(Date.now() / 1e3);
+                }
+              } catch (_) {
+              }
+            };
+            ws.onerror = function() {
+              if (Date.now() - connectedAt < 5e3) startPolling();
+            };
+            ws.onclose = function() {
+              if (Date.now() - connectedAt < 5e3) startPolling();
+            };
+          } catch (_) {
+            startPolling();
+          }
           return function() {
-            clearInterval(id);
+            if (pollId !== null) clearInterval(pollId);
+            if (ws) {
+              try {
+                ws.close();
+              } catch (_) {
+              }
+            }
           };
         },
         [refresh]
@@ -258,7 +314,7 @@
           refreshing,
           lastRefreshAt
         }
-      )), /* @__PURE__ */ React.createElement("div", { className: "oco-stats" }, /* @__PURE__ */ React.createElement("span", null, agents.length, " agent", agents.length === 1 ? "" : "s"), /* @__PURE__ */ React.createElement("span", { className: "oco-sep" }, "\xB7"), /* @__PURE__ */ React.createElement("span", null, projects.length, " project", projects.length === 1 ? "" : "s"), lastRefreshAt && /* @__PURE__ */ React.createElement("span", { className: "oco-sep" }, "\xB7"), lastRefreshAt && /* @__PURE__ */ React.createElement("span", { className: "oco-loading" }, "updated ", formatAge(lastRefreshAt), " ago")), error && /* @__PURE__ */ React.createElement("div", { className: "oco-error" }, error)), /* @__PURE__ */ React.createElement("section", { className: "oco-section" }, /* @__PURE__ */ React.createElement("h2", null, "Agents"), /* @__PURE__ */ React.createElement(AgentsTable, { agents, onSelect: setSelectedAgentId })), /* @__PURE__ */ React.createElement("section", { className: "oco-section" }, /* @__PURE__ */ React.createElement("h2", null, "Projects"), /* @__PURE__ */ React.createElement(ProjectsTable, { projects })), /* @__PURE__ */ React.createElement("section", { className: "oco-section" }, /* @__PURE__ */ React.createElement("h2", null, "Recent heartbeats"), /* @__PURE__ */ React.createElement(HeartbeatsList, { items: heartbeats })), selectedAgent && /* @__PURE__ */ React.createElement(
+      )), /* @__PURE__ */ React.createElement("div", { className: "oco-stats" }, /* @__PURE__ */ React.createElement("span", null, agents.length, " agent", agents.length === 1 ? "" : "s"), /* @__PURE__ */ React.createElement("span", { className: "oco-sep" }, "\xB7"), /* @__PURE__ */ React.createElement("span", null, projects.length, " project", projects.length === 1 ? "" : "s"), /* @__PURE__ */ React.createElement("span", { className: "oco-sep" }, "\xB7"), /* @__PURE__ */ React.createElement("span", { className: "oco-transport oco-transport-" + transport }, transport), lastRefreshAt && /* @__PURE__ */ React.createElement("span", { className: "oco-sep" }, "\xB7"), lastRefreshAt && /* @__PURE__ */ React.createElement("span", { className: "oco-loading" }, "updated ", formatAge(lastRefreshAt), " ago")), error && /* @__PURE__ */ React.createElement("div", { className: "oco-error" }, error)), /* @__PURE__ */ React.createElement("section", { className: "oco-section" }, /* @__PURE__ */ React.createElement("h2", null, "Agents"), /* @__PURE__ */ React.createElement(AgentsTable, { agents, onSelect: setSelectedAgentId })), /* @__PURE__ */ React.createElement("section", { className: "oco-section" }, /* @__PURE__ */ React.createElement("h2", null, "Projects"), /* @__PURE__ */ React.createElement(ProjectsTable, { projects })), /* @__PURE__ */ React.createElement("section", { className: "oco-section" }, /* @__PURE__ */ React.createElement("h2", null, "Recent heartbeats"), /* @__PURE__ */ React.createElement(HeartbeatsList, { items: heartbeats })), selectedAgent && /* @__PURE__ */ React.createElement(
         AgentDetailModal,
         {
           agent: selectedAgent,

@@ -8,7 +8,7 @@ them silently breaks behaviour the test suite doesn't cover.
 
 A hermes-agent plugin (Python, in-process) that orchestrates multiple
 opencode agents in git worktrees. Plugin loads at hermes startup, registers
-18 tools + 3 lifecycle hooks + 1 dashboard tab, spawns a singleton bg
+19 tools + 3 lifecycle hooks + 1 dashboard tab, spawns a singleton bg
 asyncio loop that drives a per-agent state machine through executor →
 reviewer → commit → PR_OPEN → DONE.
 
@@ -249,7 +249,7 @@ that need a live opencode (Phase 0 / 1 / 5 smoke scripts) live under
 | `worktree.py` | `git worktree` ops, `project_key_for`, `derive_abbrev`, `compose_agent_id`, `slugify` |
 | `projects.py` | `ProjectRegistry` over `projects.json` |
 | `state.py` | `AgentStore` over `agents.json`; `Agent` dataclass; `PHASES` set |
-| `tools.py` | 18 tool schemas + handlers + `all_tool_specs(rt)`; `Runtime` dataclass |
+| `tools.py` | 19 tool schemas + handlers + `all_tool_specs(rt)`; `Runtime` dataclass |
 | `event_loop.py` | Singleton bg asyncio loop + per-agent state machine + pruner + heartbeat scheduler |
 | `bootstrap.py` | Shell-bash extraction from skill SKILL.md; opencode-driven recovery on failure; `generate_bootstrap_skill` |
 | `reviewer.py` | Sister-worktree staging, `REVIEW: LGTM/REQUESTS_CHANGES` classifier, `finalize_and_open_pr` |

@@ -349,6 +349,7 @@
     const [, setLoading] = React.useState(true);
     const [refreshing, setRefreshing] = React.useState(false);
     const [lastRefreshAt, setLastRefreshAt] = React.useState(null);
+    const [transport, setTransport] = React.useState("poll");
     const [selectedAgentId, setSelectedAgentId] = React.useState(null);
     const selectedAgent = React.useMemo(
       () => agents.find((a) => a.agent_id === selectedAgentId) || null,
@@ -379,9 +380,70 @@
     React.useEffect(
       function () {
         refresh();
-        const id = setInterval(refresh, 5000);
+        let pollId = null;
+        let ws = null;
+        let connectedAt = 0;
+        let startedPolling = false;
+
+        function startPolling() {
+          if (startedPolling) return;
+          startedPolling = true;
+          setTransport("poll");
+          pollId = setInterval(refresh, 5000);
+        }
+
+        try {
+          const token = window.__HERMES_SESSION_TOKEN__ || "";
+          const proto = location.protocol === "https:" ? "wss:" : "ws:";
+          const url =
+            proto +
+            "//" +
+            location.host +
+            "/api/plugins/opencode-orchestrator/events?token=" +
+            encodeURIComponent(token);
+          ws = new WebSocket(url);
+          ws.onopen = function () {
+            connectedAt = Date.now();
+            setTransport("ws");
+          };
+          ws.onmessage = function (ev) {
+            try {
+              const msg = JSON.parse(ev.data);
+              if (!msg || !msg.type) return;
+              if (msg.type === "snapshot") {
+                if (Array.isArray(msg.agents)) setAgents(msg.agents);
+                if (Array.isArray(msg.projects)) setProjects(msg.projects);
+                setLastRefreshAt(Date.now() / 1000);
+              } else if (msg.type === "agents") {
+                if (Array.isArray(msg.agents)) setAgents(msg.agents);
+                setLastRefreshAt(Date.now() / 1000);
+              } else if (msg.type === "heartbeat") {
+                if (Array.isArray(msg.items)) {
+                  setHeartbeats((prev) =>
+                    msg.items.concat(prev || []).slice(0, 5)
+                  );
+                }
+                setLastRefreshAt(Date.now() / 1000);
+              }
+            } catch (_) {}
+          };
+          ws.onerror = function () {
+            if (Date.now() - connectedAt < 5000) startPolling();
+          };
+          ws.onclose = function () {
+            if (Date.now() - connectedAt < 5000) startPolling();
+          };
+        } catch (_) {
+          startPolling();
+        }
+
         return function () {
-          clearInterval(id);
+          if (pollId !== null) clearInterval(pollId);
+          if (ws) {
+            try {
+              ws.close();
+            } catch (_) {}
+          }
         };
       },
       [refresh]
@@ -405,6 +467,10 @@
             <span className="oco-sep">·</span>
             <span>
               {projects.length} project{projects.length === 1 ? "" : "s"}
+            </span>
+            <span className="oco-sep">·</span>
+            <span className={"oco-transport oco-transport-" + transport}>
+              {transport}
             </span>
             {lastRefreshAt && <span className="oco-sep">·</span>}
             {lastRefreshAt && (

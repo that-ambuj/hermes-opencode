@@ -43,10 +43,18 @@ plugins:
       pr:
         base_branch: main
       auto_spawn_server: true
+      review:
+        max_cycles: 1
+      bootstrap:
+        auto_on_first_spawn: true
 ```
 
 If `opencode_server.url` is unreachable and `auto_spawn_server: true`, the
 plugin will spawn `opencode serve` at the configured host/port on first use.
+`review.max_cycles` caps how many automatic address-and-rereview rounds the
+executor runs before COMMITTING. `bootstrap.auto_on_first_spawn` controls
+whether the first `oc_spawn` for a project with no skill triggers an
+automatic SKILL.md generation pass.
 
 ## Phase 1 tools
 
@@ -62,6 +70,7 @@ plugin will spawn `opencode serve` at the configured host/port on first use.
 | `oc_status` | Show one agent or all agents |
 | `oc_wait` | Block until an agent goes idle |
 | `oc_kill` | Abort agent's session, optionally prune worktree |
+| `oc_output` | Return the agent's latest assistant text from the live SSE buffer (with `/message` pull fallback) |
 
 ## Agent naming
 
@@ -72,6 +81,32 @@ Agent ids are `<abbrev>/<task>`, max 20 chars total:
   via `oc_project_add(abbrev=...)`.
 - `task` is caller-supplied and slugified to kebab-case.
 - Collisions append `-2`, `-3`, … with the task slug trimmed to fit.
+
+## Bootstrap
+
+When `oc_spawn` is called for a project whose `bootstrap_skill` is unset
+and `bootstrap.auto_on_first_spawn` is `true` (the default), the plugin
+creates a throwaway worktree on the project's base branch, spawns a
+one-shot opencode introspection session that reads the repo (`README.md`,
+`package.json`, `pyproject.toml`, `Makefile`, etc.) and writes a `SKILL.md`
+with an idempotent bash block, then tears the throwaway worktree down. The
+generated skill is registered under `opencode-orchestrator:<abbrev>-bootstrap`
+so subsequent spawns just run the bash block directly.
+
+If the auto-gen attempt fails the spawn returns an error and the project
+remains without a bootstrap skill (no partial state). You can also force
+a regeneration any time via `oc_project_regenerate_bootstrap`.
+
+## Dashboard
+
+The dashboard tab at `/opencode-agents` opens a WebSocket against
+`/api/plugins/opencode-orchestrator/events?token=...` on mount and receives
+an initial `snapshot` frame plus push `agents` / `heartbeat` deltas
+whenever `agents.json` or `notifications.jsonl` change on disk. If the
+WebSocket errors or closes within 5s of mount the React bundle falls back
+to the original 5s REST polling loop. A `ws` / `poll` transport indicator
+in the header shows which channel is active. Clicking any agent row opens
+a centered detail modal with the full agent record.
 
 ## Smoke test
 

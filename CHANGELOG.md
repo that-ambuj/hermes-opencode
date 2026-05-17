@@ -5,6 +5,47 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] — 2026-05-17
+
+### Added
+
+- **Configurable review cycles.** New `review.max_cycles` config (default `1`)
+  controls how many automatic address-and-rereview rounds the executor will
+  go through before transitioning straight to `COMMITTING`. Manual
+  `oc_review_again` calls also bump the per-agent `review_cycle_count` so the
+  cap is tracked across user-initiated retries.
+- **Auto bootstrap-skill generation on first spawn.** When `oc_spawn` is
+  called for a project that has no `bootstrap_skill` yet, the plugin now
+  spins up a one-shot opencode introspection session in a throwaway worktree
+  and generates a `SKILL.md` before the executor session starts. Gated by
+  `bootstrap.auto_on_first_spawn` (default `true`).
+- **`oc_output` tool + live SSE consumer.** A background per-agent task
+  subscribes to opencode's `GET /event` stream and accumulates
+  `message.part.delta` / `message.part.updated` text payloads into an
+  in-memory buffer. The new `oc_output` tool returns the buffered text (or
+  falls back to a `/message` pull when empty), with an optional `clear` flag
+  to reset the buffer after read. Tool count: 18 → 19.
+- **Dashboard live-events WebSocket.** New `/events` endpoint on the
+  dashboard router pushes an initial snapshot plus `agents` / `heartbeat`
+  deltas based on `agents.json` / `notifications.jsonl` mtime changes. The
+  React bundle now opens the WebSocket on mount, falls back to the existing
+  5s poll if the socket errors or closes within 5s, and shows a `ws` /
+  `poll` transport indicator in the header.
+- **PR title cleanup.** PR titles are now derived from the agent's task slug
+  via `_pr_title_from_agent_id` — collision suffixes (`-2`, `-3`, …) are
+  stripped, kebab is replaced with spaces, and the result is capitalized.
+  The pre-review staging commit also uses the cleaned title
+  (`chore: <title>` instead of `[wip] checkpoint before review`).
+
+### Rebased
+
+- Rebased on top of `0.3.4` (had originally branched off `0.3.1`). The PR
+  originally hand-edited `dashboard/dist/index.js`; per the convention
+  documented in `AGENTS.md`, those changes were translated into
+  `dashboard/src/index.jsx` and `dist/index.js` was regenerated via
+  `bun run build`. The `make_spawn` regression of the 0.3.2 fix
+  (`send_message` → `send_message_async`) was also corrected before merge.
+
 ## [0.3.4] — 2026-05-17
 
 ### Added
