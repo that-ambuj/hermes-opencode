@@ -1,4 +1,4 @@
-"""Hermes plugin: opencode-orchestrator.
+"""Hermes plugin: hermes-opencode.
 
 Registers a tool catalog, lifecycle hooks, and a background event loop that
 orchestrate multiple opencode agents running in git worktrees. Drives the
@@ -30,7 +30,7 @@ def _build_pre_llm_context() -> str | None:
     questions, permissions = event_loop.get_pending_snapshot()
     if not questions and not permissions:
         return None
-    lines: list[str] = ["[opencode-orchestrator] pending items awaiting the user:"]
+    lines: list[str] = ["[hermes-opencode] pending items awaiting the user:"]
     for agent_id, qs in questions.items():
         for entry in qs:
             qid = entry.get("id")
@@ -110,7 +110,7 @@ def register(ctx: Any) -> None:
     if callable(register_cli):
         register_cli(
             name="oco",
-            help="Drive opencode-orchestrator agents from the shell.",
+            help="Drive hermes-opencode agents from the shell.",
             setup_fn=cli_mod.setup,
             handler_fn=cli_mod.handler,
             description="list / status / attach / kill / projects without a hermes chat session.",

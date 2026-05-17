@@ -84,8 +84,8 @@ def stage_reviewer_worktree(
         cleaned = _pr_title_from_agent_id(executor.agent_id)
         wt._git(executor_worktree, "add", "-A")
         wt._git(
-            executor_worktree, "-c", "user.email=opencode-orchestrator@local",
-            "-c", "user.name=opencode-orchestrator",
+            executor_worktree, "-c", "user.email=hermes-opencode@local",
+            "-c", "user.name=hermes-opencode",
             "commit", "-m", f"chore: {cleaned}",
         )
     sister = reviewer_worktree_path(executor_worktree)
@@ -134,5 +134,5 @@ async def finalize_and_open_pr(
     pr.commit_and_push(worktree, cleaned_title, agent.branch)
     return pr.open_pr(
         worktree, base_branch=base_branch, title=cleaned_title,
-        body=f"Initial task:\n\n{agent.initial_prompt}\n\n---\nopened by opencode-orchestrator for `{agent.agent_id}`",
+        body=f"Initial task:\n\n{agent.initial_prompt}\n\n---\nopened by hermes-opencode for `{agent.agent_id}`",
     )

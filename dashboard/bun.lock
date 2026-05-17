@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "opencode-orchestrator-dashboard",
+      "name": "hermes-opencode-dashboard",
       "devDependencies": {
         "esbuild": "^0.23.0",
       },

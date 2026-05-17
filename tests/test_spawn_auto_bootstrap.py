@@ -94,7 +94,7 @@ class TestAutoBootstrapOnFirstSpawn:
 
         async def _stub_generate(client_, project, throwaway, registry, *, agent="build", timeout_sec=900.0):
             call_count["n"] += 1
-            registry.update(project.label, bootstrap_skill=f"opencode-orchestrator:{project.abbrev}-bootstrap")
+            registry.update(project.label, bootstrap_skill=f"hermes-opencode:{project.abbrev}-bootstrap")
             return bootstrap_mod.BootstrapResult(ok=True, method="opencode", skill_updated=True, detail="stub")
 
         async def _stub_run_project_bootstrap(client_, project, worktree, **kwargs):

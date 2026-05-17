@@ -1,6 +1,6 @@
-"""opencode-orchestrator dashboard backend.
+"""hermes-opencode dashboard backend.
 
-Mounted at /api/plugins/opencode-orchestrator/ by the hermes dashboard. Returns
+Mounted at /api/plugins/hermes-opencode/ by the hermes dashboard. Returns
 read-only views over the plugin's on-disk state (projects.json, agents.json,
 notifications.jsonl). Destructive actions stay in the main tool surface.
 """
@@ -53,10 +53,10 @@ except ImportError:
     http_status = _StatusStub()  # type: ignore[assignment]
 
 
-log = logging.getLogger("opencode_orchestrator.dashboard")
+log = logging.getLogger("hermes_opencode.dashboard")
 
 
-PLUGIN_NAME = "opencode-orchestrator"
+PLUGIN_NAME = "hermes-opencode"
 
 
 def _state_dir() -> Path:

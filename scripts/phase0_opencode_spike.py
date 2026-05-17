@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Phase 0 — opencode transport spike for the hermes-agent opencode-orchestrator plugin.
+Phase 0 — opencode transport spike for the hermes-agent hermes-opencode plugin.
 
 Verifies every HTTP contract the plugin will depend on:
   1. `opencode serve` is reachable (auto-spawns if missing).
@@ -281,7 +281,7 @@ async def run_spike(host: str, port: int, worktree: Path, prompt: str, agent: st
 
 def main() -> int:
     p = argparse.ArgumentParser(
-        description="Phase 0 transport spike for the opencode-orchestrator plugin."
+        description="Phase 0 transport spike for the hermes-opencode plugin."
     )
     p.add_argument("worktree", nargs="?", default=None, help="path to a worktree (defaults to a temp dir)")
     p.add_argument("--host", default="127.0.0.1")

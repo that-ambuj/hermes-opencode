@@ -1,5 +1,5 @@
 {
-  "name": "opencode-orchestrator",
+  "name": "hermes-opencode",
   "label": "Opencode Agents",
   "description": "Multi-agent worktree orchestration dashboard — live agent status, pending questions, heartbeats.",
   "icon": "Workflow",

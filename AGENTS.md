@@ -1,4 +1,4 @@
-# opencode-orchestrator — Developer Notes for AI Agents
+# hermes-opencode — Developer Notes for AI Agents
 
 Instructions for AI coding assistants working on this hermes-agent plugin.
 Read this **before** editing. Conventions here are load-bearing — violating
@@ -18,7 +18,7 @@ The plugin is loaded by hermes' `PluginManager` via
 `importlib.util.spec_from_file_location` with `submodule_search_locations`
 set to the repo root. Concretely:
 
-- `__init__.py` is loaded as `hermes_plugins.opencode_orchestrator`
+- `__init__.py` is loaded as `hermes_plugins.hermes_opencode`
 - Submodules use **relative imports only** (`from .config import Config`)
 - All `.py` files at the repo root form one package — do not put them in a
   subdirectory
@@ -111,7 +111,7 @@ sister worktree is torn down via `git worktree remove --force`.
 ## Atomic state writes
 
 `projects.json`, `agents.json`, `notifications.jsonl`, `history.jsonl`
-all live under `~/.hermes/plugins/opencode-orchestrator/`. JSON file
+all live under `~/.hermes/plugins/hermes-opencode/`. JSON file
 writes go through this pattern (see `projects.py::_write`):
 
 ```python
@@ -244,7 +244,7 @@ that need a live opencode (Phase 0 / 1 / 5 smoke scripts) live under
 | File | Owns |
 |---|---|
 | `__init__.py` | `register(ctx)` — entry point; wires tools + hooks + event loop + notify inject_message binding |
-| `config.py` | `Config` dataclass; reads plugin entry from `~/.hermes/config.yaml`; paths under `~/.hermes/plugins/opencode-orchestrator/` |
+| `config.py` | `Config` dataclass; reads plugin entry from `~/.hermes/config.yaml`; paths under `~/.hermes/plugins/hermes-opencode/` |
 | `transport.py` | `OpencodeClient` — async httpx wrapper around opencode HTTP API; both `send_message` (sync) and `send_message_async` (queue) |
 | `worktree.py` | `git worktree` ops, `project_key_for`, `derive_abbrev`, `compose_agent_id`, `slugify` |
 | `projects.py` | `ProjectRegistry` over `projects.json` |
@@ -257,7 +257,7 @@ that need a live opencode (Phase 0 / 1 / 5 smoke scripts) live under
 | `notify.py` | Sink fanout (CLI `inject_message`, gateway DM via `platform_registry.create_adapter`, dashboard JSONL append) |
 | `heartbeat.py` | Hourly report builder; phase glyphs; TZ-aware day window; `_format_age`; `next_top_of_hour` |
 | `dashboard/manifest.json` | Plugin manifest read by hermes' dashboard discovery |
-| `dashboard/plugin_api.py` | FastAPI router (READ-ONLY; mounted at `/api/plugins/opencode-orchestrator/`) |
+| `dashboard/plugin_api.py` | FastAPI router (READ-ONLY; mounted at `/api/plugins/hermes-opencode/`) |
 | `dashboard/src/index.jsx` | React frontend source |
 | `dashboard/dist/index.js` | Build output of `bun run build` — committed but DO NOT edit by hand |
 | `dashboard/dist/style.css` | Plain CSS (no build step) |

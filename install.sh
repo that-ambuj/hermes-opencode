@@ -8,7 +8,7 @@ set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HERMES_HOME="${HERMES_HOME:-${HOME}/.hermes}"
-TARGET_DIR="${HERMES_HOME}/plugins/opencode-orchestrator"
+TARGET_DIR="${HERMES_HOME}/plugins/hermes-opencode"
 
 if [[ ! -f "${REPO_DIR}/plugin.yaml" || ! -f "${REPO_DIR}/__init__.py" ]]; then
     echo "plugin.yaml or __init__.py not found at ${REPO_DIR}" >&2
@@ -26,8 +26,8 @@ ln -s "${REPO_DIR}" "${TARGET_DIR}"
 echo "linked ${TARGET_DIR} -> ${REPO_DIR}"
 echo
 echo "next: enable via"
-echo "  hermes plugins enable opencode-orchestrator"
+echo "  hermes plugins enable hermes-opencode"
 echo "or in ~/.hermes/config.yaml:"
 echo "  plugins:"
 echo "    enabled:"
-echo "      - opencode-orchestrator"
+echo "      - hermes-opencode"

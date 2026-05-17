@@ -27,7 +27,7 @@ class TestEventsWebsocket:
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         monkeypatch.delenv("HERMES_DASHBOARD_TOKEN", raising=False)
         module = _load_plugin_api(tmp_path)
-        state_dir = tmp_path / "plugins" / "opencode-orchestrator"
+        state_dir = tmp_path / "plugins" / "hermes-opencode"
         state_dir.mkdir(parents=True, exist_ok=True)
         (state_dir / "projects.json").write_text(json.dumps({}))
         agents_path = state_dir / "agents.json"
@@ -68,7 +68,7 @@ class TestEventsWebsocket:
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         monkeypatch.setenv("HERMES_DASHBOARD_TOKEN", "expected")
         module = _load_plugin_api(tmp_path)
-        state_dir = tmp_path / "plugins" / "opencode-orchestrator"
+        state_dir = tmp_path / "plugins" / "hermes-opencode"
         state_dir.mkdir(parents=True, exist_ok=True)
         (state_dir / "agents.json").write_text(json.dumps({}))
         (state_dir / "projects.json").write_text(json.dumps({}))

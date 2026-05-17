@@ -154,7 +154,7 @@ def make_oc_questions(runtime: "Runtime") -> Callable[[str], str]:
 
 
 _OC_HELP_TEXT = (
-    "/oc — opencode-orchestrator slash command\n"
+    "/oc — hermes-opencode slash command\n"
     "\n"
     "subcommands:\n"
     "  /oc list                              list tracked agents (id, project, branch, phase, pr, age)\n"

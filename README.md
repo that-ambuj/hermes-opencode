@@ -1,31 +1,49 @@
-# opencode-orchestrator
+# hermes-opencode
 
-A hermes-agent plugin that drives multiple opencode agents running in git worktrees.
-
-Status: **Phase 1** — project registry + spawn / send / status / wait / kill round trip.
-Phases 2–4 add the executor/reviewer cycle with PR automation, hourly heartbeat DMs,
-project bootstrap (with opencode-driven recovery), and a dashboard tab.
-
-## Install
-
-```bash
-# Recommended (canonical hermes path): clones repo into ~/.hermes/plugins/opencode-orchestrator/
-hermes plugins install <owner>/opencode-orchestrator
-
-# Local development: symlinks this checkout into ~/.hermes/plugins/opencode-orchestrator/
-./install.sh
-```
-
-Then enable it:
+A [hermes-agent](https://github.com/NousResearch/hermes-agent) plugin that drives multiple
+[opencode](https://opencode.ai) agents running in parallel git worktrees. Spawn an agent, hand it a
+verbatim prompt, and the plugin runs the full **executor → reviewer → PR** cycle in the background.
+Pull requests open via `gh`. Human-in-the-loop questions surface as hermes messages and route back
+to the right opencode session by inference. Hourly heartbeats and state-transition events keep you
+informed via your preferred channel (CLI, dashboard, or gateway DM).
 
 ```bash
-hermes plugins enable opencode-orchestrator
+hermes plugins install that-ambuj/hermes-opencode
+hermes plugins enable hermes-opencode
 ```
 
 ## Requirements
 
-- `opencode` binary on `PATH`
-- `httpx`, `httpx-sse`, `PyYAML` available in hermes' Python environment
+To run this plugin you need:
+
+|  | Requirement | Notes |
+|---|---|---|
+| 🐍 | **[hermes-agent](https://github.com/NousResearch/hermes-agent)** | Any modern version. Plugin loads in-process via the hermes plugin loader. |
+| 🤖 | **[opencode](https://opencode.ai) binary on `PATH`** | `curl -fsSL https://opencode.ai/install \| bash` — or any of the published distributions. |
+| 🔧 | **[`gh` CLI](https://cli.github.com/) authenticated** | `gh auth login` — used to open PRs and poll merge state. |
+| 🌿 | **`git ≥ 2.40`** | Worktree commands. |
+| 🦴 | **`httpx`, `httpx-sse`, `PyYAML`** in hermes' Python venv | Shipped with hermes-agent by default; install via `pip install -r requirements.txt` if missing. |
+
+For the dashboard tab to render (optional), you also need to be running hermes via
+`hermes dashboard`. The plugin's dashboard backend is read-only against on-disk state, so no extra
+auth setup beyond hermes' own dashboard session token.
+
+For executor/reviewer LLM calls, opencode brings its own auth (run `opencode auth login` once).
+Hermes brings its own (the LLM that powers `hermes chat` itself). The plugin doesn't need any
+provider credentials of its own.
+
+## Install (alternatives)
+
+```bash
+# canonical hermes plugin install — clones the repo into ~/.hermes/plugins/hermes-opencode/
+hermes plugins install that-ambuj/hermes-opencode
+
+# local dev — symlinks this checkout into ~/.hermes/plugins/hermes-opencode/
+./install.sh
+
+# then enable
+hermes plugins enable hermes-opencode
+```
 
 ## Configuration (optional)
 
@@ -34,9 +52,9 @@ hermes plugins enable opencode-orchestrator
 ```yaml
 plugins:
   enabled:
-    - opencode-orchestrator
+    - hermes-opencode
   entries:
-    opencode-orchestrator:
+    hermes-opencode:
       opencode_server:
         url: "http://127.0.0.1:4096"
         password: "${OPENCODE_SERVER_PASSWORD}"
@@ -120,7 +138,7 @@ creates a throwaway worktree on the project's base branch, spawns a
 one-shot opencode introspection session that reads the repo (`README.md`,
 `package.json`, `pyproject.toml`, `Makefile`, etc.) and writes a `SKILL.md`
 with an idempotent bash block, then tears the throwaway worktree down. The
-generated skill is registered under `opencode-orchestrator:<abbrev>-bootstrap`
+generated skill is registered under `hermes-opencode:<abbrev>-bootstrap`
 so subsequent spawns just run the bash block directly.
 
 If the auto-gen attempt fails the spawn returns an error and the project
@@ -130,7 +148,7 @@ a regeneration any time via `oc_project_regenerate_bootstrap`.
 ## Dashboard
 
 The dashboard tab at `/opencode-agents` opens a WebSocket against
-`/api/plugins/opencode-orchestrator/events?token=...` on mount and receives
+`/api/plugins/hermes-opencode/events?token=...` on mount and receives
 an initial `snapshot` frame plus push `agents` / `heartbeat` deltas
 whenever `agents.json` or `notifications.jsonl` change on disk. If the
 WebSocket errors or closes within 5s of mount the React bundle falls back
@@ -154,7 +172,7 @@ plugin loader to inject. Edit the source, not the build artifact:
 ```
 dashboard/
 ├── manifest.json
-├── plugin_api.py        # FastAPI router mounted at /api/plugins/opencode-orchestrator/
+├── plugin_api.py        # FastAPI router mounted at /api/plugins/hermes-opencode/
 ├── src/
 │   └── index.jsx        # CANONICAL SOURCE — edit here
 └── dist/
@@ -180,20 +198,28 @@ come from the host theme: `--color-foreground`, `--color-muted-foreground`,
 
 ## State
 
-Lives under `~/.hermes/plugins/opencode-orchestrator/`:
+Lives under `~/.hermes/plugins/hermes-opencode/`:
 
 - `projects.json` — registered projects
 - `agents.json` — live agents
 - `wt/<agent_id_fs>/` — git worktrees (one per agent; `/` in agent id encoded as `__`)
 - `logs/<agent_id_fs>.jsonl` — per-agent activity log
 
-## Roadmap
+## Status
 
-| Phase | Surface |
-|---|---|
-| 1 ✓ | Project registry + spawn/send/status/wait/kill |
-| 2 | SSE consumer · executor/reviewer cycle · PR open · pre-LLM-call question routing · `oc_answer`/`oc_review_*` tools |
-| 2.5 | ProjectBootstrap (shell + opencode-driven recovery + skill generation) |
-| 3 | Heartbeat DMs · CLI/gateway/dashboard sinks · 4h done retention |
-| 4 | FastAPI + React dashboard tab |
-| Slash & CLI commands ✓ | `/oc-list` / `/oc-attach` / `/oc-questions` slash commands · `hermes oco {list,status,attach,kill,projects}` CLI subcommand |
+All planned surfaces have shipped. See [CHANGELOG.md](./CHANGELOG.md) for the per-release notes.
+
+| ✓ | Surface | Shipped in |
+|---|---|---|
+| ✓ | Project registry + spawn / send / status / wait / kill round trip | v0.3.0 |
+| ✓ | Tool schemas correctly exposed to the LLM (description + parameters) | v0.3.1 |
+| ✓ | `oc_spawn` non-blocking via `/prompt_async` (no hermes session freeze) | v0.3.2 |
+| ✓ | Dashboard tab with theme-correct CSS + refresh button + React build pipeline | v0.3.3 |
+| ✓ | Click-to-inspect agent detail modal + AGENTS.md developer notes | v0.3.4 |
+| ✓ | Configurable review cycles · auto-bootstrap-skill generation · SSE-based `oc_output` · dashboard live-events WebSocket · clean PR titles | v0.4.0 |
+| ✓ | `/oc` slash command + `hermes oco` CLI subcommand | v0.5.0, refactored to subcommand-style in v0.7.0 |
+| ✓ | Graceful recovery when `gh pr create` finds an existing PR | v0.5.1 |
+| ✓ | Event notifications (`pr_opened`, `done`, `failed`, `awaiting_human`, `review_started`) + heartbeat scheduler resilience | v0.6.0 |
+| ✓ | Project renamed from `opencode-orchestrator` → `hermes-opencode` | v0.8.0 |
+
+Future work lives as GitHub issues. PRs welcome.

@@ -14,7 +14,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-logger = logging.getLogger("opencode_orchestrator.transport")
+logger = logging.getLogger("hermes_opencode.transport")
 
 
 class OpencodeError(RuntimeError):

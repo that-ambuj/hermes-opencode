@@ -25,7 +25,7 @@
       const token = window.__HERMES_SESSION_TOKEN__ || "";
       const headers = Object.assign({}, options && options.headers || {});
       if (token) headers["X-Hermes-Session-Token"] = token;
-      const res = await fetch("/api/plugins/opencode-orchestrator" + path, {
+      const res = await fetch("/api/plugins/hermes-opencode" + path, {
         ...options || {},
         headers
       });
@@ -258,7 +258,7 @@
           try {
             const token = window.__HERMES_SESSION_TOKEN__ || "";
             const proto = location.protocol === "https:" ? "wss:" : "ws:";
-            const url = proto + "//" + location.host + "/api/plugins/opencode-orchestrator/events?token=" + encodeURIComponent(token);
+            const url = proto + "//" + location.host + "/api/plugins/hermes-opencode/events?token=" + encodeURIComponent(token);
             ws = new WebSocket(url);
             ws.onopen = function() {
               connectedAt = Date.now();
@@ -322,6 +322,6 @@
         }
       ));
     }
-    window.__HERMES_PLUGINS__.register("opencode-orchestrator", OpencodeAgentsPage);
+    window.__HERMES_PLUGINS__.register("hermes-opencode", OpencodeAgentsPage);
   })();
 })();

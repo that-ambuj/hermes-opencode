@@ -4,7 +4,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-PLUGIN_NAME = "opencode-orchestrator"
+PLUGIN_NAME = "hermes-opencode"
 DEFAULT_SERVER_URL = "http://127.0.0.1:4096"
 
 

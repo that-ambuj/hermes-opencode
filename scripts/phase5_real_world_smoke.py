@@ -119,7 +119,7 @@ async def run(opencode_port, sandbox_repo: Path):
         log("oc_spawn (tiny task)")
         prompt = (
             "Create a file named `phase5-marker.md` in this worktree with exactly "
-            "this single-line content: `opencode-orchestrator phase-5 smoke marker`. "
+            "this single-line content: `hermes-opencode phase-5 smoke marker`. "
             "Do not commit. Do not modify any other file. When done, briefly say "
             "'marker created'."
         )
@@ -168,7 +168,7 @@ async def run(opencode_port, sandbox_repo: Path):
             try:
                 subprocess.run(
                     ["gh", "pr", "close", str(pr_number), "--delete-branch",
-                     "--comment", "smoke test cleanup", "--repo", "that-ambuj/opencode-orchestrator-smoke"],
+                     "--comment", "smoke test cleanup", "--repo", "that-ambuj/hermes-opencode-smoke"],
                     cwd=sandbox_repo, capture_output=True, text=True, timeout=30, check=False,
                 )
                 log(f"closed PR #{pr_number}")

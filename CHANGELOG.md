@@ -5,6 +5,48 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] — 2026-05-17
+
+### Changed (breaking)
+
+- **Project renamed from `opencode-orchestrator` to `hermes-opencode`.**
+  Matches the convention used by other hermes plugins (`hermes-achievements`,
+  `hermes-claude-auth`, etc.) and makes the install command read naturally:
+
+      hermes plugins install that-ambuj/hermes-opencode
+
+  All `opencode-orchestrator` references in code, manifests, JSON / YAML
+  config keys, dashboard mount paths, install symlink targets, and skill
+  namespaces become `hermes-opencode` (kebab) or `hermes_opencode` (snake).
+  Tool prefixes (`oc_*`), slash command (`/oc`), and CLI subcommand
+  (`hermes oco`) stay unchanged — those refer to *opencode* (the agent we
+  drive), not the plugin name.
+
+  **Migration for existing installs:**
+
+      mv ~/.hermes/plugins/opencode-orchestrator ~/.hermes/plugins/hermes-opencode
+
+  Then in `~/.hermes/config.yaml`, rename the key:
+
+      plugins:
+        entries:
+          opencode-orchestrator:  →  hermes-opencode:
+            …
+
+  And replace `plugins.enabled: [opencode-orchestrator]` with
+  `[hermes-opencode]`. The GitHub repo was renamed via `gh repo rename`
+  which keeps redirects, so old install URLs continue to resolve.
+
+### Cleaned up
+
+- README "Roadmap" section replaced with a "Status" table marking each
+  shipped surface ✓ against the release it landed in. The intro paragraph
+  now opens with a one-line elevator pitch and the canonical
+  `hermes plugins install …` snippet.
+- README "Requirements" section expanded to match the omo plugin's
+  table-with-glyphs format: hermes-agent, opencode binary, `gh` CLI,
+  git ≥ 2.40, Python deps. Each item links to its source.
+
 ## [0.7.0] — 2026-05-17
 
 ### Changed (breaking)
@@ -43,10 +85,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Each event is gated by `notify.events.enabled` in the plugin config
   (default: all five kinds enabled). Events fan out to the same sinks as
   the heartbeat (`cli` / `gateway` / `dashboard`) and ALSO get logged
-  unconditionally to `~/.hermes/plugins/opencode-orchestrator/events.log`
+  unconditionally to `~/.hermes/plugins/hermes-opencode/events.log`
   as newline-delimited JSON for diagnostics.
 - **`events.log` diagnostic sink** at
-  `~/.hermes/plugins/opencode-orchestrator/events.log`. Every event the
+  `~/.hermes/plugins/hermes-opencode/events.log`. Every event the
   plugin emits is appended regardless of which user-facing sinks are
   configured, so `tail -f` on it gives a complete view even when no
   gateway DM target is set up yet. Each line is JSON:
@@ -118,7 +160,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   state so it works with no in-process event loop.
 - **`config.load_entry_config()`** extracted from `__init__.py` so both
   `__init__.py` (in-session) and `cli.py` (out-of-session) can read the
-  same `plugins.entries.opencode-orchestrator` config without a circular
+  same `plugins.entries.hermes-opencode` config without a circular
   import.
 
 ### Rebased
@@ -327,4 +369,4 @@ git worktrees, driven from a hermes-agent session.
   when oh-my-openagent is installed. The plugin's executor/reviewer
   distinction lives in the plugin's `agent_id` layer and is unaffected.
 
-[0.3.0]: https://github.com/that-ambuj/opencode-orchestrator/releases/tag/v0.3.0
+[0.3.0]: https://github.com/that-ambuj/hermes-opencode/releases/tag/v0.3.0

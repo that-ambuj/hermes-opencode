@@ -13,7 +13,7 @@ from .state import Agent
 if TYPE_CHECKING:
     from .tools import Runtime
 
-logger = logging.getLogger("opencode_orchestrator.heartbeat")
+logger = logging.getLogger("hermes_opencode.heartbeat")
 
 TERMINAL_PHASES = {"DONE", "KILLED", "FAILED"}
 PR_OPEN_PHASES = {"PR_OPEN"}

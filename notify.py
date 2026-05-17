@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-logger = logging.getLogger("opencode_orchestrator.notify")
+logger = logging.getLogger("hermes_opencode.notify")
 
 
 @dataclass
@@ -28,7 +28,7 @@ def set_inject_message(callback: Callable[..., bool] | None) -> None:
 def _send_cli(title: str, body: str, _meta: dict[str, Any]) -> NotifyResult:
     if _inject_message is None:
         return NotifyResult("cli", False, "no inject_message bound (plugin not in CLI context)")
-    payload = f"[opencode-orchestrator] {title}\n{body}"
+    payload = f"[hermes-opencode] {title}\n{body}"
     try:
         ok = _inject_message(content=payload, role="user")
     except TypeError:

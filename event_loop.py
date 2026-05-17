@@ -19,7 +19,7 @@ from .transport import OpencodeError
 if TYPE_CHECKING:
     from .tools import Runtime
 
-logger = logging.getLogger("opencode_orchestrator.event_loop")
+logger = logging.getLogger("hermes_opencode.event_loop")
 
 TERMINAL_PHASES = {"DONE", "KILLED", "FAILED"}
 IDLE_DEBOUNCE_SEC = 30.0
