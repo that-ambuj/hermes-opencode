@@ -40,57 +40,61 @@ def _agent(**overrides):
     return state_mod.Agent(**defaults)
 
 
-class TestFmtTable:
+class TestFmtList:
     def test_empty_returns_no_agents_tracked(self):
-        assert commands_mod._fmt_table([]) == "no agents tracked"
+        assert commands_mod._fmt_list([]) == "no agents tracked"
 
-    def test_header_row_present(self):
-        body = commands_mod._fmt_table([_agent()])
+    def test_no_header_row(self):
+        body = commands_mod._fmt_list([_agent()])
+        assert "agent_id" not in body
+        assert not body.startswith("-")
+
+    def test_phase_glyph_present(self):
+        body = commands_mod._fmt_list([_agent(phase="EXECUTING")])
         first = body.splitlines()[0]
-        for col in ("agent_id", "project", "branch", "phase", "pr", "age"):
-            assert col in first
+        assert "▶" in first
 
-    def test_separator_under_header(self):
-        body = commands_mod._fmt_table([_agent()])
-        lines = body.splitlines()
-        assert lines[1].strip().startswith("-")
-        assert "-" * 4 in lines[1]
-
-    def test_columns_align_across_rows(self):
-        a1 = _agent(agent_id="dp/x", project_label="dodo-payments", branch="dp/x", phase="PR_OPEN", pr_number=42)
+    def test_primary_line_per_agent(self):
+        a1 = _agent(agent_id="dp/x", project_label="dodo-payments", branch="dp/x", phase="PR_OPEN", pr_number=42, pr_url="https://example.test/pr/42")
         a2 = _agent(agent_id="ma/longer-name", project_label="my-app", branch="ma/longer-name", phase="EXECUTING")
-        body = commands_mod._fmt_table([a1, a2], now_ts=a1.last_activity_at)
-        lines = body.splitlines()
-        assert len(lines) == 4
-        widths = [len(line) for line in lines if line]
-        assert max(widths) - min(widths) <= 2
+        body = commands_mod._fmt_list([a1, a2], now_ts=a1.last_activity_at)
+        assert "dp/x" in body and "ma/longer-name" in body
+        assert "PR_OPEN" in body and "EXECUTING" in body
+        assert "PR #42" in body
+        assert "example.test/pr/42" in body
 
-    def test_pr_dash_when_no_pr(self):
-        body = commands_mod._fmt_table([_agent()])
-        rows = body.splitlines()[2:]
-        assert any("  -  " in r or r.rstrip().endswith(" -") or " - " in r for r in rows)
+    def test_pr_omitted_when_no_pr(self):
+        body = commands_mod._fmt_list([_agent()])
+        assert "PR #" not in body
 
     def test_pr_number_shown_when_present(self):
-        body = commands_mod._fmt_table([_agent(pr_number=123)])
-        assert "123" in body
+        body = commands_mod._fmt_list([_agent(pr_number=123, phase="PR_OPEN", pr_url="https://x.test/pr/123")])
+        assert "PR #123" in body
+        assert "x.test/pr/123" in body
+
+    def test_failed_includes_error_continuation(self):
+        body = commands_mod._fmt_list([_agent(phase="FAILED", last_error="reviewer staging: not a git repo")])
+        assert "FAILED" in body
+        assert "reviewer staging" in body
+        assert body.splitlines()[1].startswith("    error:")
 
     def test_age_seconds(self):
         a = _agent()
         a.last_activity_at = time.time() - 5
-        body = commands_mod._fmt_table([a])
+        body = commands_mod._fmt_list([a])
         assert "5s" in body or "4s" in body or "6s" in body
 
     def test_age_minutes(self):
         a = _agent()
         a.last_activity_at = time.time() - 125
-        body = commands_mod._fmt_table([a], now_ts=a.last_activity_at + 125)
+        body = commands_mod._fmt_list([a], now_ts=a.last_activity_at + 125)
         assert "2m" in body
 
     def test_age_hours(self):
         a = _agent()
         now = time.time()
         a.last_activity_at = now - 3 * 3600 - 30 * 60
-        body = commands_mod._fmt_table([a], now_ts=now)
+        body = commands_mod._fmt_list([a], now_ts=now)
         assert "3h" in body
 
 
@@ -231,7 +235,7 @@ class TestOcListHandler:
         out = commands_mod.make_oc_list(_Stub())("")
         assert "dp/refunds" in out
         assert "ma/x" in out
-        assert "agent_id" in out.splitlines()[0]
+        assert "EXECUTING" in out or "DONE" in out or "FAILED" in out
 
 
 class TestOcDispatcher:

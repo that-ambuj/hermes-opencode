@@ -19,6 +19,7 @@ class Project:
     repo_path: str
     base_branch: str = "main"
     bootstrap_skill: str | None = None
+    cleanup_skill: str | None = None
     created_at: float = field(default_factory=time.time)
 
 
@@ -65,6 +66,7 @@ class ProjectRegistry:
     def add(
         self, label: str, repo_path: Path, base_branch: str = "main",
         abbrev: str | None = None, bootstrap_skill: str | None = None,
+        cleanup_skill: str | None = None,
     ) -> Project:
         repo_path = repo_path.expanduser().resolve()
         if not repo_path.is_dir():
@@ -90,6 +92,7 @@ class ProjectRegistry:
                 repo_path=str(repo_path),
                 base_branch=base_branch,
                 bootstrap_skill=bootstrap_skill,
+                cleanup_skill=cleanup_skill,
             )
             d[label] = asdict(project)
             self._write(d)

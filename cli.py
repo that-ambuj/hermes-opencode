@@ -85,7 +85,7 @@ def handler(args: argparse.Namespace) -> int:
 def cmd_list(args: argparse.Namespace) -> int:
     ctx = build_context()
     agents = sorted(ctx.agents.list(), key=lambda a: a.created_at)
-    print(commands_mod._fmt_table(agents))
+    print(commands_mod._fmt_list(agents))
     return 0
 
 
@@ -109,7 +109,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         rows = [asdict(a) for a in agents]
         print(json.dumps({"agents": rows, "count": len(rows)}, default=str, indent=2))
         return 0
-    print(commands_mod._fmt_table(agents))
+    print(commands_mod._fmt_list(agents))
     return 0
 
 

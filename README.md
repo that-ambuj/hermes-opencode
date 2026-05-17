@@ -98,9 +98,10 @@ round-trip — they call into the plugin directly.
 | Command | Purpose |
 |---|---|
 | `/oc` | Print help for the `/oc` slash command (lists all subcommands). |
-| `/oc list` | Pretty-printed table of all tracked agents (agent_id, project, branch, phase, pr, age). |
+| `/oc list` | One-line-per-agent status (renders cleanly on iMessage / Slack / Discord; phase glyph + age + pr; indented continuation for failures / merged PRs). |
 | `/oc attach <agent_id> [--lines N]` | Print the last N lines (default 80) of an agent's accumulated transcript. |
 | `/oc questions` | List every pending opencode question, with structured options surfaced inline. |
+| `/oc doctor` | Single-message plugin health report (versions, bg loop, deps, state files, last events) — paste into bug reports. |
 
 ## CLI subcommand
 
@@ -144,6 +145,16 @@ so subsequent spawns just run the bash block directly.
 If the auto-gen attempt fails the spawn returns an error and the project
 remains without a bootstrap skill (no partial state). You can also force
 a regeneration any time via `oc_project_regenerate_bootstrap`.
+
+The same introspection session also emits a matching **cleanup skill** at
+`~/.hermes/skills/hermes-opencode:<abbrev>-cleanup/SKILL.md` that inverses
+the bootstrap's side effects (stop docker-compose services, drop
+ephemeral databases, remove generated `.env` files, etc.). It runs
+automatically before the worktree is removed — both when the PR merges
+(DONE transition) and when you call `oc_kill --remove-worktree`. Cleanup
+failures are logged but don't block teardown. Projects whose bootstrap
+was authored manually have no cleanup until you regenerate via
+`oc_project_regenerate_bootstrap`.
 
 ## Dashboard
 

@@ -5,6 +5,67 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] — 2026-05-17
+
+### Added
+
+- **`/oc doctor` slash command** — single-message plugin health report.
+  Lists plugin version, state directory, opencode server url, bg event-
+  loop liveness, project / agent / pending counts, notify sink + gateway
+  target + events config, heartbeat schedule, binary presence (opencode,
+  gh, git, bun), Python dep presence (httpx, httpx-sse, yaml), state-file
+  sizes, and a tail of the last few `events.log` entries. Designed to
+  produce a single paste-able report for triaging.
+- **Cleanup loop running every 12 hours.** New `_cleanup_loop` task on
+  the bg event-loop performs four housekeeping passes:
+  - truncate `events.log` to the last 5000 lines
+  - truncate `notifications.jsonl` to the last 1000 lines
+  - drop `history.jsonl` entries older than 30 days (based on
+    `archived_at` / `done_at`)
+  - remove orphan worktrees under `wt/` whose name no longer matches any
+    live agent's filesystem slug
+- **Per-project cleanup skill, auto-generated alongside bootstrap.** When
+  `bootstrap.generate_bootstrap_skill` runs for the first time on a new
+  project it now asks the opencode introspection session to emit BOTH a
+  bootstrap block AND a matching cleanup block that inverses the
+  bootstrap's side effects (stop docker compose services started by
+  bootstrap, drop ephemeral databases, remove generated `.env` files,
+  etc.). The cleanup script is written to
+  `~/.hermes/skills/hermes-opencode:<abbrev>-cleanup/SKILL.md` and the
+  cleanup-skill reference is stored on the project record as
+  `cleanup_skill`. If the introspection session emits an empty cleanup
+  block (nothing worth reversing), no cleanup skill is written and the
+  field stays `None`.
+- **Cleanup skill runs before worktree removal** in two places:
+  - `_phase_pr_open` when the PR merges and the agent transitions to
+    `DONE`. Failure of the cleanup is logged but doesn't block worktree
+    removal — teardown is best-effort.
+  - `oc_kill` when `remove_worktree=True`. Cleanup failure is recorded
+    in the tool result's `errors` field but doesn't block teardown.
+
+### Changed
+
+- **`/oc list` output reformatted from a column-aligned ASCII table to
+  flow-oriented per-agent lines** — works equally well in CLI, iMessage,
+  Slack, and Discord (none of which render fixed-width ASCII tables
+  consistently). Pattern lifted from `eng-task-system`:
+    `<glyph> <agent_id> · <PHASE> · <age> [· PR #N]`
+  with an indented continuation line for `FAILED` (error), `PR_OPEN`
+  (url), and `DONE` (merged + url). Phase glyphs:
+  ▶ executing · ⏸ idle · 🔎 reviewing · 💾 committing · 🔗 PR open ·
+  ✓ done · ✗ failed · 🛑 killed.
+
+### Notes
+
+- The cleanup skill is only AUTO-generated when the plugin spawns the
+  introspection session itself (i.e. on first `oc_spawn` for a project
+  with no `bootstrap_skill`). Projects whose bootstrap skill was
+  configured manually have `cleanup_skill=None` until you either
+  (a) run `oc_project_regenerate_bootstrap` (which regenerates both),
+  or (b) manually write
+  `~/.hermes/skills/hermes-opencode:<abbrev>-cleanup/SKILL.md` and call
+  `oc_project_set_repo_path` or edit `projects.json` to set the field.
+
 ## [0.8.0] — 2026-05-17
 
 ### Changed (breaking)

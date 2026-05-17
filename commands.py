@@ -30,24 +30,55 @@ def _format_age(seconds: float) -> str:
     return f"{d}d{h:02d}h"
 
 
-def _fmt_table(agents: list["Agent"], now_ts: float | None = None) -> str:
+_PHASE_GLYPH = {
+    "EXECUTING": "▶",
+    "EXECUTOR_ADDRESSING": "▶",
+    "IDLE_TASK_COMPLETE": "⏸",
+    "IDLE_REVIEW_ADDRESSED": "⏸",
+    "REVIEW_SPAWNING": "🔎",
+    "REVIEWING": "🔎",
+    "REVIEW_DELIVERED": "🔎",
+    "COMMITTING": "💾",
+    "PR_OPEN": "🔗",
+    "DONE": "✓",
+    "FAILED": "✗",
+    "KILLED": "🛑",
+}
+
+
+def _fmt_list(agents: list["Agent"], now_ts: float | None = None) -> str:
+    """Channel-agnostic flow-oriented list — works in CLI and gateway alike.
+
+    Pattern lifted from eng-task-system: one primary line per agent with `·`
+    separators, plus an indented continuation line for states that carry
+    attention-worthy context (last_error, PR url, pending question hint).
+    No fixed-width column padding — iMessage / Slack / Discord render
+    proportional fonts that collapse columns.
+    """
     if not agents:
         return "no agents tracked"
     now_ts = now_ts if now_ts is not None else time.time()
-    headers = ("agent_id", "project", "branch", "phase", "pr", "age")
-    rows: list[tuple[str, ...]] = [headers]
+    blocks: list[str] = []
     for a in agents:
-        pr = str(a.pr_number) if a.pr_number else "-"
+        glyph = _PHASE_GLYPH.get(a.phase, "•")
         age = _format_age(now_ts - a.last_activity_at)
-        rows.append((a.agent_id, a.project_label, a.branch, a.phase, pr, age))
-    widths = [max(len(r[i]) for r in rows) for i in range(len(headers))]
-    lines = []
-    for idx, row in enumerate(rows):
-        line = "  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row)).rstrip()
-        lines.append(line)
-        if idx == 0:
-            lines.append("  ".join("-" * w for w in widths))
-    return "\n".join(lines)
+        parts = [f"{glyph} {a.agent_id}", a.phase, age]
+        if a.pr_number:
+            parts.append(f"PR #{a.pr_number}")
+        primary = " · ".join(parts)
+        cont = _continuation_line(a)
+        blocks.append(primary if not cont else f"{primary}\n    {cont}")
+    return "\n".join(blocks)
+
+
+def _continuation_line(a: "Agent") -> str | None:
+    if a.phase == "FAILED" and a.last_error:
+        return f"error: {a.last_error[:160]}"
+    if a.phase == "PR_OPEN" and a.pr_url:
+        return a.pr_url
+    if a.phase == "DONE" and a.pr_url:
+        return f"merged · {a.pr_url}"
+    return None
 
 
 def _join_buffer_text(items: list[dict], lines: int) -> str:
@@ -101,8 +132,115 @@ def _parse_oc_attach_args(raw_args: str) -> tuple[str | None, int, str | None]:
 def make_oc_list(runtime: "Runtime") -> Callable[[str], str]:
     def handler(raw_args: str) -> str:
         agents = sorted(runtime.agents.list(), key=lambda a: a.created_at)
-        return _fmt_table(agents)
+        return _fmt_list(agents)
     return handler
+
+
+def make_oc_doctor(runtime: "Runtime") -> Callable[[str], str]:
+    def handler(raw_args: str) -> str:
+        return _fmt_doctor(runtime)
+    return handler
+
+
+def _fmt_doctor(runtime: "Runtime") -> str:
+    from . import event_loop as eloop
+    import importlib.util
+    import shutil as shutil_mod
+
+    cfg = runtime.config
+    agents = runtime.agents.list()
+    projects = runtime.projects.list()
+    phase_counts: dict[str, int] = {}
+    for a in agents:
+        phase_counts[a.phase] = phase_counts.get(a.phase, 0) + 1
+    questions, permissions = eloop.get_pending_snapshot()
+    pending_q_count = sum(len(v) for v in questions.values())
+    pending_p_count = sum(len(v) for v in permissions.values())
+
+    lines: list[str] = ["plugin health · hermes-opencode"]
+
+    plugin_version = "?"
+    try:
+        import yaml
+        manifest = yaml.safe_load((cfg.projects_file.parent.parent.parent / "config.yaml").read_text()) or {}
+    except Exception:
+        manifest = {}
+    try:
+        from . import __file__ as init_path  # type: ignore
+        import yaml
+        plug_yaml = Path(init_path).parent / "plugin.yaml"
+        if plug_yaml.exists():
+            plugin_version = (yaml.safe_load(plug_yaml.read_text()) or {}).get("version", "?")
+    except Exception:
+        pass
+
+    lines.append(f"  version              · {plugin_version}")
+    lines.append(f"  state dir            · {cfg.projects_file.parent}")
+    lines.append(f"  opencode server      · {cfg.server_url}")
+
+    bg_alive = eloop._thread is not None and eloop._thread.is_alive()
+    lines.append(f"  bg event loop alive  · {'yes' if bg_alive else 'NO'}")
+
+    lines.append(f"  projects registered  · {len(projects)}")
+    if phase_counts:
+        phase_summary = ", ".join(f"{p}={n}" for p, n in sorted(phase_counts.items()))
+        lines.append(f"  agents               · {len(agents)} ({phase_summary})")
+    else:
+        lines.append(f"  agents               · 0")
+    lines.append(f"  pending questions    · {pending_q_count}")
+    lines.append(f"  pending permissions  · {pending_p_count}")
+
+    sinks = ",".join(cfg.notify_sinks) or "(none)"
+    target = "(unset)"
+    if cfg.notify_gateway_platform and cfg.notify_gateway_chat_id:
+        target = f"{cfg.notify_gateway_platform}:{cfg.notify_gateway_chat_id}"
+    elif cfg.notify_gateway_platform or cfg.notify_gateway_chat_id:
+        target = f"{cfg.notify_gateway_platform or '?'}:{cfg.notify_gateway_chat_id or '?'}"
+    lines.append(f"  notify sinks         · {sinks}")
+    lines.append(f"  notify gateway       · {target}")
+    lines.append(f"  notify events        · {','.join(sorted(cfg.notify_events))}")
+    lines.append(
+        f"  heartbeat            · enabled={cfg.heartbeat_enabled} "
+        f"window={cfg.heartbeat_day_start}-{cfg.heartbeat_day_end} tz={cfg.heartbeat_timezone or '(system)'}"
+    )
+
+    deps = []
+    deps.append(("opencode", shutil_mod.which("opencode")))
+    deps.append(("gh", shutil_mod.which("gh")))
+    deps.append(("git", shutil_mod.which("git")))
+    deps.append(("bun", shutil_mod.which("bun")))
+    for name, path in deps:
+        lines.append(f"  binary {name:<14} · {path or 'MISSING (PATH)'}")
+    for mod_name in ("httpx", "httpx_sse", "yaml"):
+        ok = importlib.util.find_spec(mod_name) is not None
+        lines.append(f"  python {mod_name:<14} · {'ok' if ok else 'MISSING'}")
+
+    state_files = [
+        ("projects.json", cfg.projects_file),
+        ("agents.json", cfg.agents_file),
+        ("notifications.jsonl", cfg.notifications_file),
+        ("events.log", cfg.events_log),
+    ]
+    for label, p in state_files:
+        if p.exists():
+            try:
+                size = p.stat().st_size
+                lines.append(f"  file {label:<20} · {size} bytes")
+            except OSError:
+                lines.append(f"  file {label:<20} · (unreadable)")
+        else:
+            lines.append(f"  file {label:<20} · (absent)")
+
+    if cfg.events_log.exists():
+        try:
+            tail_lines = cfg.events_log.read_text(encoding="utf-8").splitlines()[-3:]
+            if tail_lines:
+                lines.append("  last events:")
+                for ln in tail_lines:
+                    lines.append(f"    {ln[:160]}")
+        except OSError:
+            pass
+    return "\n".join(lines)
 
 
 def make_oc_attach(runtime: "Runtime") -> Callable[[str], str]:
@@ -157,9 +295,10 @@ _OC_HELP_TEXT = (
     "/oc — hermes-opencode slash command\n"
     "\n"
     "subcommands:\n"
-    "  /oc list                              list tracked agents (id, project, branch, phase, pr, age)\n"
+    "  /oc list                              list tracked agents (one line per agent, status + age + pr)\n"
     "  /oc attach <agent_id> [--lines N]     print the last N (default 80) lines of an agent's transcript\n"
     "  /oc questions                         list pending opencode questions awaiting a human answer\n"
+    "  /oc doctor                            plugin health report (versions, bg loop alive, deps, state files)\n"
     "  /oc help                              show this help\n"
     "\n"
     "for richer ops outside an active chat session, use the `hermes oco` CLI subcommand."
@@ -170,10 +309,12 @@ def make_oc_dispatcher(runtime: "Runtime") -> Callable[[str], str]:
     list_fn = make_oc_list(runtime)
     attach_fn = make_oc_attach(runtime)
     questions_fn = make_oc_questions(runtime)
+    doctor_fn = make_oc_doctor(runtime)
     subcommands = {
         "list": list_fn,
         "attach": attach_fn,
         "questions": questions_fn,
+        "doctor": doctor_fn,
     }
 
     def handler(raw_args: str) -> str:

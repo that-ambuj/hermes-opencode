@@ -26,6 +26,10 @@ IDLE_DEBOUNCE_SEC = 30.0
 PR_POLL_SEC = 300.0
 PRUNE_INTERVAL_SEC = 60.0
 DONE_RETENTION_SEC = 4 * 3600.0
+CLEANUP_INTERVAL_SEC = 12 * 3600.0
+EVENTS_LOG_MAX_LINES = 5000
+NOTIFICATIONS_MAX_LINES = 1000
+HISTORY_RETAIN_DAYS = 30.0
 
 _state_lock = threading.Lock()
 _thread: threading.Thread | None = None
@@ -295,6 +299,7 @@ def _thread_main() -> None:
 async def _supervisor() -> None:
     pruner = asyncio.create_task(_pruner_loop())
     heartbeat = asyncio.create_task(_heartbeat_loop())
+    cleanup = asyncio.create_task(_cleanup_loop())
     try:
         while not _stop_flag.is_set():
             if _runtime is not None:
@@ -303,12 +308,117 @@ async def _supervisor() -> None:
                         await _ensure_agent_task_async(agent.agent_id)
             await asyncio.sleep(2.0)
     finally:
-        for t in (pruner, heartbeat):
+        for t in (pruner, heartbeat, cleanup):
             t.cancel()
             try:
                 await t
             except asyncio.CancelledError:
                 pass
+
+
+async def _cleanup_loop() -> None:
+    while not _stop_flag.is_set():
+        if _runtime is None:
+            await asyncio.sleep(30.0)
+            continue
+        try:
+            _run_cleanup()
+        except Exception as e:
+            logger.warning("cleanup tick failed: %s", e)
+        await asyncio.sleep(CLEANUP_INTERVAL_SEC)
+
+
+def _run_cleanup() -> None:
+    assert _runtime is not None
+    cfg = _runtime.config
+    summary: dict[str, int] = {}
+
+    summary["events_truncated"] = _truncate_log(cfg.events_log, EVENTS_LOG_MAX_LINES)
+    summary["notifications_truncated"] = _truncate_log(cfg.notifications_file, NOTIFICATIONS_MAX_LINES)
+    summary["history_truncated"] = _truncate_history(cfg.logs_dir.parent / "history.jsonl", HISTORY_RETAIN_DAYS)
+    summary["orphan_worktrees_removed"] = _remove_orphan_worktrees()
+
+    logger.info("cleanup tick: %s", summary)
+
+
+def _truncate_log(path: Path, keep_last: int) -> int:
+    if not path.exists():
+        return 0
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return 0
+    if len(lines) <= keep_last:
+        return 0
+    kept = lines[-keep_last:]
+    try:
+        path.write_text("\n".join(kept) + "\n", encoding="utf-8")
+        return len(lines) - keep_last
+    except OSError:
+        return 0
+
+
+def _truncate_history(history_path: Path, retain_days: float) -> int:
+    if not history_path.exists():
+        return 0
+    cutoff = time.time() - retain_days * 86400.0
+    try:
+        lines = history_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return 0
+    import json as _json
+    kept: list[str] = []
+    dropped = 0
+    for ln in lines:
+        try:
+            rec = _json.loads(ln)
+            archived_at = rec.get("archived_at") or rec.get("done_at") or 0
+            if float(archived_at) >= cutoff:
+                kept.append(ln)
+            else:
+                dropped += 1
+        except (ValueError, TypeError):
+            kept.append(ln)
+    if dropped == 0:
+        return 0
+    try:
+        history_path.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+        return dropped
+    except OSError:
+        return 0
+
+
+def _remove_orphan_worktrees() -> int:
+    assert _runtime is not None
+    wt_root = _runtime.config.worktrees_root
+    if not wt_root.is_dir():
+        return 0
+    live_fs = set()
+    for agent in _runtime.agents.list():
+        live_fs.add(wt_mod.agent_id_to_fs(agent.agent_id))
+        live_fs.add(wt_mod.agent_id_to_fs(agent.agent_id) + ".review")
+    removed = 0
+    for child in wt_root.iterdir():
+        if not child.is_dir():
+            continue
+        if child.name in live_fs:
+            continue
+        project = None
+        for a in _runtime.agents.list():
+            if a.worktree_path == str(child):
+                project = _runtime.projects.get(a.project_label)
+                break
+        try:
+            if project:
+                wt_mod.remove_worktree(Path(project.repo_path), child, force=True)
+            else:
+                import shutil as _sh
+                _sh.rmtree(child, ignore_errors=True)
+            removed += 1
+            logger.info("cleanup: removed orphan worktree %s", child)
+        except Exception as e:
+            logger.warning("cleanup: could not remove orphan %s: %s", child, e)
+    return removed
 
 
 async def _pruner_loop() -> None:
@@ -611,6 +721,13 @@ async def _phase_pr_open(agent: Agent) -> None:
         _maybe_notify_phase(refreshed, "done")
         project = _runtime.projects.get(agent.project_label)
         if project:
+            from . import bootstrap as bootstrap_mod
+            try:
+                cleanup_result = await bootstrap_mod.run_project_cleanup(_runtime.client, project, worktree)
+                if not cleanup_result.ok:
+                    logger.warning("cleanup skill failed for %s: %s", agent.agent_id, cleanup_result.detail)
+            except Exception as e:
+                logger.warning("cleanup skill exception for %s: %s", agent.agent_id, e)
             wt_mod.remove_worktree(Path(project.repo_path), worktree, force=True)
         return
     await asyncio.sleep(PR_POLL_SEC)

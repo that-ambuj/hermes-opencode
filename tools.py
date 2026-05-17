@@ -518,6 +518,12 @@ def make_kill(rt: Runtime) -> Callable[..., Awaitable[str]]:
             if project and agent.reviewer_worktree_path:
                 reviewer_mod.teardown_reviewer_worktree(project, worktree_path)
             if project:
+                try:
+                    cleanup_result = await bootstrap_mod.run_project_cleanup(rt.client, project, worktree_path)
+                    if not cleanup_result.ok:
+                        errors.append(f"cleanup_skill: {cleanup_result.detail}")
+                except Exception as e:
+                    errors.append(f"cleanup_skill exception: {e}")
                 wt.remove_worktree(Path(project.repo_path), worktree_path)
             elif worktree_path.exists():
                 shutil.rmtree(worktree_path, ignore_errors=True)
