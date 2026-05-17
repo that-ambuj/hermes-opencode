@@ -187,6 +187,35 @@ def _format_permission_block(p: dict) -> str:
     return f"[{pid}] {detail}\n  Reply: /oc answer {pid} <once|always|reject>"
 
 
+async def _resume_from_awaiting_human(agent: "Agent", reason: str = "human reply received") -> "Agent":
+    """If `agent` is currently in AWAITING_HUMAN, restore the saved
+    `phase_before_awaiting` (default EXECUTING), clear the awaiting
+    bookkeeping fields, and fire `awaiting_human_resumed`. No-op when
+    the agent is not in AWAITING_HUMAN. Designed to be called from
+    every human-input dispatch surface (oc_answer, oc_send,
+    @<agent_id>) so the dashboard sees forward progress immediately
+    instead of waiting for the next _phase_awaiting_human poll tick.
+    """
+    if _runtime is None:
+        return agent
+    current = _runtime.agents.get(agent.agent_id) or agent
+    if current.phase != "AWAITING_HUMAN":
+        return current
+    restored = current.phase_before_awaiting or "EXECUTING"
+    duration = time.time() - (current.awaiting_human_since or time.time())
+    refreshed = _runtime.agents.update(
+        current.agent_id,
+        phase=restored,
+        phase_before_awaiting=None,
+        awaiting_human_since=None,
+    )
+    _notify_event(
+        refreshed, "awaiting_human_resumed",
+        f"{reason} after {_humanize_seconds(duration)}; agent resumed at phase={restored}.",
+    )
+    return refreshed
+
+
 def _enter_awaiting_human(agent: "Agent", body: str) -> "Agent":
     """Transition agent into the AWAITING_HUMAN phase and fire the
     `awaiting_human` notification with `body`. v0.16.0 promoted

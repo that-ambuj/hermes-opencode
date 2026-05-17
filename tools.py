@@ -722,6 +722,9 @@ def make_send(rt: Runtime) -> Callable[..., Awaitable[str]]:
         except OpencodeError as e:
             return _err(f"send_message_async failed: {e}", agent_id=agent_id)
         rt.agents.update(agent_id, last_activity_at=time.time())
+        await event_loop._resume_from_awaiting_human(
+            agent, reason="oc_send human reply",
+        )
         return _ok({
             "agent_id": agent_id,
             "queued": True,
@@ -1070,6 +1073,9 @@ def make_answer(rt: Runtime) -> Callable[..., Awaitable[str]]:
             return _err(f"opencode error: {e}")
         if not ok:
             return _err("opencode rejected the answer")
+        await event_loop._resume_from_awaiting_human(
+            agent, reason=f"oc_answer {action} for question {qid}",
+        )
         return _ok({"agent_id": agent.agent_id, "question_id": qid, "action": action})
     return handler
 

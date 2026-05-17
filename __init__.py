@@ -196,6 +196,9 @@ def _handle_at_agent_dispatch(event: Any, gateway: Any, text: str) -> dict[str, 
     async def _do_dispatch() -> None:
         try:
             await runtime.client.send_message_async(session_id, worktree_path, body)
+            await event_loop._resume_from_awaiting_human(
+                agent, reason=f"@{agent_id} human reply",
+            )
             _gateway_send(gateway, event, f"[hermes-opencode] -> @{agent_id}")
         except Exception as exc:
             log.exception("@%s dispatch failed", agent_id)

@@ -2469,3 +2469,124 @@ class TestResumePrHandler:
         assert payload["ok"] is False
         assert "MERGED" in payload["error"]
         assert "OPEN" in payload["error"]
+
+
+class TestResumeFromAwaitingHuman:
+    """v0.16.1: human-input dispatch surfaces (oc_answer, oc_send,
+    @<agent_id>) call _resume_from_awaiting_human immediately after a
+    successful send so the agent transitions out of AWAITING_HUMAN
+    without waiting for the next _phase_awaiting_human poll tick.
+    """
+
+    def setup_method(self):
+        self._notified: list = []
+        self._saved_pkg_runtime = plugin_mod._runtime
+        self._saved_evloop_runtime = event_loop_mod._runtime
+        self._saved_notify = event_loop_mod._notify_event
+        event_loop_mod._notify_event = lambda agent, kind, body="": self._notified.append((kind, body, agent.phase))
+
+    def teardown_method(self):
+        plugin_mod._runtime = self._saved_pkg_runtime
+        event_loop_mod._runtime = self._saved_evloop_runtime
+        event_loop_mod._notify_event = self._saved_notify
+
+    def _setup(self, tmp_path, agent_phase="AWAITING_HUMAN", phase_before="EXECUTING"):
+        cfg = config_mod.Config(
+            projects_file=tmp_path / "projects.json",
+            agents_file=tmp_path / "agents.json",
+            worktrees_root=tmp_path / "wt",
+            logs_dir=tmp_path / "logs",
+            notifications_file=tmp_path / "notifications.jsonl",
+        )
+        cfg.ensure_dirs()
+        agents = state_mod.AgentStore(cfg.agents_file)
+        agent = state_mod.Agent(
+            agent_id="bck/test", project_label="bck",
+            worktree_path=str(tmp_path), session_id="s",
+            branch="bck/test", initial_prompt="p", phase=agent_phase,
+            phase_before_awaiting=phase_before if agent_phase == "AWAITING_HUMAN" else None,
+            awaiting_human_since=time.time() - 5.0 if agent_phase == "AWAITING_HUMAN" else None,
+        )
+        agents.add(agent)
+        tools_mod = sys.modules["_oco_test_pkg.tools"]
+        rt = tools_mod.Runtime(config=cfg, client=None, projects=None, agents=agents)
+        plugin_mod._runtime = rt
+        event_loop_mod._runtime = rt
+        return agents
+
+    def test_resume_helper_restores_prior_phase(self, tmp_path: Path):
+        import asyncio
+        agents = self._setup(tmp_path, "AWAITING_HUMAN", phase_before="EXECUTOR_ADDRESSING")
+        agent = agents.get("bck/test")
+        result = asyncio.run(event_loop_mod._resume_from_awaiting_human(agent, "test"))
+        refreshed = agents.get("bck/test")
+        assert refreshed.phase == "EXECUTOR_ADDRESSING"
+        assert refreshed.phase_before_awaiting is None
+        assert refreshed.awaiting_human_since is None
+        kinds = [k for (k, _b, _p) in self._notified]
+        assert "awaiting_human_resumed" in kinds
+
+    def test_resume_helper_defaults_to_executing(self, tmp_path: Path):
+        import asyncio
+        agents = self._setup(tmp_path, "AWAITING_HUMAN")
+        agents.update("bck/test", phase_before_awaiting=None)
+        agent = agents.get("bck/test")
+        asyncio.run(event_loop_mod._resume_from_awaiting_human(agent))
+        assert agents.get("bck/test").phase == "EXECUTING"
+
+    def test_resume_helper_noop_when_not_awaiting(self, tmp_path: Path):
+        import asyncio
+        agents = self._setup(tmp_path, "EXECUTING", phase_before=None)
+        agent = agents.get("bck/test")
+        asyncio.run(event_loop_mod._resume_from_awaiting_human(agent))
+        assert agents.get("bck/test").phase == "EXECUTING"
+        assert self._notified == []
+
+    def test_oc_send_resumes_awaiting_agent(self, tmp_path: Path):
+        import asyncio
+        import json
+        agents = self._setup(tmp_path, "AWAITING_HUMAN", phase_before="EXECUTING")
+        sent = []
+
+        class FakeClient:
+            async def send_message_async(self_inner, session_id, directory, text, timeout=30.0):
+                sent.append({"session_id": session_id, "text": text})
+                return {"queued": True}
+
+        tools_mod = sys.modules["_oco_test_pkg.tools"]
+        cfg = plugin_mod._runtime.config
+        rt = tools_mod.Runtime(config=cfg, client=FakeClient(), projects=None, agents=agents)
+        plugin_mod._runtime = rt
+        event_loop_mod._runtime = rt
+
+        handler = tools_mod.make_send(rt)
+        result_str = asyncio.run(handler({"agent_id": "bck/test", "text": "my answer"}))
+        result = json.loads(result_str)
+        assert result["ok"] is True
+        assert len(sent) == 1
+        refreshed = agents.get("bck/test")
+        assert refreshed.phase == "EXECUTING", (
+            "oc_send to an AWAITING_HUMAN agent must transition it back "
+            "without waiting for the poll tick"
+        )
+        kinds = [k for (k, _b, _p) in self._notified]
+        assert "awaiting_human_resumed" in kinds
+
+    def test_oc_send_to_non_awaiting_does_not_emit_resumed(self, tmp_path: Path):
+        import asyncio
+        import json
+        agents = self._setup(tmp_path, "EXECUTING", phase_before=None)
+        class FakeClient:
+            async def send_message_async(self_inner, session_id, directory, text, timeout=30.0):
+                return {"queued": True}
+        tools_mod = sys.modules["_oco_test_pkg.tools"]
+        cfg = plugin_mod._runtime.config
+        rt = tools_mod.Runtime(config=cfg, client=FakeClient(), projects=None, agents=agents)
+        plugin_mod._runtime = rt
+        event_loop_mod._runtime = rt
+        handler = tools_mod.make_send(rt)
+        asyncio.run(handler({"agent_id": "bck/test", "text": "chase-up"}))
+        kinds = [k for (k, _b, _p) in self._notified]
+        assert "awaiting_human_resumed" not in kinds, (
+            "oc_send to a non-AWAITING agent must not spuriously fire resumed"
+        )

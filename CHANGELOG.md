@@ -5,6 +5,56 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.1] - 2026-05-17
+
+Closes a v0.16.0 UX gap: a human reply on an `AWAITING_HUMAN` agent
+now transitions the agent immediately, instead of waiting for the
+next `_phase_awaiting_human` poll tick.
+
+### Fixed
+
+- **Immediate resume on human input.** v0.16.0 introduced
+  `AWAITING_HUMAN` as a proper phase, with exit detected by
+  `_phase_awaiting_human` polling `list_questions` / `list_permissions`
+  and re-running the classifier. The exit could take a tick (a few
+  seconds) after the human replied, leaving the dashboard showing
+  `AWAITING_HUMAN` longer than necessary and giving the impression
+  the reply didn't land.
+
+  v0.16.1 wires a new `event_loop._resume_from_awaiting_human(agent,
+  reason)` helper into every human-input dispatch surface:
+
+  - `oc_answer` tool (after a successful `/question` reply or reject).
+  - `oc_send` tool (after `send_message_async` succeeds).
+  - `@<agent_id> <text>` direct gateway dispatch (after
+    `send_message_async` succeeds inside `_handle_at_agent_dispatch`).
+
+  On dispatch success, if the agent is currently in `AWAITING_HUMAN`,
+  the helper restores `phase_before_awaiting` (default `EXECUTING`),
+  clears the awaiting bookkeeping fields, and fires the existing
+  `awaiting_human_resumed` event. No-op when the agent is not in
+  `AWAITING_HUMAN` so the surfaces work the same for non-awaiting
+  agents.
+
+  `_phase_awaiting_human`'s poll-based exit path remains as a safety
+  net for the case where the human resolves the question by some
+  other means (e.g. opencode-side `/question` answered via a separate
+  client). Both paths converge on the same state-update +
+  `awaiting_human_resumed` notification.
+
+### Added
+
+- **5 new regression tests** in `tests/test_pure_logic.py::TestResumeFromAwaitingHuman`:
+  - helper restores `phase_before_awaiting` (incl. `EXECUTOR_ADDRESSING`).
+  - helper defaults to `EXECUTING` when no prior phase saved.
+  - helper is a noop when agent is not in `AWAITING_HUMAN`.
+  - `oc_send` to an `AWAITING_HUMAN` agent transitions it back without
+    a poll tick AND fires `awaiting_human_resumed`.
+  - `oc_send` to a non-`AWAITING_HUMAN` agent does NOT spuriously fire
+    `awaiting_human_resumed` (the no-op guard works).
+
+  Full suite: 346 passed (was 341 at v0.16.0).
+
 ## [0.16.0] - 2026-05-17
 
 Minor bump: introduces a new `AWAITING_HUMAN` phase (previously only an
