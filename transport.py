@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import os
 import shutil
 import socket
 import subprocess
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator
 from urllib.parse import urlparse
 
 import httpx
+
+logger = logging.getLogger("opencode_orchestrator.transport")
 
 
 class OpencodeError(RuntimeError):
@@ -190,6 +194,40 @@ class OpencodeClient:
         async with self._client(directory) as c:
             r = await c.delete(f"/session/{session_id}")
             return r.status_code in (200, 204)
+
+    async def stream_events(
+        self, directory: Path, stop_event: asyncio.Event,
+        *, reconnect_backoff: float = 3.0,
+    ) -> AsyncIterator[dict[str, Any]]:
+        try:
+            from httpx_sse import aconnect_sse
+        except ImportError as e:
+            raise OpencodeError(f"httpx-sse not installed: {e}") from e
+        while not stop_event.is_set():
+            headers = dict(self._headers)
+            headers["x-opencode-directory"] = str(directory)
+            try:
+                async with httpx.AsyncClient(base_url=self.base_url, headers=headers, timeout=None) as c:
+                    async with aconnect_sse(c, "GET", "/event") as es:
+                        async for sse in es.aiter_sse():
+                            if stop_event.is_set():
+                                return
+                            data = sse.data
+                            if not data:
+                                continue
+                            try:
+                                yield json.loads(data)
+                            except (ValueError, TypeError):
+                                continue
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.debug("stream_events reconnecting after %s", e)
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=reconnect_backoff)
+                    return
+                except asyncio.TimeoutError:
+                    continue
 
     @staticmethod
     def extract_assistant_text(send_message_response: dict[str, Any]) -> str:

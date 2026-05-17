@@ -11,6 +11,7 @@ from typing import Any, Awaitable, Callable
 from . import bootstrap as bootstrap_mod
 from . import event_loop
 from . import heartbeat as heartbeat_mod
+from . import notify
 from . import pr as pr_mod
 from . import reviewer as reviewer_mod
 from . import worktree as wt
@@ -289,6 +290,36 @@ def make_spawn(rt: Runtime) -> Callable[..., Awaitable[str]]:
         if not (repo_path / ".git").exists():
             return _err(f"project repo missing: {repo_path}")
 
+        if project.bootstrap_skill is None and rt.config.auto_bootstrap_on_first_spawn:
+            notify.fanout(
+                sinks=rt.config.notify_sinks,
+                title="generating bootstrap skill",
+                body=f"project {project_label!r} has no bootstrap_skill; spawning a one-shot opencode introspection session before the first agent spawn.",
+                meta={"kind": "auto_bootstrap", "project": project_label},
+                dashboard_path=rt.config.notifications_file,
+                gateway_platform=rt.config.notify_gateway_platform,
+                gateway_chat_id=rt.config.notify_gateway_chat_id,
+            )
+            throwaway = (rt.config.worktrees_root / f"genboot-{project.abbrev}-{int(time.time())}").resolve()
+            throwaway_branch = f"oc-orch-genboot-{project.abbrev}-{int(time.time())}"
+            try:
+                _ensure_server(rt)
+            except OpencodeError as e:
+                return _err(f"opencode server unavailable: {e}")
+            try:
+                wt.create_worktree(repo_path, throwaway, branch=throwaway_branch, base=project.base_branch)
+            except wt.GitError as e:
+                return _err(f"auto bootstrap worktree create failed: {e}")
+            try:
+                result = await bootstrap_mod.generate_bootstrap_skill(rt.client, project, throwaway, rt.projects)
+                if not result.ok:
+                    return _err(f"auto bootstrap generation failed: {result.detail}")
+                refreshed = rt.projects.get(project_label)
+                if refreshed:
+                    project = refreshed
+            finally:
+                wt.remove_worktree(repo_path, throwaway, force=True)
+
         existing = rt.agents.ids()
         try:
             agent_id = wt.compose_agent_id(project.abbrev, task, existing)
@@ -492,6 +523,7 @@ def make_kill(rt: Runtime) -> Callable[..., Awaitable[str]]:
                 shutil.rmtree(worktree_path, ignore_errors=True)
         rt.agents.update(agent_id, phase="KILLED")
         event_loop._drop_snapshots(agent_id)
+        event_loop.clear_text_buffer(agent_id)
         rt.agents.remove(agent_id)
         return _ok({"agent_id": agent_id, "killed": True, "worktree_removed": remove_wt, "errors": errors})
     return handler
@@ -589,6 +621,21 @@ SET_NOTIFY_TARGET_SCHEMA: dict[str, Any] = {
 }
 
 
+OUTPUT_SCHEMA: dict[str, Any] = {
+    "name": "oc_output",
+    "description": "Return the latest assistant text for an agent. Prefers the live SSE delta/snapshot buffer (populated by the background consumer) and falls back to a /message pull from opencode when the buffer is empty. Set clear=true to reset the buffer after reading (only meaningful when source=='sse').",
+    "parameters": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "agent_id": {"type": "string"},
+            "clear": {"type": "boolean", "default": False, "description": "If true and the result came from the SSE buffer, reset the buffer entry after returning."},
+        },
+        "required": ["agent_id"],
+    },
+}
+
+
 HEARTBEAT_NOW_SCHEMA: dict[str, Any] = {
     "name": "oc_heartbeat_send_now",
     "description": "Send the heartbeat status report immediately to all configured sinks (CLI inject_message / gateway DM / dashboard JSONL). Useful for testing the notify pipeline or for ad-hoc status pings outside the hourly schedule.",
@@ -668,7 +715,13 @@ def make_review_again(rt: Runtime) -> Callable[..., Awaitable[str]]:
         project = rt.projects.get(agent.project_label)
         if project and agent.reviewer_worktree_path:
             reviewer_mod.teardown_reviewer_worktree(project, Path(agent.worktree_path))
-        rt.agents.update(agent_id, phase="REVIEW_SPAWNING", reviewer_session_id=None, reviewer_worktree_path=None)
+        rt.agents.update(
+            agent_id,
+            phase="REVIEW_SPAWNING",
+            reviewer_session_id=None,
+            reviewer_worktree_path=None,
+            review_cycle_count=agent.review_cycle_count + 1,
+        )
         event_loop.ensure_agent_task(agent_id)
         return _ok({"agent_id": agent_id, "phase": "REVIEW_SPAWNING"})
     return handler
@@ -732,6 +785,45 @@ def make_set_notify_target(rt: Runtime) -> Callable[..., Awaitable[str]]:
     return handler
 
 
+def _pull_assistant_text(body: dict[str, Any]) -> tuple[str, int]:
+    items = body.get("items") or []
+    chunks: list[str] = []
+    parts_count = 0
+    for item in items:
+        for p in item.get("parts") or []:
+            if isinstance(p, dict) and p.get("type") == "text":
+                t = p.get("text")
+                if isinstance(t, str) and t:
+                    chunks.append(t)
+                    parts_count += 1
+    return ("\n".join(chunks), parts_count)
+
+
+def make_output(rt: Runtime) -> Callable[..., Awaitable[str]]:
+    async def handler(args: dict, **_: Any) -> str:
+        agent_id = args.get("agent_id")
+        if not agent_id:
+            return _err("agent_id required")
+        agent = rt.agents.get(agent_id)
+        if not agent:
+            return _err(f"unknown agent: {agent_id}")
+        buffer = event_loop.get_text_buffer(agent_id)
+        if buffer:
+            text = "\n".join(buffer[k] for k in sorted(buffer.keys()) if isinstance(buffer[k], str))
+            payload = {"agent_id": agent_id, "text": text, "source": "sse", "parts": len(buffer)}
+            if bool(args.get("clear", False)):
+                event_loop.clear_text_buffer(agent_id)
+            return _ok(payload)
+        worktree = Path(agent.worktree_path)
+        try:
+            body = await rt.client.get_messages(agent.session_id, worktree)
+        except OpencodeError as e:
+            return _err(f"get_messages failed: {e}")
+        text, parts_count = _pull_assistant_text(body)
+        return _ok({"agent_id": agent_id, "text": text, "source": "pull", "parts": parts_count})
+    return handler
+
+
 def make_heartbeat_send_now(rt: Runtime) -> Callable[..., Awaitable[str]]:
     async def handler(args: dict, **_: Any) -> str:
         result = heartbeat_mod.send_heartbeat(rt, force=bool(args.get("force", False)))
@@ -788,6 +880,7 @@ def all_tool_specs(rt: Runtime) -> list[dict[str, Any]]:
         {"name": "oc_status", "toolset": "opencode_orchestrator", "schema": STATUS_SCHEMA, "handler": make_status(rt), "is_async": True, "emoji": "📊"},
         {"name": "oc_wait", "toolset": "opencode_orchestrator", "schema": WAIT_SCHEMA, "handler": make_wait(rt), "is_async": True, "emoji": "⏳"},
         {"name": "oc_kill", "toolset": "opencode_orchestrator", "schema": KILL_SCHEMA, "handler": make_kill(rt), "is_async": True, "emoji": "🛑"},
+        {"name": "oc_output", "toolset": "opencode_orchestrator", "schema": OUTPUT_SCHEMA, "handler": make_output(rt), "is_async": True, "emoji": "📤"},
         {"name": "oc_answer", "toolset": "opencode_orchestrator", "schema": ANSWER_SCHEMA, "handler": make_answer(rt), "is_async": True, "emoji": "✉️"},
         {"name": "oc_review_now", "toolset": "opencode_orchestrator", "schema": REVIEW_NOW_SCHEMA, "handler": make_review_now(rt), "is_async": True, "emoji": "🔎"},
         {"name": "oc_review_again", "toolset": "opencode_orchestrator", "schema": REVIEW_AGAIN_SCHEMA, "handler": make_review_again(rt), "is_async": True, "emoji": "🔁"},

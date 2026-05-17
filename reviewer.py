@@ -14,8 +14,18 @@ from .transport import OpencodeClient, OpencodeError
 
 _LGTM_RE = re.compile(r"\bREVIEW\s*:\s*LGTM\b", re.IGNORECASE)
 _REQUEST_RE = re.compile(r"\bREVIEW\s*:\s*REQUESTS?_CHANGES\b", re.IGNORECASE)
+_COLLISION_SUFFIX_RE = re.compile(r"-\d+$")
 
 REVIEWER_AGENT_TYPE = "plan"
+
+
+def _pr_title_from_agent_id(agent_id: str) -> str:
+    if "/" in agent_id:
+        task_slug = agent_id.split("/", 1)[1]
+    else:
+        task_slug = agent_id
+    task_slug = _COLLISION_SUFFIX_RE.sub("", task_slug)
+    return task_slug.replace("-", " ").capitalize()
 
 
 def reviewer_prompt(executor_initial_prompt: str, base_branch: str) -> str:
@@ -71,11 +81,12 @@ def stage_reviewer_worktree(
     if wt.GitError and not executor_worktree.exists():
         raise wt.GitError(f"executor worktree missing: {executor_worktree}")
     if wt._git(executor_worktree, "status", "--porcelain", check=False).stdout.strip():
+        cleaned = _pr_title_from_agent_id(executor.agent_id)
         wt._git(executor_worktree, "add", "-A")
         wt._git(
             executor_worktree, "-c", "user.email=opencode-orchestrator@local",
             "-c", "user.name=opencode-orchestrator",
-            "commit", "-m", "[wip] checkpoint before review",
+            "commit", "-m", f"chore: {cleaned}",
         )
     sister = reviewer_worktree_path(executor_worktree)
     if sister.exists():
@@ -119,9 +130,9 @@ async def finalize_and_open_pr(
     project: Project, agent: Agent, base_branch: str, title: str | None = None,
 ) -> pr.PrInfo:
     worktree = Path(agent.worktree_path)
-    commit_msg = title or f"[{agent.agent_id}] {agent.initial_prompt[:60].strip()}"
-    pr.commit_and_push(worktree, commit_msg, agent.branch)
+    cleaned_title = title or _pr_title_from_agent_id(agent.agent_id)
+    pr.commit_and_push(worktree, cleaned_title, agent.branch)
     return pr.open_pr(
-        worktree, base_branch=base_branch, title=title,
+        worktree, base_branch=base_branch, title=cleaned_title,
         body=f"Initial task:\n\n{agent.initial_prompt}\n\n---\nopened by opencode-orchestrator for `{agent.agent_id}`",
     )

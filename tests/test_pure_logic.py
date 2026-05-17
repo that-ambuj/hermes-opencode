@@ -27,6 +27,7 @@ reviewer_mod = sys.modules["_oco_test_pkg.reviewer"]
 heartbeat_mod = sys.modules["_oco_test_pkg.heartbeat"]
 state_mod = sys.modules["_oco_test_pkg.state"]
 config_mod = sys.modules["_oco_test_pkg.config"]
+event_loop_mod = sys.modules["_oco_test_pkg.event_loop"]
 
 
 class TestExtractBash:
@@ -144,3 +145,67 @@ class TestNextTopOfHour:
         d = datetime(2026, 5, 17, 14, 30, 0)
         wait = heartbeat_mod.next_top_of_hour(d)
         assert 1700 < wait <= 1800
+
+
+class TestPrTitleFromAgentId:
+    def test_refunds(self):
+        assert reviewer_mod._pr_title_from_agent_id("dp/refunds") == "Refunds"
+
+    def test_v04_polish(self):
+        assert reviewer_mod._pr_title_from_agent_id("oco/v0.4-polish") == "V0.4 polish"
+
+    def test_trailing_collision_suffix_stripped(self):
+        assert reviewer_mod._pr_title_from_agent_id("oco/fix-css-2") == "Fix css"
+
+    def test_leading_digits_preserved(self):
+        assert reviewer_mod._pr_title_from_agent_id("oco/2fa-flow") == "2fa flow"
+
+    def test_no_bracket_or_wip_artifacts(self):
+        for agent_id in ("dp/refunds", "oco/v0.4-polish", "oco/fix-css-2", "oco/2fa-flow"):
+            title = reviewer_mod._pr_title_from_agent_id(agent_id)
+            assert "[" not in title and "]" not in title
+            assert "wip" not in title.lower()
+            assert "/" not in title
+
+
+class TestSseBuffer:
+    def test_apply_delta_appends_for_new_part(self):
+        buffers: dict[str, str] = {}
+        out = event_loop_mod.apply_delta(buffers, "p1", "hello")
+        assert out is buffers
+        assert buffers == {"p1": "hello"}
+
+    def test_apply_delta_accumulates(self):
+        buffers = {"p1": "hel"}
+        event_loop_mod.apply_delta(buffers, "p1", "lo")
+        event_loop_mod.apply_delta(buffers, "p1", " world")
+        assert buffers == {"p1": "hello world"}
+
+    def test_apply_snapshot_replaces(self):
+        buffers = {"p1": "old"}
+        event_loop_mod.apply_snapshot(buffers, "p1", "new value")
+        assert buffers == {"p1": "new value"}
+
+    def test_apply_snapshot_wins_over_partial_delta(self):
+        buffers: dict[str, str] = {}
+        event_loop_mod.apply_delta(buffers, "p1", "partial")
+        event_loop_mod.apply_snapshot(buffers, "p1", "FULL")
+        assert buffers["p1"] == "FULL"
+
+    def test_separate_parts_are_independent(self):
+        buffers: dict[str, str] = {}
+        event_loop_mod.apply_delta(buffers, "p1", "alpha")
+        event_loop_mod.apply_delta(buffers, "p2", "beta")
+        assert buffers == {"p1": "alpha", "p2": "beta"}
+
+
+class TestReviewCycleClassifier:
+    def test_default_cap_one_allows_first_addressing_round(self):
+        assert event_loop_mod.decide_review_action(0, 1) == "address"
+
+    def test_at_cap_exhausts(self):
+        assert event_loop_mod.decide_review_action(1, 1) == "exhausted"
+
+    def test_higher_cap_allows_more_rounds(self):
+        assert event_loop_mod.decide_review_action(1, 3) == "address"
+        assert event_loop_mod.decide_review_action(3, 3) == "exhausted"

@@ -42,6 +42,7 @@ class Agent:
     pr_merged_at: float | None = None
     done_at: float | None = None
     last_error: str | None = None
+    review_cycle_count: int = 0
     created_at: float = field(default_factory=time.time)
     last_activity_at: float = field(default_factory=time.time)
 

@@ -45,6 +45,8 @@ class Config:
     heartbeat_timezone: str | None = None
     heartbeat_day_start: int = 9
     heartbeat_day_end: int = 23
+    review_max_cycles: int = 1
+    auto_bootstrap_on_first_spawn: bool = True
 
     @classmethod
     def from_plugin_entry(cls, entry: dict | None) -> "Config":
@@ -54,6 +56,8 @@ class Config:
         notify = entry.get("notify") or {}
         gateway = notify.get("gateway") or {}
         heartbeat = entry.get("heartbeat") or {}
+        review = entry.get("review") or {}
+        bootstrap_cfg = entry.get("bootstrap") or {}
         day_window = heartbeat.get("unconditional_hours", [9, 23])
         return cls(
             server_url=server.get("url", DEFAULT_SERVER_URL),
@@ -69,6 +73,8 @@ class Config:
             heartbeat_timezone=heartbeat.get("timezone"),
             heartbeat_day_start=int(day_window[0]) if len(day_window) >= 1 else 9,
             heartbeat_day_end=int(day_window[1]) if len(day_window) >= 2 else 23,
+            review_max_cycles=max(1, int(review.get("max_cycles", 1))),
+            auto_bootstrap_on_first_spawn=bool(bootstrap_cfg.get("auto_on_first_spawn", True)),
         )
 
     def ensure_dirs(self) -> None:

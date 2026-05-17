@@ -32,10 +32,33 @@ _thread: threading.Thread | None = None
 _loop: asyncio.AbstractEventLoop | None = None
 _stop_flag = threading.Event()
 _runtime: "Runtime | None" = None
-_agent_tasks: dict[str, asyncio.Task] = {}
+_agent_tasks: dict[str, dict[str, asyncio.Task]] = {}
+_sse_stop_events: dict[str, asyncio.Event] = {}
 _question_snapshot: dict[str, list[dict]] = {}
 _permission_snapshot: dict[str, list[dict]] = {}
 _snapshot_lock = threading.Lock()
+_sse_text_buffers: dict[str, dict[str, str]] = {}
+_sse_buffer_lock = threading.Lock()
+
+
+def apply_delta(buffers: dict[str, str], part_id: str, delta: str) -> dict[str, str]:
+    buffers[part_id] = buffers.get(part_id, "") + delta
+    return buffers
+
+
+def apply_snapshot(buffers: dict[str, str], part_id: str, text: str) -> dict[str, str]:
+    buffers[part_id] = text
+    return buffers
+
+
+def get_text_buffer(agent_id: str) -> dict[str, str]:
+    with _sse_buffer_lock:
+        return dict(_sse_text_buffers.get(agent_id) or {})
+
+
+def clear_text_buffer(agent_id: str) -> None:
+    with _sse_buffer_lock:
+        _sse_text_buffers.pop(agent_id, None)
 
 
 def get_pending_snapshot() -> tuple[dict[str, list[dict]], dict[str, list[dict]]]:
@@ -92,6 +115,7 @@ def stop(timeout: float = 5.0) -> None:
         _thread = None
         _loop = None
         _agent_tasks.clear()
+        _sse_stop_events.clear()
 
 
 def ensure_agent_task(agent_id: str) -> None:
@@ -117,11 +141,32 @@ def schedule(coro_factory) -> asyncio.Future | None:
 async def _ensure_agent_task_async(agent_id: str) -> None:
     if _runtime is None:
         return
-    existing = _agent_tasks.get(agent_id)
-    if existing and not existing.done():
-        return
-    task = asyncio.create_task(_agent_loop(agent_id))
-    _agent_tasks[agent_id] = task
+    existing = _agent_tasks.get(agent_id) or {}
+    loop_task = existing.get("agent")
+    sse_task = existing.get("sse")
+    new_tasks: dict[str, asyncio.Task] = {}
+    if loop_task and not loop_task.done():
+        new_tasks["agent"] = loop_task
+    else:
+        new_tasks["agent"] = asyncio.create_task(_agent_loop(agent_id))
+    if sse_task and not sse_task.done():
+        new_tasks["sse"] = sse_task
+    else:
+        stop_event = asyncio.Event()
+        _sse_stop_events[agent_id] = stop_event
+        new_tasks["sse"] = asyncio.create_task(_sse_consumer_loop(agent_id, stop_event))
+    _agent_tasks[agent_id] = new_tasks
+
+
+def _cancel_agent_tasks(agent_id: str) -> None:
+    tasks = _agent_tasks.pop(agent_id, None) or {}
+    stop_event = _sse_stop_events.pop(agent_id, None)
+    if stop_event is not None:
+        stop_event.set()
+    for t in tasks.values():
+        if not t.done():
+            t.cancel()
+    clear_text_buffer(agent_id)
 
 
 def _thread_main() -> None:
@@ -213,7 +258,7 @@ async def _agent_loop(agent_id: str) -> None:
     while not _stop_flag.is_set():
         agent = _runtime.agents.get(agent_id)
         if agent is None or agent.phase in TERMINAL_PHASES:
-            _agent_tasks.pop(agent_id, None)
+            _cancel_agent_tasks(agent_id)
             return
         try:
             await _tick(agent)
@@ -224,6 +269,51 @@ async def _agent_loop(agent_id: str) -> None:
             backoff = min(backoff * 2, 60.0)
         else:
             await asyncio.sleep(0.5)
+
+
+async def _sse_consumer_loop(agent_id: str, stop_event: asyncio.Event) -> None:
+    if _runtime is None:
+        return
+    agent = _runtime.agents.get(agent_id)
+    if agent is None:
+        return
+    worktree = Path(agent.worktree_path)
+    session_id = agent.session_id
+    try:
+        async for event in _runtime.client.stream_events(worktree, stop_event):
+            if stop_event.is_set():
+                return
+            etype = event.get("type")
+            props = event.get("properties") or {}
+            if etype == "message.part.delta":
+                if props.get("sessionID") != session_id:
+                    continue
+                if props.get("field") != "text":
+                    continue
+                part_id = props.get("partID") or props.get("part_id") or props.get("id")
+                delta = props.get("delta")
+                if not isinstance(part_id, str) or not isinstance(delta, str):
+                    continue
+                with _sse_buffer_lock:
+                    buffers = _sse_text_buffers.setdefault(agent_id, {})
+                    apply_delta(buffers, part_id, delta)
+            elif etype == "message.part.updated":
+                part = props.get("part") or {}
+                if part.get("sessionID") != session_id:
+                    continue
+                if part.get("type") != "text":
+                    continue
+                part_id = part.get("id") or part.get("partID")
+                text = part.get("text")
+                if not isinstance(part_id, str) or not isinstance(text, str):
+                    continue
+                with _sse_buffer_lock:
+                    buffers = _sse_text_buffers.setdefault(agent_id, {})
+                    apply_snapshot(buffers, part_id, text)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.debug("sse consumer %s ended: %s", agent_id, e)
 
 
 async def _tick(agent: Agent) -> None:
@@ -317,6 +407,12 @@ async def _phase_reviewing(agent: Agent) -> None:
     await _handle_review_text(agent, reviewer_text)
 
 
+def decide_review_action(current_cycle: int, max_cycles: int) -> str:
+    if current_cycle < max_cycles:
+        return "address"
+    return "exhausted"
+
+
 async def _handle_review_text(agent: Agent, reviewer_text: str) -> None:
     assert _runtime is not None
     verdict = reviewer_mod.classify_review(reviewer_text)
@@ -324,12 +420,24 @@ async def _handle_review_text(agent: Agent, reviewer_text: str) -> None:
         _runtime.agents.update(agent.agent_id, phase="COMMITTING")
         return
     if verdict.kind == "requests_changes":
+        action = decide_review_action(agent.review_cycle_count, _runtime.config.review_max_cycles)
+        if action == "exhausted":
+            logger.info(
+                "agent %s: review cycles exhausted (count=%d, cap=%d) - proceeding to COMMITTING",
+                agent.agent_id, agent.review_cycle_count, _runtime.config.review_max_cycles,
+            )
+            _runtime.agents.update(agent.agent_id, phase="COMMITTING", last_error=None)
+            return
         try:
             await reviewer_mod.send_addressing_to_executor(_runtime.client, agent, verdict.body)
         except OpencodeError as e:
             _runtime.agents.update(agent.agent_id, phase="FAILED", last_error=f"address dispatch: {e}")
             return
-        _runtime.agents.update(agent.agent_id, phase="EXECUTOR_ADDRESSING")
+        _runtime.agents.update(
+            agent.agent_id,
+            phase="EXECUTOR_ADDRESSING",
+            review_cycle_count=agent.review_cycle_count + 1,
+        )
         return
 
 
