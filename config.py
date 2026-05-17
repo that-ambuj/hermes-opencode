@@ -27,6 +27,22 @@ def plugin_state_dir() -> Path:
     return d
 
 
+def load_entry_config() -> dict:
+    """Read this plugin's entry from ~/.hermes/config.yaml.
+
+    Importable from both ``__init__.py`` (in-session) and ``cli.py`` (out-of-
+    session CLI subcommands) without a circular import.
+    """
+    try:
+        from hermes_cli.config import cfg_get  # type: ignore
+    except ImportError:
+        return {}
+    try:
+        return cfg_get(f"plugins.entries.{PLUGIN_NAME}", {}) or {}
+    except Exception:
+        return {}
+
+
 @dataclass
 class Config:
     server_url: str = DEFAULT_SERVER_URL

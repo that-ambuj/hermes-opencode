@@ -10,24 +10,15 @@ from __future__ import annotations
 
 from typing import Any
 
+from . import cli as cli_mod
+from . import commands as commands_mod
 from . import event_loop
 from . import notify
-from .config import Config
+from .config import Config, load_entry_config
 from .projects import ProjectRegistry
 from .state import AgentStore
 from .tools import Runtime, all_tool_specs
 from .transport import OpencodeClient
-
-
-def _load_entry_config() -> dict:
-    try:
-        from hermes_cli.config import cfg_get  # type: ignore
-    except ImportError:
-        return {}
-    try:
-        return cfg_get("plugins.entries.opencode-orchestrator", {}) or {}
-    except Exception:
-        return {}
 
 
 _runtime: Runtime | None = None
@@ -86,7 +77,7 @@ def _pre_llm_call_hook(**_: Any) -> dict[str, Any] | None:
 
 def register(ctx: Any) -> None:
     global _runtime
-    config = Config.from_plugin_entry(_load_entry_config())
+    config = Config.from_plugin_entry(load_entry_config())
     config.ensure_dirs()
 
     client = OpencodeClient(config.server_url, config.server_password)
@@ -105,5 +96,36 @@ def register(ctx: Any) -> None:
     inject = getattr(ctx, "inject_message", None)
     if callable(inject):
         notify.set_inject_message(inject)
+
+    register_cmd = getattr(ctx, "register_command", None)
+    if callable(register_cmd):
+        register_cmd(
+            "oc-list",
+            handler=commands_mod.make_oc_list(_runtime),
+            description="List tracked opencode-orchestrator agents.",
+            args_hint="",
+        )
+        register_cmd(
+            "oc-attach",
+            handler=commands_mod.make_oc_attach(_runtime),
+            description="Print the last N lines of an agent's transcript.",
+            args_hint="<agent_id> [--lines N]",
+        )
+        register_cmd(
+            "oc-questions",
+            handler=commands_mod.make_oc_questions(_runtime),
+            description="List pending opencode questions awaiting an answer.",
+            args_hint="",
+        )
+
+    register_cli = getattr(ctx, "register_cli_command", None)
+    if callable(register_cli):
+        register_cli(
+            name="oco",
+            help="Drive opencode-orchestrator agents from the shell.",
+            setup_fn=cli_mod.setup,
+            handler_fn=cli_mod.handler,
+            description="list / status / attach / kill / projects without a hermes chat session.",
+        )
 
     event_loop.start(_runtime)

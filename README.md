@@ -72,6 +72,35 @@ automatic SKILL.md generation pass.
 | `oc_kill` | Abort agent's session, optionally prune worktree |
 | `oc_output` | Return the agent's latest assistant text from the live SSE buffer (with `/message` pull fallback) |
 
+## Slash commands
+
+In-session commands available from any hermes CLI or gateway chat. No LLM
+round-trip — they call into the plugin directly.
+
+| Command | Purpose |
+|---|---|
+| `/oc-list` | Pretty-printed table of all tracked agents (agent_id, project, branch, phase, pr, age). |
+| `/oc-attach <agent_id> [--lines N]` | Print the last N lines (default 80) of an agent's accumulated transcript. |
+| `/oc-questions` | List every pending opencode question, with structured options surfaced inline. |
+
+## CLI subcommand
+
+`hermes oco …` is the same surface available from outside an active hermes
+chat session — ideal for ops, automation, and cron-driven checks. Reads the
+plugin's on-disk state directly (no background event loop required).
+
+```
+hermes oco list
+hermes oco status oco/refunds
+hermes oco attach oco/refunds --lines 200
+hermes oco kill oco/refunds --force
+hermes oco projects
+```
+
+`status` accepts `--json` to emit the raw agent payload. `kill` prompts for
+confirmation unless `--force` is passed; it removes the worktree unless
+`--keep-worktree` is also passed.
+
 ## Agent naming
 
 Agent ids are `<abbrev>/<task>`, max 20 chars total:
@@ -166,3 +195,4 @@ Lives under `~/.hermes/plugins/opencode-orchestrator/`:
 | 2.5 | ProjectBootstrap (shell + opencode-driven recovery + skill generation) |
 | 3 | Heartbeat DMs · CLI/gateway/dashboard sinks · 4h done retention |
 | 4 | FastAPI + React dashboard tab |
+| Slash & CLI commands ✓ | `/oc-list` / `/oc-attach` / `/oc-questions` slash commands · `hermes oco {list,status,attach,kill,projects}` CLI subcommand |
