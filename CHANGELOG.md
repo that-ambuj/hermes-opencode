@@ -5,6 +5,55 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] — 2026-05-17
+
+### Added
+
+- **Event-based notifications** on key state-machine transitions, not just
+  the hourly heartbeat. New event kinds:
+  - `pr_opened` — fires when an agent transitions to `PR_OPEN` with the PR
+    URL + branch in the body.
+  - `done` — fires when the PR merges and the agent transitions to `DONE`.
+  - `failed` — fires on any `FAILED` transition with the captured
+    `last_error`.
+  - `awaiting_human` — fires when a new pending `/question` is detected
+    for an agent (deduped per question_id so we don't replay on each
+    polling tick).
+  - `review_started` — fires when the reviewer session spawns on the
+    sister worktree.
+  Each event is gated by `notify.events.enabled` in the plugin config
+  (default: all five kinds enabled). Events fan out to the same sinks as
+  the heartbeat (`cli` / `gateway` / `dashboard`) and ALSO get logged
+  unconditionally to `~/.hermes/plugins/opencode-orchestrator/events.log`
+  as newline-delimited JSON for diagnostics.
+- **`events.log` diagnostic sink** at
+  `~/.hermes/plugins/opencode-orchestrator/events.log`. Every event the
+  plugin emits is appended regardless of which user-facing sinks are
+  configured, so `tail -f` on it gives a complete view even when no
+  gateway DM target is set up yet. Each line is JSON:
+  `{ts, kind, agent_id, project, phase, pr_url, title, body}`.
+
+### Fixed
+
+- **Heartbeat scheduler no longer dies silently** when `_runtime` is
+  briefly `None` at startup. Previously the `_heartbeat_loop` coro did
+  `if _runtime is None: return`, exiting forever if it raced the
+  `start(runtime)` setter. Now it retries every 10 s until `_runtime` is
+  populated. Same retry-instead-of-return guard added to `_pruner_loop`.
+- **Heartbeat scheduler now logs at INFO** when it computes the next
+  fire time and when it actually fires (sink results inline). Grep
+  `~/.hermes/logs/agent.log` for `heartbeat:` to debug.
+
+### Notes
+
+- If you weren't seeing heartbeats before, set
+  `oc_set_notify_target(platform="telegram", chat_id="...")` (or your
+  preferred platform/chat_id) so the gateway sink has a target. The CLI
+  sink only works inside an active interactive `hermes chat` session;
+  the dashboard sink writes to `notifications.jsonl` (visible in the
+  dashboard tab). With nothing configured the new `events.log` file
+  still captures everything for `tail -f` debugging.
+
 ## [0.5.1] — 2026-05-17
 
 ### Fixed
