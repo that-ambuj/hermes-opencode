@@ -93,7 +93,10 @@
                 onClick={() => onSelect && onSelect(a.agent_id)}
                 title="click to inspect"
               >
-                <td className="oco-mono oco-link-cell">{a.agent_id}</td>
+                <td className="oco-mono oco-link-cell">
+                  {a.agent_id}
+                  {a.archived && <span className="oco-archived-badge">archived</span>}
+                </td>
                 <td>{a.project_label}</td>
                 <td className="oco-mono">{a.branch}</td>
                 <td>
@@ -351,31 +354,40 @@
     const [lastRefreshAt, setLastRefreshAt] = React.useState(null);
     const [transport, setTransport] = React.useState("poll");
     const [selectedAgentId, setSelectedAgentId] = React.useState(null);
+    const [includeArchived, setIncludeArchived] = React.useState(false);
+    const [archivedHidden, setArchivedHidden] = React.useState(0);
     const selectedAgent = React.useMemo(
       () => agents.find((a) => a.agent_id === selectedAgentId) || null,
       [agents, selectedAgentId]
     );
 
-    const refresh = React.useCallback(async function () {
-      setRefreshing(true);
-      try {
-        const [a, p, h] = await Promise.all([
-          api("/agents"),
-          api("/projects"),
-          api("/heartbeats?n=5"),
-        ]);
-        setAgents((a && a.agents) || []);
-        setProjects((p && p.projects) || []);
-        setHeartbeats((h && h.items) || []);
-        setError(null);
-        setLastRefreshAt(Date.now() / 1000);
-      } catch (e) {
-        setError(String(e));
-      } finally {
-        setLoading(false);
-        setRefreshing(false);
-      }
-    }, []);
+    const refresh = React.useCallback(
+      async function () {
+        setRefreshing(true);
+        try {
+          const agentsPath = includeArchived
+            ? "/agents?include_archived=1"
+            : "/agents";
+          const [a, p, h] = await Promise.all([
+            api(agentsPath),
+            api("/projects"),
+            api("/heartbeats?n=5"),
+          ]);
+          setAgents((a && a.agents) || []);
+          setArchivedHidden((a && a.archived_hidden) || 0);
+          setProjects((p && p.projects) || []);
+          setHeartbeats((h && h.items) || []);
+          setError(null);
+          setLastRefreshAt(Date.now() / 1000);
+        } catch (e) {
+          setError(String(e));
+        } finally {
+          setLoading(false);
+          setRefreshing(false);
+        }
+      },
+      [includeArchived]
+    );
 
     React.useEffect(
       function () {
@@ -395,12 +407,14 @@
         try {
           const token = window.__HERMES_SESSION_TOKEN__ || "";
           const proto = location.protocol === "https:" ? "wss:" : "ws:";
+          const archivedQ = includeArchived ? "&include_archived=1" : "";
           const url =
             proto +
             "//" +
             location.host +
             "/api/plugins/hermes-opencode/events?token=" +
-            encodeURIComponent(token);
+            encodeURIComponent(token) +
+            archivedQ;
           ws = new WebSocket(url);
           ws.onopen = function () {
             connectedAt = Date.now();
@@ -413,9 +427,11 @@
               if (msg.type === "snapshot") {
                 if (Array.isArray(msg.agents)) setAgents(msg.agents);
                 if (Array.isArray(msg.projects)) setProjects(msg.projects);
+                if (typeof msg.archived_hidden === "number") setArchivedHidden(msg.archived_hidden);
                 setLastRefreshAt(Date.now() / 1000);
               } else if (msg.type === "agents") {
                 if (Array.isArray(msg.agents)) setAgents(msg.agents);
+                if (typeof msg.archived_hidden === "number") setArchivedHidden(msg.archived_hidden);
                 setLastRefreshAt(Date.now() / 1000);
               } else if (msg.type === "heartbeat") {
                 if (Array.isArray(msg.items)) {
@@ -446,7 +462,7 @@
           }
         };
       },
-      [refresh]
+      [refresh, includeArchived]
     );
 
     return (
@@ -454,11 +470,23 @@
         <header className="oco-header">
           <div className="oco-header-row">
             <h1>Opencode Agents</h1>
-            <RefreshButton
-              onClick={refresh}
-              refreshing={refreshing}
-              lastRefreshAt={lastRefreshAt}
-            />
+            <div className="oco-header-actions">
+              <label className="oco-archive-toggle">
+                <input
+                  type="checkbox"
+                  checked={includeArchived}
+                  onChange={(e) => setIncludeArchived(e.target.checked)}
+                />
+                <span>
+                  show archived{archivedHidden > 0 && !includeArchived ? " (" + archivedHidden + " hidden)" : ""}
+                </span>
+              </label>
+              <RefreshButton
+                onClick={refresh}
+                refreshing={refreshing}
+                lastRefreshAt={lastRefreshAt}
+              />
+            </div>
           </div>
           <div className="oco-stats">
             <span>

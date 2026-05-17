@@ -5,6 +5,89 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] - 2026-05-17
+
+### Added
+
+- **Archived agents.** DONE agents older than 12 h are now marked
+  `archived=True` in `agents.json` (still on disk, just hidden) instead of
+  being hard-deleted after 4 h. The previous `_archive_done(...)` history
+  append is retained for audit; what changes is that the row stays in
+  `agents.json` so the dashboard / CLI can still surface it on demand.
+- **`/oc list --all`** and **`hermes oco list --all` / `-a`** to include
+  archived agents in the listing. Default behaviour hides them. When all
+  visible agents are archived, `/oc list` returns a hint that `--all` is
+  required.
+- **Dashboard archived toggle.** New checkbox in the Opencode Agents
+  header (`show archived`) toggles the `?include_archived=1` query string
+  on `/api/plugins/hermes-opencode/agents` and on the events WebSocket.
+  Archived rows render with a muted `archived` badge next to the agent
+  id. The header surfaces the hidden-count when archived items are
+  filtered out.
+- **Executor-driven PR open** (`reviewer.executor_open_pr`). After
+  reviewer LGTM (or cycle exhaustion), the plugin no longer shells out
+  to `gh pr create --fill` itself. Instead it sends a structured prompt
+  to the executor's existing opencode session asking it to commit any
+  pending diff, push the branch, and run `gh pr create` with a concrete
+  title + summary; the executor emits a `PR_OPENED: <url>` sentinel line
+  that the plugin parses. Falls back to the plugin-driven
+  `finalize_and_open_pr(...)` path when extraction fails. Two
+  consequences: (a) PR titles + bodies are now written by the agent with
+  full task context instead of a slugified agent id + verbatim prompt
+  dump, and (b) the PR commit lands under the user's normal git identity
+  because the executor's shell tool inherits it.
+
+### Fixed
+
+- **Commits no longer hard-forced to the `hermes-opencode@local` git
+  identity.** `reviewer.stage_reviewer_worktree` previously passed
+  `-c user.email=hermes-opencode@local -c user.name=hermes-opencode` on
+  the pre-review staging commit, which made every PR show the executor's
+  attribution as the plugin instead of the user's configured git
+  identity. The staging commit now runs without those overrides; if
+  git has no user configured it surfaces a typed `GitError` instead of
+  silently swapping the author.
+- **Ambiguous review verdicts no longer silently loop in `REVIEWING`.**
+  When the reviewer emits neither `REVIEW: LGTM` nor
+  `REVIEW: REQUESTS_CHANGES`, the classifier returns `ambiguous`;
+  previously `_handle_review_text` did nothing in that branch, leaving
+  the agent stuck. The same code path that handles `requests_changes`
+  now runs for `ambiguous`, with the full reviewer text forwarded to the
+  executor and normal cycle accounting applied.
+- **Tightened reviewer prompt.** The reviewer is now explicitly required
+  to run `git diff origin/<base>...HEAD`, read every changed hunk, and
+  reject LGTM on untested behaviour changes, dead code, silently
+  swallowed errors, placeholders, or scope creep. Concrete file+line
+  citations are mandatory on any non-LGTM verdict. Replaces the prior
+  generic prompt that under-specified the bar for LGTM and contributed
+  to rubber-stamp reviews on shallow plan-agent passes.
+- **`/oc list` PR url visibility.** The PR url (when set) is now on the
+  primary line of each agent block instead of a separate continuation
+  line tucked under PR_OPEN / DONE. iMessage / Slack / Discord render
+  the url as a tap-target without needing to expand the row. The PR
+  number-only fallback (`PR #N`) still applies when only `pr_number` is
+  known.
+
+### Internal
+
+- `Agent.archived: bool = False` + `Agent.archived_at: float | None`
+  added to the dataclass. Old `agents.json` rows missing those keys load
+  with the defaults (verified by test
+  `test_old_rows_without_archived_field_load_with_default`).
+- `event_loop._pruner_loop` now archives instead of deleting; the
+  constant `DONE_RETENTION_SEC = 4 * 3600.0` is replaced by
+  `ARCHIVE_AFTER_SEC = 12 * 3600.0`.
+- `event_loop._phase_committing` calls
+  `reviewer.executor_open_pr(...)` first and only falls back to
+  `reviewer.finalize_and_open_pr(...)` when no PR url is extracted.
+- New helpers in `reviewer.py`: `executor_open_pr_prompt(branch, base)`,
+  `parse_pr_opened(text)`, `executor_open_pr(client, agent, base, *, timeout_sec)`.
+- 15 new tests across `test_commands.py`, `test_pure_logic.py`, and
+  `test_registries.py` covering archived filtering, the `--all` flag,
+  PR-url primary-line promotion, `parse_pr_opened` extraction, the
+  executor-PR prompt invariants, and the migration-tolerance for old
+  agent rows.
+
 ## [0.9.1] — 2026-05-17
 
 ### Fixed

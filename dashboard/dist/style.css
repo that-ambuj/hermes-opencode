@@ -72,3 +72,8 @@
 .oco-heartbeat { border: 1px solid var(--color-border); border-radius: 6px; padding: 0.6rem 0.85rem; background: color-mix(in srgb, var(--color-card) 60%, transparent); color: var(--color-foreground); }
 .oco-heartbeat-when { font-size: 0.75rem; color: var(--color-muted-foreground); margin-bottom: 0.4rem; font-family: var(--font-mono, ui-monospace, monospace); }
 .oco-heartbeat-body { margin: 0; font-family: var(--font-mono, ui-monospace, monospace); font-size: 0.82rem; white-space: pre-wrap; line-height: 1.5; color: var(--color-foreground); }
+
+.oco-header-actions { display: flex; align-items: center; gap: 0.75rem; }
+.oco-archive-toggle { display: inline-flex; align-items: center; gap: 0.35rem; font-size: 0.8rem; color: var(--color-muted-foreground); cursor: pointer; user-select: none; }
+.oco-archive-toggle input { accent-color: var(--color-primary); cursor: pointer; }
+.oco-archived-badge { margin-left: 0.4rem; padding: 0.05rem 0.4rem; border-radius: 4px; background: color-mix(in srgb, var(--color-muted-foreground) 25%, transparent); color: var(--color-muted-foreground); font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.05em; }

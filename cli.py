@@ -45,11 +45,15 @@ def build_context() -> CliContext:
 def setup(subparser: argparse.ArgumentParser) -> None:
     subs = subparser.add_subparsers(dest="oco_command")
 
-    subs.add_parser("list", help="List tracked agents (same as /oc-list).")
+    list_p = subs.add_parser("list", help="List tracked agents (same as /oc list).")
+    list_p.add_argument("--all", "-a", dest="include_archived", action="store_true",
+                        help="Also include archived (DONE > 12h) agents.")
 
     status_p = subs.add_parser("status", help="Show status for one or all agents.")
     status_p.add_argument("agent_id", nargs="?", default=None)
     status_p.add_argument("--json", dest="as_json", action="store_true", help="Emit raw JSON.")
+    status_p.add_argument("--all", "-a", dest="include_archived", action="store_true",
+                          help="Include archived agents when listing all.")
 
     attach_p = subs.add_parser("attach", help="Print the last N lines of an agent transcript.")
     attach_p.add_argument("agent_id")
@@ -85,7 +89,8 @@ def handler(args: argparse.Namespace) -> int:
 def cmd_list(args: argparse.Namespace) -> int:
     ctx = build_context()
     agents = sorted(ctx.agents.list(), key=lambda a: a.created_at)
-    print(commands_mod._fmt_list(agents))
+    include_archived = bool(getattr(args, "include_archived", False))
+    print(commands_mod._fmt_list(agents, include_archived=include_archived))
     return 0
 
 
@@ -93,6 +98,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     ctx = build_context()
     agent_id = getattr(args, "agent_id", None)
     as_json = bool(getattr(args, "as_json", False))
+    include_archived = bool(getattr(args, "include_archived", False))
     if agent_id:
         agent = ctx.agents.get(agent_id)
         if agent is None:
@@ -106,10 +112,11 @@ def cmd_status(args: argparse.Namespace) -> int:
         return 0
     agents = sorted(ctx.agents.list(), key=lambda a: a.created_at)
     if as_json:
-        rows = [asdict(a) for a in agents]
+        visible = [a for a in agents if include_archived or not a.archived]
+        rows = [asdict(a) for a in visible]
         print(json.dumps({"agents": rows, "count": len(rows)}, default=str, indent=2))
         return 0
-    print(commands_mod._fmt_list(agents))
+    print(commands_mod._fmt_list(agents, include_archived=include_archived))
     return 0
 
 

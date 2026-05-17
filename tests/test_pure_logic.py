@@ -209,3 +209,40 @@ class TestReviewCycleClassifier:
     def test_higher_cap_allows_more_rounds(self):
         assert event_loop_mod.decide_review_action(1, 3) == "address"
         assert event_loop_mod.decide_review_action(3, 3) == "exhausted"
+
+
+class TestExecutorOpenPrParse:
+    def test_parses_canonical_pr_opened_line(self):
+        text = "Did the thing.\n\nPR_OPENED: https://github.com/o/r/pull/42\n"
+        url, num = reviewer_mod.parse_pr_opened(text)
+        assert url == "https://github.com/o/r/pull/42"
+        assert num == 42
+
+    def test_parses_lowercase_marker(self):
+        text = "pr_opened: https://github.com/o/r/pull/9"
+        url, num = reviewer_mod.parse_pr_opened(text)
+        assert num == 9
+
+    def test_fallback_finds_pr_url_without_marker(self):
+        text = "Opened the PR at https://github.com/o/r/pull/77 - it's there."
+        parsed = reviewer_mod.parse_pr_opened(text)
+        assert parsed is not None
+        assert parsed[1] == 77
+
+    def test_returns_none_when_no_pr_url(self):
+        assert reviewer_mod.parse_pr_opened("Nothing here, just text.") is None
+        assert reviewer_mod.parse_pr_opened("") is None
+        assert reviewer_mod.parse_pr_opened(None) is None
+
+
+class TestExecutorOpenPrPrompt:
+    def test_includes_branch_and_base(self):
+        prompt = reviewer_mod.executor_open_pr_prompt("oco/x", "main")
+        assert "oco/x" in prompt
+        assert "main" in prompt
+        assert "PR_OPENED:" in prompt
+
+    def test_does_not_force_identity_override(self):
+        prompt = reviewer_mod.executor_open_pr_prompt("oco/x", "main")
+        assert "hermes-opencode@local" not in prompt
+        assert "do NOT pass" in prompt or "do not pass" in prompt.lower()

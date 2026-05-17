@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 import shutil
 from dataclasses import dataclass
@@ -15,8 +16,12 @@ from .transport import OpencodeClient, OpencodeError
 _LGTM_RE = re.compile(r"\bREVIEW\s*:\s*LGTM\b", re.IGNORECASE)
 _REQUEST_RE = re.compile(r"\bREVIEW\s*:\s*REQUESTS?_CHANGES\b", re.IGNORECASE)
 _COLLISION_SUFFIX_RE = re.compile(r"-\d+$")
+_PR_OPENED_LINE_RE = re.compile(r"PR_OPENED:\s*(https?://[^\s]+/pull/(\d+))", re.IGNORECASE)
+_PR_URL_FALLBACK_RE = re.compile(r"https?://github\.com/[^\s)]+/pull/(\d+)")
 
 REVIEWER_AGENT_TYPE = "plan"
+
+logger = logging.getLogger("hermes_opencode.reviewer")
 
 
 def _pr_title_from_agent_id(agent_id: str) -> str:
@@ -30,18 +35,22 @@ def _pr_title_from_agent_id(agent_id: str) -> str:
 
 def reviewer_prompt(executor_initial_prompt: str, base_branch: str) -> str:
     return (
-        "You are a code reviewer. A peer agent was given this task:\n\n"
-        "«««\n"
+        "You are a strict code reviewer. A peer agent was given this task:\n\n"
+        "<<<TASK\n"
         f"{executor_initial_prompt}\n"
-        "»»»\n\n"
-        f"Their work is the diff on this worktree's current branch vs origin/{base_branch} (or local HEAD if no remote). "
-        "Read the diff (`git diff` from your shell, or `git log`), then assess: correctness, scope creep, "
-        "missing tests, style fit.\n\n"
-        "Emit one of these tokens on its own line at the end:\n"
-        "  REVIEW: LGTM             — if no changes needed\n"
-        "  REVIEW: REQUESTS_CHANGES — if you have feedback\n\n"
-        "If you emit REQUESTS_CHANGES, list the change requests above the token as a numbered list. "
-        "Be specific (file + line + what to do)."
+        "TASK>>>\n\n"
+        "Procedure (mandatory, in order):\n"
+        f"  1. Run `git diff origin/{base_branch}...HEAD` and read EVERY changed hunk. If no remote, "
+        f"     fall back to `git log --patch {base_branch}..HEAD`.\n"
+        "  2. For each changed file, evaluate: correctness (does it actually solve the task), scope creep "
+        "     (changes outside the task), missing tests, error-handling gaps, style fit with surrounding code.\n"
+        "  3. Reject LGTM if ANY of these hold: untested behavior change, dead code, silently swallowed errors, "
+        "     placeholder values, work that doesn't match the task above.\n\n"
+        "Output format:\n"
+        "  - If requesting changes: a numbered list of concrete change requests, each citing FILE + LINE + "
+        "    the exact fix. Then emit the line: REVIEW: REQUESTS_CHANGES\n"
+        "  - If everything passes the procedure above: emit the line: REVIEW: LGTM\n\n"
+        "Emit exactly one of those two tokens, on its own line, at the very end."
     )
 
 
@@ -83,11 +92,14 @@ def stage_reviewer_worktree(
     if wt._git(executor_worktree, "status", "--porcelain", check=False).stdout.strip():
         cleaned = _pr_title_from_agent_id(executor.agent_id)
         wt._git(executor_worktree, "add", "-A")
-        wt._git(
-            executor_worktree, "-c", "user.email=hermes-opencode@local",
-            "-c", "user.name=hermes-opencode",
-            "commit", "-m", f"chore: {cleaned}",
+        commit_res = wt._git(
+            executor_worktree, "commit", "-m", f"chore: {cleaned}", check=False,
         )
+        if commit_res.returncode != 0:
+            raise wt.GitError(
+                f"staging commit failed (cwd={executor_worktree}): "
+                f"{(commit_res.stderr or commit_res.stdout).strip()}"
+            )
     sister = reviewer_worktree_path(executor_worktree)
     if sister.exists():
         try:
@@ -136,3 +148,59 @@ async def finalize_and_open_pr(
         worktree, base_branch=base_branch, title=cleaned_title,
         body=f"Initial task:\n\n{agent.initial_prompt}\n\n---\nopened by hermes-opencode for `{agent.agent_id}`",
     )
+
+
+def executor_open_pr_prompt(branch: str, base_branch: str) -> str:
+    return (
+        "Your task is complete and code review has signed off. Open a pull request for your work.\n\n"
+        "Steps (run them in your shell tool, in order):\n"
+        "  1. If `git status --porcelain` shows any uncommitted or untracked changes, stage and commit them "
+        "     with a single clear commit message that summarizes what you did. Use the user's existing git "
+        "     identity; do NOT pass `-c user.email=...` or `-c user.name=...`.\n"
+        f"  2. Push the branch: `git push -u origin {branch}`.\n"
+        f"  3. Open the PR: `gh pr create --base {base_branch} --title \"<concise title>\" "
+        "--body \"<markdown summary>\"`. The title should describe the change in <= 72 chars. The body should "
+        "be a short markdown summary of what changed and why; reference notable files if helpful. Do NOT paste "
+        "the original task prompt into the body.\n"
+        f"  4. If the PR already exists for branch `{branch}`, run `gh pr view --json url,number` to fetch it "
+        "     instead of failing.\n\n"
+        "After the PR exists, emit ONE line in this exact format on its own line, then stop:\n"
+        "  PR_OPENED: <full github pull request url>\n\n"
+        "If anything in steps 1-4 fails, fix it and retry. Do not give up silently."
+    )
+
+
+def parse_pr_opened(text: str) -> tuple[str, int] | None:
+    m = _PR_OPENED_LINE_RE.search(text or "")
+    if m:
+        return m.group(1), int(m.group(2))
+    m = _PR_URL_FALLBACK_RE.search(text or "")
+    if m:
+        return m.group(0), int(m.group(1))
+    return None
+
+
+async def executor_open_pr(
+    client: OpencodeClient, agent: Agent, base_branch: str, *, timeout_sec: float = 900.0,
+) -> pr.PrInfo | None:
+    worktree = Path(agent.worktree_path)
+    prompt = executor_open_pr_prompt(agent.branch, base_branch)
+    try:
+        resp = await client.send_message(agent.session_id, worktree, prompt, timeout=timeout_sec)
+    except OpencodeError as e:
+        logger.warning("executor_open_pr: send_message failed for %s: %s", agent.agent_id, e)
+        return None
+    final_text = OpencodeClient.extract_assistant_text(resp)
+    parsed = parse_pr_opened(final_text)
+    if not parsed:
+        logger.warning("executor_open_pr: no PR url emitted by executor for %s; falling back", agent.agent_id)
+        return None
+    url, number = parsed
+    try:
+        info = pr.pr_state(worktree, number)
+        if info.url:
+            return info
+        return pr.PrInfo(number=number, url=url, state="OPEN", merged_at=None)
+    except pr.PrError as e:
+        logger.warning("executor_open_pr: pr_state(%s) failed: %s; using parsed url", number, e)
+        return pr.PrInfo(number=number, url=url, state="OPEN", merged_at=None)

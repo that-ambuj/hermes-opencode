@@ -121,13 +121,22 @@ async def health() -> dict[str, Any]:
 
 
 @router.get("/agents")
-async def list_agents() -> dict[str, Any]:
+async def list_agents(include_archived: int = 0) -> dict[str, Any]:
     data = _read_json(_state_dir() / "agents.json")
     if not isinstance(data, dict):
-        return {"agents": [], "count": 0}
+        return {"agents": [], "count": 0, "archived_hidden": 0}
     rows = list(data.values())
+    hidden = 0
+    if not include_archived:
+        kept: list[dict] = []
+        for r in rows:
+            if r.get("archived"):
+                hidden += 1
+            else:
+                kept.append(r)
+        rows = kept
     rows.sort(key=lambda r: r.get("last_activity_at") or 0, reverse=True)
-    return {"agents": rows, "count": len(rows)}
+    return {"agents": rows, "count": len(rows), "archived_hidden": hidden}
 
 
 @router.get("/agents/{agent_id:path}")
@@ -185,11 +194,20 @@ def _check_ws_token(provided: str | None) -> bool:
     return hmac.compare_digest(str(provided), str(expected))
 
 
-def _snapshot_payload() -> dict[str, Any]:
+def _snapshot_payload(include_archived: bool = False) -> dict[str, Any]:
     sd = _state_dir()
     agents_data = _read_json(sd / "agents.json")
     projects_data = _read_json(sd / "projects.json")
     agents_rows = list(agents_data.values()) if isinstance(agents_data, dict) else []
+    archived_hidden = 0
+    if not include_archived:
+        kept: list[dict] = []
+        for r in agents_rows:
+            if r.get("archived"):
+                archived_hidden += 1
+            else:
+                kept.append(r)
+        agents_rows = kept
     agents_rows.sort(key=lambda r: r.get("last_activity_at") or 0, reverse=True)
     projects_rows = list(projects_data.values()) if isinstance(projects_data, dict) else []
     for r in projects_rows:
@@ -197,7 +215,7 @@ def _snapshot_payload() -> dict[str, Any]:
         if repo_path:
             r["repo_exists"] = Path(repo_path).is_dir()
     projects_rows.sort(key=lambda r: r.get("created_at") or 0, reverse=True)
-    return {"type": "snapshot", "agents": agents_rows, "projects": projects_rows}
+    return {"type": "snapshot", "agents": agents_rows, "projects": projects_rows, "archived_hidden": archived_hidden}
 
 
 def _read_jsonl_since(path: Path, byte_offset: int) -> tuple[list[dict], int]:
@@ -240,12 +258,14 @@ async def events_ws(websocket: "WebSocket") -> None:
     if not _check_ws_token(token):
         await websocket.close(code=http_status.WS_1008_POLICY_VIOLATION)
         return
+    include_archived_q = websocket.query_params.get("include_archived")
+    include_archived = bool(include_archived_q and include_archived_q not in ("0", "false", "False", ""))
     await websocket.accept()
     sd = _state_dir()
     agents_path = sd / "agents.json"
     notif_path = sd / "notifications.jsonl"
     try:
-        await websocket.send_json(_snapshot_payload())
+        await websocket.send_json(_snapshot_payload(include_archived))
     except Exception:
         return
     agents_mtime = _file_mtime(agents_path)
@@ -261,9 +281,9 @@ async def events_ws(websocket: "WebSocket") -> None:
             new_agents_mtime = _file_mtime(agents_path)
             if new_agents_mtime != agents_mtime:
                 agents_mtime = new_agents_mtime
-                payload = _snapshot_payload()
+                payload = _snapshot_payload(include_archived)
                 try:
-                    await websocket.send_json({"type": "agents", "agents": payload["agents"]})
+                    await websocket.send_json({"type": "agents", "agents": payload["agents"], "archived_hidden": payload.get("archived_hidden", 0)})
                 except Exception:
                     return
             items, new_offset = _read_jsonl_since(notif_path, notif_offset)

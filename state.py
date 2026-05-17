@@ -45,6 +45,8 @@ class Agent:
     review_cycle_count: int = 0
     created_at: float = field(default_factory=time.time)
     last_activity_at: float = field(default_factory=time.time)
+    archived: bool = False
+    archived_at: float | None = None
 
 
 class AgentExists(ValueError):

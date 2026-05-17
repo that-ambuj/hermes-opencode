@@ -60,17 +60,41 @@ class TestFmtList:
         body = commands_mod._fmt_list([a1, a2], now_ts=a1.last_activity_at)
         assert "dp/x" in body and "ma/longer-name" in body
         assert "PR_OPEN" in body and "EXECUTING" in body
-        assert "PR #42" in body
         assert "example.test/pr/42" in body
 
     def test_pr_omitted_when_no_pr(self):
         body = commands_mod._fmt_list([_agent()])
         assert "PR #" not in body
+        assert "/pull/" not in body
 
-    def test_pr_number_shown_when_present(self):
+    def test_pr_url_promoted_to_primary_line(self):
         body = commands_mod._fmt_list([_agent(pr_number=123, phase="PR_OPEN", pr_url="https://x.test/pr/123")])
-        assert "PR #123" in body
-        assert "x.test/pr/123" in body
+        first_line = body.splitlines()[0]
+        assert "x.test/pr/123" in first_line
+
+    def test_pr_number_shown_when_url_missing(self):
+        body = commands_mod._fmt_list([_agent(pr_number=99, phase="PR_OPEN")])
+        assert "PR #99" in body
+
+    def test_archived_hidden_by_default(self):
+        live = _agent(agent_id="ma/a")
+        archived = _agent(agent_id="ma/b", phase="DONE", archived=True)
+        body = commands_mod._fmt_list([live, archived])
+        assert "ma/a" in body
+        assert "ma/b" not in body
+
+    def test_archived_shown_with_include_archived(self):
+        live = _agent(agent_id="ma/a")
+        archived = _agent(agent_id="ma/b", phase="DONE", archived=True, pr_url="https://x.test/pr/9")
+        body = commands_mod._fmt_list([live, archived], include_archived=True)
+        assert "ma/a" in body
+        assert "ma/b" in body
+        assert "archived" in body
+
+    def test_only_archived_hidden_returns_hint(self):
+        archived = _agent(agent_id="ma/old", phase="DONE", archived=True)
+        body = commands_mod._fmt_list([archived])
+        assert "--all" in body
 
     def test_failed_includes_error_continuation(self):
         body = commands_mod._fmt_list([_agent(phase="FAILED", last_error="reviewer staging: not a git repo")])
@@ -236,6 +260,36 @@ class TestOcListHandler:
         assert "dp/refunds" in out
         assert "ma/x" in out
         assert "EXECUTING" in out or "DONE" in out or "FAILED" in out
+
+    def test_all_flag_includes_archived(self, tmp_path: Path):
+        state = sys.modules["_oco_test_pkg.state"]
+        store = state.AgentStore(tmp_path / "agents.json")
+        store.add(_agent(agent_id="dp/live", project_label="dodo-payments", branch="dp/live"))
+        store.add(_agent(agent_id="dp/old", project_label="dodo-payments", branch="dp/old", phase="DONE", archived=True))
+
+        class _Stub:
+            def __init__(self):
+                self.agents = store
+
+        out_default = commands_mod.make_oc_list(_Stub())("")
+        assert "dp/live" in out_default
+        assert "dp/old" not in out_default
+
+        out_all = commands_mod.make_oc_list(_Stub())("--all")
+        assert "dp/live" in out_all
+        assert "dp/old" in out_all
+
+    def test_unknown_list_arg_returns_usage(self, tmp_path: Path):
+        state = sys.modules["_oco_test_pkg.state"]
+        store = state.AgentStore(tmp_path / "agents.json")
+
+        class _Stub:
+            def __init__(self):
+                self.agents = store
+
+        out = commands_mod.make_oc_list(_Stub())("--bogus")
+        assert "unknown arg" in out
+        assert "/oc list" in out
 
 
 class TestOcDispatcher:

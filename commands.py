@@ -46,24 +46,23 @@ _PHASE_GLYPH = {
 }
 
 
-def _fmt_list(agents: list["Agent"], now_ts: float | None = None) -> str:
-    """Channel-agnostic flow-oriented list — works in CLI and gateway alike.
-
-    Pattern lifted from eng-task-system: one primary line per agent with `·`
-    separators, plus an indented continuation line for states that carry
-    attention-worthy context (last_error, PR url, pending question hint).
-    No fixed-width column padding — iMessage / Slack / Discord render
-    proportional fonts that collapse columns.
-    """
+def _fmt_list(agents: list["Agent"], now_ts: float | None = None, *, include_archived: bool = False) -> str:
     if not agents:
         return "no agents tracked"
     now_ts = now_ts if now_ts is not None else time.time()
+    visible = [a for a in agents if include_archived or not getattr(a, "archived", False)]
+    if not visible:
+        return "no agents tracked (use --all to include archived)"
     blocks: list[str] = []
-    for a in agents:
+    for a in visible:
         glyph = _PHASE_GLYPH.get(a.phase, "•")
         age = _format_age(now_ts - a.last_activity_at)
         parts = [f"{glyph} {a.agent_id}", a.phase, age]
-        if a.pr_number:
+        if getattr(a, "archived", False):
+            parts.append("archived")
+        if a.pr_url:
+            parts.append(a.pr_url)
+        elif a.pr_number:
             parts.append(f"PR #{a.pr_number}")
         primary = " · ".join(parts)
         cont = _continuation_line(a)
@@ -74,10 +73,8 @@ def _fmt_list(agents: list["Agent"], now_ts: float | None = None) -> str:
 def _continuation_line(a: "Agent") -> str | None:
     if a.phase == "FAILED" and a.last_error:
         return f"error: {a.last_error[:160]}"
-    if a.phase == "PR_OPEN" and a.pr_url:
-        return a.pr_url
-    if a.phase == "DONE" and a.pr_url:
-        return f"merged · {a.pr_url}"
+    if a.phase == "DONE" and a.pr_url is None:
+        return "merged"
     return None
 
 
@@ -131,8 +128,18 @@ def _parse_oc_attach_args(raw_args: str) -> tuple[str | None, int, str | None]:
 
 def make_oc_list(runtime: "Runtime") -> Callable[[str], str]:
     def handler(raw_args: str) -> str:
+        tokens = (raw_args or "").split()
+        include_archived = False
+        unknown: list[str] = []
+        for tok in tokens:
+            if tok in ("--all", "-a"):
+                include_archived = True
+            else:
+                unknown.append(tok)
+        if unknown:
+            return f"unknown arg(s): {' '.join(unknown)}\nusage: /oc list [--all]"
         agents = sorted(runtime.agents.list(), key=lambda a: a.created_at)
-        return _fmt_list(agents)
+        return _fmt_list(agents, include_archived=include_archived)
     return handler
 
 
@@ -292,10 +299,10 @@ def make_oc_questions(runtime: "Runtime") -> Callable[[str], str]:
 
 
 _OC_HELP_TEXT = (
-    "/oc — hermes-opencode slash command\n"
+    "/oc - hermes-opencode slash command\n"
     "\n"
     "subcommands:\n"
-    "  /oc list                              list tracked agents (one line per agent, status + age + pr)\n"
+    "  /oc list [--all]                      list tracked agents (one line per agent, status + age + pr_url); --all also shows archived\n"
     "  /oc attach <agent_id> [--lines N]     print the last N (default 80) lines of an agent's transcript\n"
     "  /oc questions                         list pending opencode questions awaiting a human answer\n"
     "  /oc doctor                            plugin health report (versions, bg loop alive, deps, state files)\n"

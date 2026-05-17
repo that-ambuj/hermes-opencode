@@ -25,11 +25,14 @@ TERMINAL_PHASES = {"DONE", "KILLED", "FAILED"}
 IDLE_DEBOUNCE_SEC = 30.0
 PR_POLL_SEC = 300.0
 PRUNE_INTERVAL_SEC = 60.0
-DONE_RETENTION_SEC = 4 * 3600.0
+ARCHIVE_AFTER_SEC = 12 * 3600.0
 CLEANUP_INTERVAL_SEC = 12 * 3600.0
 EVENTS_LOG_MAX_LINES = 5000
 NOTIFICATIONS_MAX_LINES = 1000
 HISTORY_RETAIN_DAYS = 30.0
+PR_OPEN_TIMEOUT_SEC = 900.0
+PR_OPENED_RE_PATTERN = r"PR_OPENED:\s*(https?://[^\s]+/pull/\d+)"
+PR_URL_FALLBACK_RE_PATTERN = r"https?://github\.com/[^\s]+/pull/(\d+)"
 
 _state_lock = threading.Lock()
 _thread: threading.Thread | None = None
@@ -429,10 +432,15 @@ async def _pruner_loop() -> None:
         try:
             now = time.time()
             for agent in list(_runtime.agents.list()):
-                if agent.phase == "DONE" and agent.done_at and (now - agent.done_at) > DONE_RETENTION_SEC:
+                if (
+                    agent.phase == "DONE"
+                    and not agent.archived
+                    and agent.done_at
+                    and (now - agent.done_at) > ARCHIVE_AFTER_SEC
+                ):
                     _archive_done(agent)
-                    _runtime.agents.remove(agent.agent_id)
-                    logger.info("pruned DONE agent %s after %.0fs", agent.agent_id, now - agent.done_at)
+                    _runtime.agents.update(agent.agent_id, archived=True, archived_at=now)
+                    logger.info("archived DONE agent %s after %.0fs", agent.agent_id, now - agent.done_at)
         except Exception as e:
             logger.warning("pruner tick failed: %s", e)
         await asyncio.sleep(PRUNE_INTERVAL_SEC)
@@ -643,12 +651,12 @@ async def _handle_review_text(agent: Agent, reviewer_text: str) -> None:
     if verdict.kind == "lgtm":
         _runtime.agents.update(agent.agent_id, phase="COMMITTING")
         return
-    if verdict.kind == "requests_changes":
+    if verdict.kind in ("requests_changes", "ambiguous"):
         action = decide_review_action(agent.review_cycle_count, _runtime.config.review_max_cycles)
         if action == "exhausted":
             logger.info(
-                "agent %s: review cycles exhausted (count=%d, cap=%d) - proceeding to COMMITTING",
-                agent.agent_id, agent.review_cycle_count, _runtime.config.review_max_cycles,
+                "agent %s: review cycles exhausted (count=%d, cap=%d, verdict=%s) - proceeding to COMMITTING",
+                agent.agent_id, agent.review_cycle_count, _runtime.config.review_max_cycles, verdict.kind,
             )
             _runtime.agents.update(agent.agent_id, phase="COMMITTING", last_error=None)
             return
@@ -690,11 +698,16 @@ async def _phase_committing(agent: Agent) -> None:
         return
     if agent.reviewer_worktree_path:
         reviewer_mod.teardown_reviewer_worktree(project, Path(agent.worktree_path))
-    try:
-        info = await reviewer_mod.finalize_and_open_pr(project, agent, project.base_branch)
-    except pr_mod.PrError as e:
-        _maybe_notify_phase(_runtime.agents.update(agent.agent_id, phase="FAILED", last_error=f"pr open: {e}"), "failed")
-        return
+
+    info = await reviewer_mod.executor_open_pr(
+        _runtime.client, agent, project.base_branch, timeout_sec=PR_OPEN_TIMEOUT_SEC,
+    )
+    if info is None:
+        try:
+            info = await reviewer_mod.finalize_and_open_pr(project, agent, project.base_branch)
+        except pr_mod.PrError as e:
+            _maybe_notify_phase(_runtime.agents.update(agent.agent_id, phase="FAILED", last_error=f"pr open: {e}"), "failed")
+            return
     refreshed = _runtime.agents.update(
         agent.agent_id, phase="PR_OPEN",
         pr_url=info.url, pr_number=info.number,

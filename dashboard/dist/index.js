@@ -65,7 +65,7 @@
           onClick: () => onSelect && onSelect(a.agent_id),
           title: "click to inspect"
         },
-        /* @__PURE__ */ React.createElement("td", { className: "oco-mono oco-link-cell" }, a.agent_id),
+        /* @__PURE__ */ React.createElement("td", { className: "oco-mono oco-link-cell" }, a.agent_id, a.archived && /* @__PURE__ */ React.createElement("span", { className: "oco-archived-badge" }, "archived")),
         /* @__PURE__ */ React.createElement("td", null, a.project_label),
         /* @__PURE__ */ React.createElement("td", { className: "oco-mono" }, a.branch),
         /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement(PhaseCell, { phase: a.phase })),
@@ -218,30 +218,37 @@
       const [lastRefreshAt, setLastRefreshAt] = React.useState(null);
       const [transport, setTransport] = React.useState("poll");
       const [selectedAgentId, setSelectedAgentId] = React.useState(null);
+      const [includeArchived, setIncludeArchived] = React.useState(false);
+      const [archivedHidden, setArchivedHidden] = React.useState(0);
       const selectedAgent = React.useMemo(
         () => agents.find((a) => a.agent_id === selectedAgentId) || null,
         [agents, selectedAgentId]
       );
-      const refresh = React.useCallback(async function() {
-        setRefreshing(true);
-        try {
-          const [a, p, h] = await Promise.all([
-            api("/agents"),
-            api("/projects"),
-            api("/heartbeats?n=5")
-          ]);
-          setAgents(a && a.agents || []);
-          setProjects(p && p.projects || []);
-          setHeartbeats(h && h.items || []);
-          setError(null);
-          setLastRefreshAt(Date.now() / 1e3);
-        } catch (e) {
-          setError(String(e));
-        } finally {
-          setLoading(false);
-          setRefreshing(false);
-        }
-      }, []);
+      const refresh = React.useCallback(
+        async function() {
+          setRefreshing(true);
+          try {
+            const agentsPath = includeArchived ? "/agents?include_archived=1" : "/agents";
+            const [a, p, h] = await Promise.all([
+              api(agentsPath),
+              api("/projects"),
+              api("/heartbeats?n=5")
+            ]);
+            setAgents(a && a.agents || []);
+            setArchivedHidden(a && a.archived_hidden || 0);
+            setProjects(p && p.projects || []);
+            setHeartbeats(h && h.items || []);
+            setError(null);
+            setLastRefreshAt(Date.now() / 1e3);
+          } catch (e) {
+            setError(String(e));
+          } finally {
+            setLoading(false);
+            setRefreshing(false);
+          }
+        },
+        [includeArchived]
+      );
       React.useEffect(
         function() {
           refresh();
@@ -258,7 +265,8 @@
           try {
             const token = window.__HERMES_SESSION_TOKEN__ || "";
             const proto = location.protocol === "https:" ? "wss:" : "ws:";
-            const url = proto + "//" + location.host + "/api/plugins/hermes-opencode/events?token=" + encodeURIComponent(token);
+            const archivedQ = includeArchived ? "&include_archived=1" : "";
+            const url = proto + "//" + location.host + "/api/plugins/hermes-opencode/events?token=" + encodeURIComponent(token) + archivedQ;
             ws = new WebSocket(url);
             ws.onopen = function() {
               connectedAt = Date.now();
@@ -271,9 +279,11 @@
                 if (msg.type === "snapshot") {
                   if (Array.isArray(msg.agents)) setAgents(msg.agents);
                   if (Array.isArray(msg.projects)) setProjects(msg.projects);
+                  if (typeof msg.archived_hidden === "number") setArchivedHidden(msg.archived_hidden);
                   setLastRefreshAt(Date.now() / 1e3);
                 } else if (msg.type === "agents") {
                   if (Array.isArray(msg.agents)) setAgents(msg.agents);
+                  if (typeof msg.archived_hidden === "number") setArchivedHidden(msg.archived_hidden);
                   setLastRefreshAt(Date.now() / 1e3);
                 } else if (msg.type === "heartbeat") {
                   if (Array.isArray(msg.items)) {
@@ -305,16 +315,23 @@
             }
           };
         },
-        [refresh]
+        [refresh, includeArchived]
       );
-      return /* @__PURE__ */ React.createElement("div", { className: "oco-page" }, /* @__PURE__ */ React.createElement("header", { className: "oco-header" }, /* @__PURE__ */ React.createElement("div", { className: "oco-header-row" }, /* @__PURE__ */ React.createElement("h1", null, "Opencode Agents"), /* @__PURE__ */ React.createElement(
+      return /* @__PURE__ */ React.createElement("div", { className: "oco-page" }, /* @__PURE__ */ React.createElement("header", { className: "oco-header" }, /* @__PURE__ */ React.createElement("div", { className: "oco-header-row" }, /* @__PURE__ */ React.createElement("h1", null, "Opencode Agents"), /* @__PURE__ */ React.createElement("div", { className: "oco-header-actions" }, /* @__PURE__ */ React.createElement("label", { className: "oco-archive-toggle" }, /* @__PURE__ */ React.createElement(
+        "input",
+        {
+          type: "checkbox",
+          checked: includeArchived,
+          onChange: (e) => setIncludeArchived(e.target.checked)
+        }
+      ), /* @__PURE__ */ React.createElement("span", null, "show archived", archivedHidden > 0 && !includeArchived ? " (" + archivedHidden + " hidden)" : "")), /* @__PURE__ */ React.createElement(
         RefreshButton,
         {
           onClick: refresh,
           refreshing,
           lastRefreshAt
         }
-      )), /* @__PURE__ */ React.createElement("div", { className: "oco-stats" }, /* @__PURE__ */ React.createElement("span", null, agents.length, " agent", agents.length === 1 ? "" : "s"), /* @__PURE__ */ React.createElement("span", { className: "oco-sep" }, "\xB7"), /* @__PURE__ */ React.createElement("span", null, projects.length, " project", projects.length === 1 ? "" : "s"), /* @__PURE__ */ React.createElement("span", { className: "oco-sep" }, "\xB7"), /* @__PURE__ */ React.createElement("span", { className: "oco-transport oco-transport-" + transport }, transport), lastRefreshAt && /* @__PURE__ */ React.createElement("span", { className: "oco-sep" }, "\xB7"), lastRefreshAt && /* @__PURE__ */ React.createElement("span", { className: "oco-loading" }, "updated ", formatAge(lastRefreshAt), " ago")), error && /* @__PURE__ */ React.createElement("div", { className: "oco-error" }, error)), /* @__PURE__ */ React.createElement("section", { className: "oco-section" }, /* @__PURE__ */ React.createElement("h2", null, "Agents"), /* @__PURE__ */ React.createElement(AgentsTable, { agents, onSelect: setSelectedAgentId })), /* @__PURE__ */ React.createElement("section", { className: "oco-section" }, /* @__PURE__ */ React.createElement("h2", null, "Projects"), /* @__PURE__ */ React.createElement(ProjectsTable, { projects })), /* @__PURE__ */ React.createElement("section", { className: "oco-section" }, /* @__PURE__ */ React.createElement("h2", null, "Recent heartbeats"), /* @__PURE__ */ React.createElement(HeartbeatsList, { items: heartbeats })), selectedAgent && /* @__PURE__ */ React.createElement(
+      ))), /* @__PURE__ */ React.createElement("div", { className: "oco-stats" }, /* @__PURE__ */ React.createElement("span", null, agents.length, " agent", agents.length === 1 ? "" : "s"), /* @__PURE__ */ React.createElement("span", { className: "oco-sep" }, "\xB7"), /* @__PURE__ */ React.createElement("span", null, projects.length, " project", projects.length === 1 ? "" : "s"), /* @__PURE__ */ React.createElement("span", { className: "oco-sep" }, "\xB7"), /* @__PURE__ */ React.createElement("span", { className: "oco-transport oco-transport-" + transport }, transport), lastRefreshAt && /* @__PURE__ */ React.createElement("span", { className: "oco-sep" }, "\xB7"), lastRefreshAt && /* @__PURE__ */ React.createElement("span", { className: "oco-loading" }, "updated ", formatAge(lastRefreshAt), " ago")), error && /* @__PURE__ */ React.createElement("div", { className: "oco-error" }, error)), /* @__PURE__ */ React.createElement("section", { className: "oco-section" }, /* @__PURE__ */ React.createElement("h2", null, "Agents"), /* @__PURE__ */ React.createElement(AgentsTable, { agents, onSelect: setSelectedAgentId })), /* @__PURE__ */ React.createElement("section", { className: "oco-section" }, /* @__PURE__ */ React.createElement("h2", null, "Projects"), /* @__PURE__ */ React.createElement(ProjectsTable, { projects })), /* @__PURE__ */ React.createElement("section", { className: "oco-section" }, /* @__PURE__ */ React.createElement("h2", null, "Recent heartbeats"), /* @__PURE__ */ React.createElement(HeartbeatsList, { items: heartbeats })), selectedAgent && /* @__PURE__ */ React.createElement(
         AgentDetailModal,
         {
           agent: selectedAgent,

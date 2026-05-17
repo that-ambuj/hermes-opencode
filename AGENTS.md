@@ -95,6 +95,59 @@ Critical idle-detection rule in `_phase_executing`:
 All four must hold to transition out of `EXECUTING`. The debounce exists
 because opencode may briefly report idle between tool calls.
 
+## Executor-driven PR open (LOAD-BEARING)
+
+After reviewer LGTM (or `decide_review_action(...)` returns `exhausted`),
+`event_loop._phase_committing` does NOT run `gh pr create --fill` itself
+anymore. Instead it sends a structured prompt to the executor's existing
+opencode session (`reviewer.executor_open_pr_prompt(...)`) telling the
+executor to:
+
+1. Commit any pending diff under the user's normal git identity (NO
+   `-c user.email=...` / `-c user.name=...` overrides).
+2. Push the branch.
+3. Run `gh pr create --base <base> --title <concise> --body <markdown
+   summary>` with a title and body the executor authors itself.
+4. Emit `PR_OPENED: <github pr url>` on its own line.
+
+The plugin parses the line via `reviewer.parse_pr_opened(...)` and sets
+`agent.pr_url` / `agent.pr_number`. Falls back to the original plugin-
+driven `reviewer.finalize_and_open_pr(...)` (which calls `pr.open_pr`
+with `--fill`) when extraction fails — that fallback is the safety net,
+not the default path.
+
+Why: the executor has full context for what was changed and why, so its
+PR title and body are concrete and relevant. The previous default
+generated `_pr_title_from_agent_id(agent_id)` (e.g. `"Fix bb gateway"`
+from `oco/fix-bb-gateway`) and a body that was just the verbatim initial
+prompt — useless on review.
+
+If you add new phases or shortcuts that bypass `_phase_committing`,
+either route them through this same executor-driven path or document
+why the slug-based fallback is acceptable for that path.
+
+## Archived agents (LOAD-BEARING)
+
+`Agent` carries `archived: bool` and `archived_at: float | None`. The
+pruner (`event_loop._pruner_loop`, 60 s tick) sets `archived=True` on
+DONE agents older than `ARCHIVE_AFTER_SEC = 12 h`. The row STAYS in
+`agents.json` — there is no longer a hard-delete after 4 h. Archive
+records continue to be appended to `history.jsonl` for audit via
+`_archive_done(...)` exactly as before; the difference is the live row
+survives.
+
+Default surfaces hide archived agents:
+- `/oc list` filters `archived=True` out; `/oc list --all` re-includes.
+- `hermes oco list` filters; `--all` / `-a` re-includes.
+- Dashboard `/agents` endpoint hides archived; pass
+  `?include_archived=1` to re-include. The events WebSocket honours the
+  same query param at connect time. The frontend exposes a `show
+  archived` checkbox.
+
+When adding NEW listing surfaces, default-hide archived and document
+the include knob. Never re-add a hard-delete path — that would lose the
+PR-merge audit trail the archived rows preserve.
+
 ## Reviewer worktree isolation (LOAD-BEARING)
 
 Two opencode sessions targeting the same `x-opencode-directory` SHARE
@@ -270,6 +323,17 @@ update `_pre_gateway_dispatch_hook` to match the new prefixes.
   atomic-write pattern.
 - **Reviewer session sharing the executor's worktree directory.** Always
   stage a sister `<wt>.review/` worktree first.
+- **Plugin-driven `gh pr create` as the default commit path.** Use the
+  executor-driven path (`reviewer.executor_open_pr`). The slug-based
+  `_pr_title_from_agent_id` + verbatim-prompt body is the fallback when
+  the executor fails to emit `PR_OPENED:` — not the primary surface.
+- **Hard-forcing git identity on plugin-side commits.** The
+  `-c user.email=hermes-opencode@local -c user.name=hermes-opencode`
+  overrides on the pre-review staging commit were dropped in 0.10.0.
+  Don't reintroduce them; let the user's git config stand and surface a
+  typed error if it's unset.
+- **Hard-deleting DONE agents from `agents.json`.** Use the archive
+  flag. Hard-deleting would lose the merged-PR audit trail.
 - **Marketing comments, AI-slop narration, em-dashes in code.** No.
 - **New top-level helpers files like `utils.py` / `helpers.py`.** Module
   names must describe what they own.

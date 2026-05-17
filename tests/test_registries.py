@@ -151,3 +151,48 @@ class TestAgentStore:
         store.add(self._agent(agent_id="ma/a"))
         store.add(self._agent(agent_id="ma/b"))
         assert store.ids() == {"ma/a", "ma/b"}
+
+    def test_archived_defaults_false_for_new_agent(self, tmp_path: Path):
+        store = state_mod.AgentStore(tmp_path / "agents.json")
+        store.add(self._agent())
+        got = store.get("ma/test")
+        assert got is not None
+        assert got.archived is False
+        assert got.archived_at is None
+
+    def test_archived_can_be_set_via_update(self, tmp_path: Path):
+        store = state_mod.AgentStore(tmp_path / "agents.json")
+        store.add(self._agent())
+        updated = store.update("ma/test", archived=True, archived_at=1234.5)
+        assert updated.archived is True
+        assert updated.archived_at == 1234.5
+
+    def test_old_rows_without_archived_field_load_with_default(self, tmp_path: Path):
+        import json
+        path = tmp_path / "agents.json"
+        path.write_text(json.dumps({
+            "ma/legacy": {
+                "agent_id": "ma/legacy",
+                "project_label": "my-app",
+                "worktree_path": "/t",
+                "session_id": "s",
+                "branch": "ma/legacy",
+                "initial_prompt": "x",
+                "phase": "DONE",
+                "last_cursor": None,
+                "reviewer_session_id": None,
+                "reviewer_worktree_path": None,
+                "pr_url": None,
+                "pr_number": None,
+                "pr_merged_at": None,
+                "done_at": 1.0,
+                "last_error": None,
+                "review_cycle_count": 0,
+                "created_at": 0.0,
+                "last_activity_at": 0.0,
+            }
+        }))
+        store = state_mod.AgentStore(path)
+        got = store.get("ma/legacy")
+        assert got is not None
+        assert got.archived is False
