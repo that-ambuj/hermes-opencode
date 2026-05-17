@@ -112,11 +112,13 @@ def _send_gateway(title: str, body: str, _meta: dict[str, Any], platform: str | 
         from model_tools import _run_async  # type: ignore
         result = _run_async(adapter.send(chat_id=chat_id, content=content))
     except ImportError:
-        import asyncio
+        from . import event_loop as event_loop_mod
         try:
-            result = asyncio.run(adapter.send(chat_id=chat_id, content=content))
+            result = event_loop_mod.run_blocking(
+                lambda: adapter.send(chat_id=chat_id, content=content)
+            )
         except RuntimeError as e:
-            return NotifyResult("gateway", False, f"asyncio.run failed: {e}")
+            return NotifyResult("gateway", False, f"run_blocking failed: {e}")
     except Exception as e:
         return NotifyResult("gateway", False, repr(e))
     ok = bool(getattr(result, "ok", True) if result is not None else False)

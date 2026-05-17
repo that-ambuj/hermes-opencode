@@ -378,6 +378,49 @@ def schedule(coro_factory) -> asyncio.Future | None:
     return asyncio.run_coroutine_threadsafe(coro_factory(), loop)
 
 
+def run_blocking(coro_factory, *, timeout: float = 60.0):
+    """Run a coroutine to completion from a sync context, returning its result.
+
+    Used by sync slash-command and gateway-dispatch handlers that need to
+    await an opencode HTTP call from a code path that may already be inside
+    a running asyncio loop (e.g. hermes' main session loop dispatching a
+    pre_gateway_dispatch hook or a registered slash command).
+
+    Prefers the plugin's background event loop (always running once
+    ``start(runtime)`` has been called) via ``run_coroutine_threadsafe`` so
+    we never call ``asyncio.run`` from inside a running loop — that raises
+    ``RuntimeError: asyncio.run() cannot be called from a running event
+    loop``, which is the bug class this helper exists to prevent.
+
+    Falls back to ``asyncio.run`` only when (a) the bg loop is not running
+    (e.g. the standalone ``hermes oco`` CLI path that builds its own
+    Runtime without calling ``event_loop.start``) AND (b) the caller is
+    not already inside a running event loop.
+
+    ``coro_factory`` is a zero-arg callable returning a fresh awaitable;
+    matches the ``schedule()`` API so a coroutine is never created in a
+    context that won't consume it.
+
+    Raises ``RuntimeError`` only when the caller is inside a running loop
+    AND the bg loop is unavailable — an exceptional configuration that
+    indicates the plugin was not registered correctly.
+    """
+    with _state_lock:
+        loop = _loop
+    if loop is not None and loop.is_running():
+        fut = asyncio.run_coroutine_threadsafe(coro_factory(), loop)
+        return fut.result(timeout=timeout)
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro_factory())
+    raise RuntimeError(
+        "run_blocking: caller is inside a running event loop and the "
+        "hermes-opencode background loop is not running. Ensure "
+        "event_loop.start(runtime) was called during plugin register()."
+    )
+
+
 async def _ensure_agent_task_async(agent_id: str) -> None:
     if _runtime is None:
         return
