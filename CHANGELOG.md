@@ -5,6 +5,48 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.2] - 2026-05-17
+
+### Fixed
+
+- **`/oc attach` and `/oc cancel` no longer crash with
+  `RuntimeError: asyncio.run() cannot be called from a running event loop`.**
+  Both slash-command handlers ([`make_oc_attach`](commands.py) and
+  [`make_oc_cancel`](commands.py)) were sync functions that called
+  `asyncio.run(...)` to dispatch the opencode HTTP round-trip. From the
+  hermes TUI dispatch path and the `pre_gateway_dispatch` hook path,
+  these handlers run on threads where hermes' main asyncio loop is
+  already active, so `asyncio.run` raised immediately and the user saw
+  the bare exception instead of the transcript / cancel result. The
+  same bug class affected the `notify_gateway` sink's adapter `send`
+  call when `model_tools._run_async` is unavailable
+  ([`notify._send_gateway`](notify.py)), where it manifested as a
+  silently failed `NotifyResult("gateway", False, "asyncio.run failed: ...")`
+  rather than a crash.
+
+### Added
+
+- **`event_loop.run_blocking(coro_factory, *, timeout=60.0)`** —
+  canonical helper for sync slash-command and hook handlers that need
+  to await an opencode HTTP call. Routes coroutines through the
+  plugin's already-running background event loop via
+  `asyncio.run_coroutine_threadsafe`, so it works whether or not the
+  caller's thread has its own running loop. Falls back to
+  `asyncio.run` only when the bg loop isn't running AND the caller
+  has no running loop (the standalone `hermes oco …` CLI path).
+  Raises a descriptive `RuntimeError` when inside a running loop with
+  no bg loop available (a plugin-registration error that won't occur
+  at runtime). Matches the existing `schedule()` signature — takes a
+  zero-arg factory so coroutines are never created in contexts that
+  won't consume them. All three previously broken call sites
+  (`make_oc_attach`, `make_oc_cancel`, `_send_gateway`) now route
+  through this helper.
+
+  Originally proposed as v0.14.6 in PR #7 (branch `oco/fix-attach`);
+  rebased onto current `main` and renumbered to v0.15.2 because the
+  v0.14.6 / v0.15.0 / v0.15.1 slots were claimed in-flight by other
+  releases.
+
 ## [0.15.1] - 2026-05-17
 
 Closes the known gap documented in v0.15.0: reviewer-session

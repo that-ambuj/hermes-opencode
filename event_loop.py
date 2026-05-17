@@ -388,9 +388,9 @@ def run_blocking(coro_factory, *, timeout: float = 60.0):
 
     Prefers the plugin's background event loop (always running once
     ``start(runtime)`` has been called) via ``run_coroutine_threadsafe`` so
-    we never call ``asyncio.run`` from inside a running loop — that raises
+    we never call ``asyncio.run`` from inside a running loop (that raises
     ``RuntimeError: asyncio.run() cannot be called from a running event
-    loop``, which is the bug class this helper exists to prevent.
+    loop``), which is the bug class this helper exists to prevent.
 
     Falls back to ``asyncio.run`` only when (a) the bg loop is not running
     (e.g. the standalone ``hermes oco`` CLI path that builds its own
@@ -402,7 +402,7 @@ def run_blocking(coro_factory, *, timeout: float = 60.0):
     context that won't consume it.
 
     Raises ``RuntimeError`` only when the caller is inside a running loop
-    AND the bg loop is unavailable — an exceptional configuration that
+    AND the bg loop is unavailable: an exceptional configuration that
     indicates the plugin was not registered correctly.
     """
     with _state_lock:

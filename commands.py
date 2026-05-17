@@ -303,7 +303,7 @@ def make_oc_attach(runtime: "Runtime") -> Callable[[str], str]:
         except OpencodeError as e:
             return f"transport error: {e}"
         except RuntimeError as e:
-            return f"transport error: {e}"
+            return f"plugin error (background loop unavailable): {e}"
         items = body.get("items") or []
         if not items:
             return "no transcript yet"
