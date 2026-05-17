@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.3] — 2026-05-17
+
+### Fixed
+
+- **Dashboard text was invisible** against the host theme. CSS used variable
+  names that don't exist in hermes' dashboard (`--foreground`, `--muted`,
+  `--border`); the fallback colors I shipped (`#ddd`, `#888`) collided with
+  whatever the host theme rendered, so text was only visible during selection.
+  Now uses the actual host variables: `--color-foreground`,
+  `--color-muted-foreground`, `--color-border`, `--color-card`,
+  `--color-primary`, `--color-ring`, `--font-mono`. Matches the convention
+  used by the bundled `hermes-achievements` dashboard plugin.
+
+### Added
+
+- **Dashboard refresh button** in the header row. Manually triggers a fetch
+  in addition to the 5s auto-poll; spins while in-flight; shows "updated Ns
+  ago" relative timestamp.
+- **Proper React source + build pipeline.** Previously `dashboard/dist/index.js`
+  was hand-edited vanilla `React.createElement` calls (build artifact masquerading
+  as source). Now:
+    - `dashboard/src/index.jsx` is the canonical source (proper JSX)
+    - `dashboard/package.json` declares esbuild as a devDep and exposes
+      `bun run build` (or `npm run build`) which compiles `src/index.jsx` →
+      `dist/index.js` using `--jsx-factory=React.createElement
+      --jsx-fragment=React.Fragment --format=iife`
+    - `dashboard/dist/` is still committed (hermes loads it at runtime)
+  Future dashboard work edits `src/`; `dist/` is regenerated.
+
 ## [0.3.2] — 2026-05-17
 
 ### Fixed

@@ -1,0 +1,14 @@
+{
+  "name": "opencode-orchestrator-dashboard",
+  "version": "0.3.3",
+  "private": true,
+  "description": "Dashboard frontend for the opencode-orchestrator hermes plugin. React via the host SDK (window.__HERMES_PLUGIN_SDK__); JSX compiled to React.createElement calls.",
+  "scripts": {
+    "build": "esbuild src/index.jsx --outfile=dist/index.js --jsx-factory=React.createElement --jsx-fragment=React.Fragment --format=iife --target=es2018 --log-level=warning",
+    "build:min": "esbuild src/index.jsx --outfile=dist/index.js --jsx-factory=React.createElement --jsx-fragment=React.Fragment --format=iife --target=es2018 --minify --log-level=warning",
+    "watch": "esbuild src/index.jsx --outfile=dist/index.js --jsx-factory=React.createElement --jsx-fragment=React.Fragment --format=iife --target=es2018 --watch"
+  },
+  "devDependencies": {
+    "esbuild": "^0.23.0"
+  }
+}

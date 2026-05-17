@@ -81,6 +81,38 @@ uv run --quiet scripts/phase0_opencode_spike.py --port 4099
 
 That script exercises every HTTP contract this plugin depends on. Keep it green.
 
+## Dashboard development
+
+The dashboard tab is a React component bundled to a single IIFE for the host
+plugin loader to inject. Edit the source, not the build artifact:
+
+```
+dashboard/
+├── manifest.json
+├── plugin_api.py        # FastAPI router mounted at /api/plugins/opencode-orchestrator/
+├── src/
+│   └── index.jsx        # CANONICAL SOURCE — edit here
+└── dist/
+    ├── index.js         # build output (committed; hermes loads it at runtime)
+    └── style.css        # plain CSS (no build step)
+```
+
+To iterate:
+
+```bash
+cd dashboard
+bun install              # or `npm install` — installs esbuild as a devDep
+bun run build            # compiles src/index.jsx → dist/index.js
+bun run watch            # rebuild on save
+```
+
+The host injects `window.__HERMES_PLUGIN_SDK__` (React + utils) and
+`window.__HERMES_PLUGINS__.register(name, Component)` at load time; auth uses
+`X-Hermes-Session-Token` from `window.__HERMES_SESSION_TOKEN__`. CSS variables
+come from the host theme: `--color-foreground`, `--color-muted-foreground`,
+`--color-border`, `--color-card`, `--color-primary`, `--color-ring`,
+`--font-mono`.
+
 ## State
 
 Lives under `~/.hermes/plugins/opencode-orchestrator/`:
