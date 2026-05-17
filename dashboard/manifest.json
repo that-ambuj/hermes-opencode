@@ -1,0 +1,11 @@
+{
+  "name": "opencode-orchestrator",
+  "label": "Opencode Agents",
+  "description": "Multi-agent worktree orchestration dashboard — live agent status, pending questions, heartbeats.",
+  "icon": "Workflow",
+  "version": "0.3.0",
+  "tab": { "path": "/opencode-agents", "position": "after:skills" },
+  "entry": "dist/index.js",
+  "css": "dist/style.css",
+  "api": "plugin_api.py"
+}

@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+build/
+*.log
+.DS_Store
+
+# runtime state that should never be tracked (created in ~/.hermes/... by default,
+# but guard against the repo dir being used as HERMES_HOME during dev)
+/wt/
+/logs/
+/projects.json
+/agents.json
+/notifications.jsonl
+/history.jsonl

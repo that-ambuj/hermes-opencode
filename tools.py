@@ -1,0 +1,748 @@
+from __future__ import annotations
+
+import json
+import shutil
+import tempfile
+import time
+from dataclasses import asdict
+from pathlib import Path
+from typing import Any, Awaitable, Callable
+
+from . import bootstrap as bootstrap_mod
+from . import event_loop
+from . import heartbeat as heartbeat_mod
+from . import pr as pr_mod
+from . import reviewer as reviewer_mod
+from . import worktree as wt
+from .config import Config
+from .projects import ProjectNotFound, ProjectRegistry
+from .state import Agent, AgentNotFound, AgentStore
+from .transport import OpencodeClient, OpencodeError
+
+
+class Runtime:
+    def __init__(
+        self,
+        config: Config,
+        client: OpencodeClient,
+        projects: ProjectRegistry,
+        agents: AgentStore,
+    ) -> None:
+        self.config = config
+        self.client = client
+        self.projects = projects
+        self.agents = agents
+
+    def on_session_start(self, **_: Any) -> None:
+        self.config.ensure_dirs()
+        event_loop.start(self)
+
+    def on_session_end(self, **_: Any) -> None:
+        pass
+
+
+def _ok(data: Any) -> str:
+    return json.dumps({"ok": True, "data": data}, default=str, indent=2)
+
+
+def _err(msg: str, **extra: Any) -> str:
+    payload: dict[str, Any] = {"ok": False, "error": msg}
+    if extra:
+        payload.update(extra)
+    return json.dumps(payload, default=str, indent=2)
+
+
+def _ensure_server(rt: Runtime) -> None:
+    if rt.config.auto_spawn_server:
+        rt.client.ensure_server()
+
+
+PROJECT_ADD_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "label": {"type": "string", "description": "Human-readable project label (kebab-case, e.g. 'dodo-payments')."},
+        "repo_path": {"type": "string", "description": "Absolute path to a local git repository."},
+        "base_branch": {"type": "string", "description": "Default base branch for new feature branches.", "default": "main"},
+        "abbrev": {"type": "string", "description": "2-5 char abbreviation prefix for agent ids (auto-derived if omitted)."},
+        "bootstrap_skill": {"type": "string", "description": "Qualified hermes skill name to run during worktree bootstrap (e.g. 'opencode-orchestrator:dp-bootstrap')."},
+    },
+    "required": ["label", "repo_path"],
+}
+
+
+PROJECT_LIST_SCHEMA: dict[str, Any] = {
+    "type": "object", "properties": {}, "additionalProperties": False,
+}
+
+
+PROJECT_SHOW_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {"label": {"type": "string"}},
+    "required": ["label"],
+}
+
+
+PROJECT_REMOVE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {"label": {"type": "string"}},
+    "required": ["label"],
+}
+
+
+PROJECT_SET_REPO_PATH_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "label": {"type": "string"},
+        "repo_path": {"type": "string"},
+    },
+    "required": ["label", "repo_path"],
+}
+
+
+SPAWN_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "project": {"type": "string", "description": "Registered project label."},
+        "task": {"type": "string", "description": "2-4 kebab-case words summarizing the task; used in agent_id."},
+        "prompt": {"type": "string", "description": "Initial prompt sent VERBATIM to the executor opencode session."},
+        "branch": {"type": "string", "description": "Branch name (default: agent_id)."},
+        "base_branch": {"type": "string", "description": "Branch to fork from (default: project's base_branch)."},
+        "agent": {"type": "string", "description": "Opencode agent type (default: 'build').", "default": "build"},
+    },
+    "required": ["project", "task", "prompt"],
+}
+
+
+SEND_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "agent_id": {"type": "string"},
+        "text": {"type": "string", "description": "Message sent verbatim to the agent."},
+        "timeout_sec": {"type": "number", "default": 600},
+    },
+    "required": ["agent_id", "text"],
+}
+
+
+STATUS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "agent_id": {"type": "string", "description": "Optional. Omit to list all agents."},
+    },
+}
+
+
+WAIT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "agent_id": {"type": "string"},
+        "timeout_sec": {"type": "number", "default": 600},
+    },
+    "required": ["agent_id"],
+}
+
+
+KILL_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "agent_id": {"type": "string"},
+        "remove_worktree": {"type": "boolean", "default": True},
+    },
+    "required": ["agent_id"],
+}
+
+
+def make_project_add(rt: Runtime) -> Callable[..., Awaitable[str]]:
+    async def handler(args: dict, **_: Any) -> str:
+        try:
+            project = rt.projects.add(
+                label=args["label"],
+                repo_path=Path(args["repo_path"]),
+                base_branch=args.get("base_branch", rt.config.default_base_branch),
+                abbrev=args.get("abbrev"),
+                bootstrap_skill=args.get("bootstrap_skill"),
+            )
+            return _ok(asdict(project))
+        except (KeyError, ValueError) as e:
+            return _err(str(e))
+    return handler
+
+
+def make_project_list(rt: Runtime) -> Callable[..., Awaitable[str]]:
+    async def handler(args: dict, **_: Any) -> str:
+        rows = []
+        for p in rt.projects.list():
+            row = asdict(p)
+            row["repo_exists"] = Path(p.repo_path).is_dir()
+            rows.append(row)
+        return _ok({"projects": rows, "count": len(rows)})
+    return handler
+
+
+def make_project_show(rt: Runtime) -> Callable[..., Awaitable[str]]:
+    async def handler(args: dict, **_: Any) -> str:
+        label = args.get("label")
+        if not label:
+            return _err("missing label")
+        p = rt.projects.get(label)
+        if not p:
+            return _err(f"unknown project: {label}")
+        return _ok(asdict(p))
+    return handler
+
+
+def make_project_remove(rt: Runtime) -> Callable[..., Awaitable[str]]:
+    async def handler(args: dict, **_: Any) -> str:
+        label = args.get("label")
+        if not label:
+            return _err("missing label")
+        active = [a for a in rt.agents.list() if a.project_label == label and a.phase not in {"DONE", "KILLED", "FAILED"}]
+        if active:
+            return _err(
+                f"cannot remove '{label}': {len(active)} active agent(s). Kill them first.",
+                active_agents=[a.agent_id for a in active],
+            )
+        removed = rt.projects.remove(label)
+        if not removed:
+            return _err(f"unknown project: {label}")
+        return _ok({"removed": asdict(removed)})
+    return handler
+
+
+def make_project_set_repo_path(rt: Runtime) -> Callable[..., Awaitable[str]]:
+    async def handler(args: dict, **_: Any) -> str:
+        label = args.get("label")
+        path = args.get("repo_path")
+        if not label or not path:
+            return _err("label and repo_path required")
+        resolved = Path(path).expanduser().resolve()
+        if not (resolved / ".git").exists():
+            return _err(f"not a git repository: {resolved}")
+        try:
+            updated = rt.projects.update(label, repo_path=str(resolved))
+            return _ok(asdict(updated))
+        except ProjectNotFound:
+            return _err(f"unknown project: {label}")
+    return handler
+
+
+def make_spawn(rt: Runtime) -> Callable[..., Awaitable[str]]:
+    async def handler(args: dict, **_: Any) -> str:
+        try:
+            project_label = args["project"]
+            task = args["task"]
+            prompt = args["prompt"]
+        except KeyError as e:
+            return _err(f"missing required arg: {e.args[0]}")
+
+        project = rt.projects.get(project_label)
+        if not project:
+            return _err(f"unknown project: {project_label}. Run oc_project_add first.")
+        repo_path = Path(project.repo_path)
+        if not (repo_path / ".git").exists():
+            return _err(f"project repo missing: {repo_path}")
+
+        existing = rt.agents.ids()
+        try:
+            agent_id = wt.compose_agent_id(project.abbrev, task, existing)
+        except ValueError as e:
+            return _err(str(e))
+
+        branch = args.get("branch") or agent_id
+        base_branch = args.get("base_branch") or project.base_branch
+        agent_type = args.get("agent", "build")
+        fs = wt.agent_id_to_fs(agent_id)
+        worktree_path = (rt.config.worktrees_root / fs).resolve()
+
+        try:
+            _ensure_server(rt)
+        except OpencodeError as e:
+            return _err(f"opencode server unavailable: {e}")
+
+        try:
+            wt.create_worktree(repo_path, worktree_path, branch=branch, base=base_branch)
+        except wt.GitError as e:
+            return _err(f"worktree creation failed: {e}")
+
+        boot = await bootstrap_mod.run_project_bootstrap(rt.client, project, worktree_path)
+        if not boot.ok:
+            wt.remove_worktree(repo_path, worktree_path)
+            return _err(f"bootstrap failed ({boot.method}): {boot.detail}")
+
+        try:
+            session = await rt.client.create_session(worktree_path, agent=agent_type)
+        except OpencodeError as e:
+            wt.remove_worktree(repo_path, worktree_path)
+            return _err(f"session create failed: {e}")
+
+        session_id = session.get("id") or session.get("sessionID") or ""
+        if not session_id:
+            wt.remove_worktree(repo_path, worktree_path)
+            return _err(f"opencode returned no session id; keys={list(session.keys())[:8]}")
+
+        agent = Agent(
+            agent_id=agent_id,
+            project_label=project_label,
+            worktree_path=str(worktree_path),
+            session_id=session_id,
+            branch=branch,
+            initial_prompt=prompt,
+            phase="EXECUTING",
+        )
+        rt.agents.add(agent)
+
+        try:
+            resp = await rt.client.send_message(session_id, worktree_path, prompt)
+        except OpencodeError as e:
+            rt.agents.update(agent_id, phase="FAILED", last_error=str(e))
+            return _err(f"send_message failed: {e}", agent_id=agent_id)
+
+        rt.agents.update(agent_id, phase="EXECUTING")
+        reply = OpencodeClient.extract_assistant_text(resp)
+
+        event_loop.start(rt)
+        event_loop.ensure_agent_task(agent_id)
+
+        return _ok({
+            "agent_id": agent_id,
+            "session_id": session_id,
+            "worktree_path": str(worktree_path),
+            "branch": branch,
+            "opencode_agent_resolved": (resp.get("info") or {}).get("agent"),
+            "first_turn_assistant_text": reply[:2000],
+            "first_turn_finish": (resp.get("info") or {}).get("finish"),
+            "bootstrap": {"ok": boot.ok, "method": boot.method, "skill_updated": boot.skill_updated},
+        })
+    return handler
+
+
+def make_send(rt: Runtime) -> Callable[..., Awaitable[str]]:
+    async def handler(args: dict, **_: Any) -> str:
+        agent_id = args.get("agent_id")
+        text = args.get("text")
+        if not agent_id or text is None:
+            return _err("agent_id and text required")
+        agent = rt.agents.get(agent_id)
+        if not agent:
+            return _err(f"unknown agent: {agent_id}")
+        worktree_path = Path(agent.worktree_path)
+        timeout = float(args.get("timeout_sec", 600))
+        try:
+            resp = await rt.client.send_message(agent.session_id, worktree_path, text, timeout=timeout)
+        except OpencodeError as e:
+            return _err(f"send failed: {e}")
+        rt.agents.update(agent_id, last_activity_at=time.time())
+        reply = OpencodeClient.extract_assistant_text(resp)
+        return _ok({
+            "agent_id": agent_id,
+            "assistant_text": reply[:4000],
+            "finish": (resp.get("info") or {}).get("finish"),
+        })
+    return handler
+
+
+def make_status(rt: Runtime) -> Callable[..., Awaitable[str]]:
+    async def handler(args: dict, **_: Any) -> str:
+        agent_id = args.get("agent_id")
+        if agent_id:
+            agent = rt.agents.get(agent_id)
+            if not agent:
+                return _err(f"unknown agent: {agent_id}")
+            return _ok(await _detailed_status(rt, agent))
+        rows: list[dict[str, Any]] = []
+        for a in rt.agents.list():
+            rows.append({
+                "agent_id": a.agent_id,
+                "project": a.project_label,
+                "branch": a.branch,
+                "phase": a.phase,
+                "pr_url": a.pr_url,
+                "created_at": a.created_at,
+                "last_activity_at": a.last_activity_at,
+            })
+        return _ok({"agents": rows, "count": len(rows)})
+    return handler
+
+
+async def _detailed_status(rt: Runtime, agent: Agent) -> dict[str, Any]:
+    worktree_path = Path(agent.worktree_path)
+    detail: dict[str, Any] = {
+        "agent_id": agent.agent_id,
+        "project": agent.project_label,
+        "phase": agent.phase,
+        "branch": agent.branch,
+        "session_id": agent.session_id,
+        "worktree_path": str(worktree_path),
+        "pr_url": agent.pr_url,
+        "pr_number": agent.pr_number,
+        "pr_merged_at": agent.pr_merged_at,
+        "done_at": agent.done_at,
+        "created_at": agent.created_at,
+        "last_activity_at": agent.last_activity_at,
+        "last_error": agent.last_error,
+    }
+    try:
+        questions = await rt.client.list_questions(worktree_path)
+        permissions = await rt.client.list_permissions(worktree_path)
+        detail["pending_questions"] = [
+            {"id": q.get("id"), "session_id": q.get("sessionID"), "n_questions": len(q.get("questions") or [])}
+            for q in questions if q.get("sessionID") == agent.session_id
+        ]
+        detail["pending_permissions"] = [
+            {"id": p.get("id"), "session_id": p.get("sessionID"), "permission": p.get("permission")}
+            for p in permissions if p.get("sessionID") == agent.session_id
+        ]
+    except OpencodeError as e:
+        detail["transport_error"] = str(e)
+    return detail
+
+
+def make_wait(rt: Runtime) -> Callable[..., Awaitable[str]]:
+    async def handler(args: dict, **_: Any) -> str:
+        agent_id = args.get("agent_id")
+        if not agent_id:
+            return _err("agent_id required")
+        agent = rt.agents.get(agent_id)
+        if not agent:
+            return _err(f"unknown agent: {agent_id}")
+        timeout = float(args.get("timeout_sec", 600))
+        try:
+            became_idle = await rt.client.wait_idle(agent.session_id, Path(agent.worktree_path), timeout=timeout)
+        except OpencodeError as e:
+            return _err(f"wait failed: {e}")
+        if not became_idle:
+            return _err(f"timeout waiting for idle ({timeout}s)", agent_id=agent_id)
+        rt.agents.update(agent_id, last_activity_at=time.time())
+        return _ok({"agent_id": agent_id, "idle": True})
+    return handler
+
+
+def make_kill(rt: Runtime) -> Callable[..., Awaitable[str]]:
+    async def handler(args: dict, **_: Any) -> str:
+        agent_id = args.get("agent_id")
+        if not agent_id:
+            return _err("agent_id required")
+        agent = rt.agents.get(agent_id)
+        if not agent:
+            return _err(f"unknown agent: {agent_id}")
+        remove_wt = bool(args.get("remove_worktree", True))
+        worktree_path = Path(agent.worktree_path)
+        errors: list[str] = []
+        try:
+            await rt.client.delete_session(agent.session_id, worktree_path)
+        except OpencodeError as e:
+            errors.append(f"delete_session: {e}")
+        if agent.reviewer_session_id and agent.reviewer_worktree_path:
+            try:
+                await rt.client.delete_session(agent.reviewer_session_id, Path(agent.reviewer_worktree_path))
+            except OpencodeError as e:
+                errors.append(f"delete_reviewer_session: {e}")
+        project = rt.projects.get(agent.project_label)
+        if remove_wt:
+            if project and agent.reviewer_worktree_path:
+                reviewer_mod.teardown_reviewer_worktree(project, worktree_path)
+            if project:
+                wt.remove_worktree(Path(project.repo_path), worktree_path)
+            elif worktree_path.exists():
+                shutil.rmtree(worktree_path, ignore_errors=True)
+        rt.agents.update(agent_id, phase="KILLED")
+        event_loop._drop_snapshots(agent_id)
+        rt.agents.remove(agent_id)
+        return _ok({"agent_id": agent_id, "killed": True, "worktree_removed": remove_wt, "errors": errors})
+    return handler
+
+
+ANSWER_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "question_id": {"type": "string", "description": "Question id from /question or from the pre_llm_call injection."},
+        "answer": {"type": "string", "description": "Verbatim user reply text. Forwarded unmodified to opencode."},
+        "answers": {"type": "array", "items": {"type": "string"}, "description": "Alternative: list of selected option labels. Use this when the question listed structured options."},
+        "reject": {"type": "boolean", "default": False, "description": "Reject the question instead of answering."},
+    },
+    "required": ["question_id"],
+}
+
+
+REVIEW_NOW_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {"agent_id": {"type": "string"}},
+    "required": ["agent_id"],
+}
+
+
+REVIEW_AGAIN_SCHEMA = REVIEW_NOW_SCHEMA
+SKIP_REVIEW_SCHEMA = REVIEW_NOW_SCHEMA
+PR_STATUS_SCHEMA = REVIEW_NOW_SCHEMA
+
+
+REGEN_BOOTSTRAP_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {"label": {"type": "string"}},
+    "required": ["label"],
+}
+
+
+SET_NOTIFY_TARGET_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "platform": {"type": "string", "description": "Gateway platform: telegram | discord | slack | ..."},
+        "chat_id": {"type": "string", "description": "Chat / channel id where DMs are delivered."},
+        "sinks": {"type": "array", "items": {"type": "string"}, "description": "Active sinks: any of [cli, gateway, dashboard]."},
+    },
+}
+
+
+HEARTBEAT_NOW_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {"force": {"type": "boolean", "default": False, "description": "Send even if outside the day window with no pending tasks."}},
+}
+
+
+def _find_agent_for_question(rt: Runtime, question_id: str) -> Agent | None:
+    questions, _perms = event_loop.get_pending_snapshot()
+    for agent_id, qs in questions.items():
+        for q in qs:
+            if q.get("id") == question_id:
+                return rt.agents.get(agent_id)
+    return None
+
+
+def make_answer(rt: Runtime) -> Callable[..., Awaitable[str]]:
+    async def handler(args: dict, **_: Any) -> str:
+        qid = args.get("question_id")
+        if not qid:
+            return _err("question_id required")
+        agent = _find_agent_for_question(rt, qid)
+        if not agent:
+            return _err(f"no live agent has a pending question with id={qid}")
+        worktree = Path(agent.worktree_path)
+        try:
+            if args.get("reject"):
+                ok = await rt.client.reject_question(qid, worktree)
+                action = "rejected"
+            else:
+                answers = args.get("answers")
+                if answers is None:
+                    answer = args.get("answer")
+                    if answer is None:
+                        return _err("provide answer (string) or answers (list of option labels)")
+                    answers = [answer]
+                ok = await rt.client.reply_question(qid, worktree, list(answers))
+                action = "replied"
+        except OpencodeError as e:
+            return _err(f"opencode error: {e}")
+        if not ok:
+            return _err("opencode rejected the answer")
+        return _ok({"agent_id": agent.agent_id, "question_id": qid, "action": action})
+    return handler
+
+
+def make_review_now(rt: Runtime) -> Callable[..., Awaitable[str]]:
+    async def handler(args: dict, **_: Any) -> str:
+        agent_id = args.get("agent_id")
+        if not agent_id:
+            return _err("agent_id required")
+        agent = rt.agents.get(agent_id)
+        if not agent:
+            return _err(f"unknown agent: {agent_id}")
+        if agent.phase in {"DONE", "KILLED", "FAILED", "PR_OPEN"}:
+            return _err(f"cannot review_now from phase {agent.phase}")
+        rt.agents.update(agent_id, phase="REVIEW_SPAWNING")
+        event_loop.ensure_agent_task(agent_id)
+        return _ok({"agent_id": agent_id, "phase": "REVIEW_SPAWNING"})
+    return handler
+
+
+def make_review_again(rt: Runtime) -> Callable[..., Awaitable[str]]:
+    async def handler(args: dict, **_: Any) -> str:
+        agent_id = args.get("agent_id")
+        if not agent_id:
+            return _err("agent_id required")
+        agent = rt.agents.get(agent_id)
+        if not agent:
+            return _err(f"unknown agent: {agent_id}")
+        if agent.phase in {"DONE", "KILLED", "FAILED"}:
+            return _err(f"cannot review_again from phase {agent.phase}")
+        project = rt.projects.get(agent.project_label)
+        if project and agent.reviewer_worktree_path:
+            reviewer_mod.teardown_reviewer_worktree(project, Path(agent.worktree_path))
+        rt.agents.update(agent_id, phase="REVIEW_SPAWNING", reviewer_session_id=None, reviewer_worktree_path=None)
+        event_loop.ensure_agent_task(agent_id)
+        return _ok({"agent_id": agent_id, "phase": "REVIEW_SPAWNING"})
+    return handler
+
+
+def make_skip_review(rt: Runtime) -> Callable[..., Awaitable[str]]:
+    async def handler(args: dict, **_: Any) -> str:
+        agent_id = args.get("agent_id")
+        if not agent_id:
+            return _err("agent_id required")
+        agent = rt.agents.get(agent_id)
+        if not agent:
+            return _err(f"unknown agent: {agent_id}")
+        if agent.phase in {"DONE", "KILLED", "FAILED", "PR_OPEN"}:
+            return _err(f"cannot skip_review from phase {agent.phase}")
+        rt.agents.update(agent_id, phase="COMMITTING")
+        event_loop.ensure_agent_task(agent_id)
+        return _ok({"agent_id": agent_id, "phase": "COMMITTING"})
+    return handler
+
+
+def make_pr_status(rt: Runtime) -> Callable[..., Awaitable[str]]:
+    async def handler(args: dict, **_: Any) -> str:
+        agent_id = args.get("agent_id")
+        if not agent_id:
+            return _err("agent_id required")
+        agent = rt.agents.get(agent_id)
+        if not agent:
+            return _err(f"unknown agent: {agent_id}")
+        if not agent.pr_number:
+            return _err(f"agent {agent_id} has no PR yet (phase={agent.phase})")
+        try:
+            info = pr_mod.pr_state(Path(agent.worktree_path), agent.pr_number)
+        except pr_mod.PrError as e:
+            return _err(str(e))
+        return _ok({"agent_id": agent_id, "number": info.number, "url": info.url, "state": info.state, "merged_at": info.merged_at})
+    return handler
+
+
+def make_set_notify_target(rt: Runtime) -> Callable[..., Awaitable[str]]:
+    async def handler(args: dict, **_: Any) -> str:
+        platform = args.get("platform")
+        chat_id = args.get("chat_id")
+        sinks = args.get("sinks")
+        if platform is not None:
+            rt.config.notify_gateway_platform = platform
+        if chat_id is not None:
+            rt.config.notify_gateway_chat_id = chat_id
+        if sinks is not None:
+            allowed = {"cli", "gateway", "dashboard"}
+            bad = [s for s in sinks if s not in allowed]
+            if bad:
+                return _err(f"unknown sink(s): {bad}; allowed={sorted(allowed)}")
+            rt.config.notify_sinks = list(sinks)
+        return _ok({
+            "platform": rt.config.notify_gateway_platform,
+            "chat_id": rt.config.notify_gateway_chat_id,
+            "sinks": rt.config.notify_sinks,
+            "note": "config is in-memory for this hermes session; persist via ~/.hermes/config.yaml plugins.entries.opencode-orchestrator.notify",
+        })
+    return handler
+
+
+def make_heartbeat_send_now(rt: Runtime) -> Callable[..., Awaitable[str]]:
+    async def handler(args: dict, **_: Any) -> str:
+        result = heartbeat_mod.send_heartbeat(rt, force=bool(args.get("force", False)))
+        return _ok(result)
+    return handler
+
+
+def make_regen_bootstrap(rt: Runtime) -> Callable[..., Awaitable[str]]:
+    async def handler(args: dict, **_: Any) -> str:
+        label = args.get("label")
+        if not label:
+            return _err("label required")
+        project = rt.projects.get(label)
+        if not project:
+            return _err(f"unknown project: {label}")
+        repo_path = Path(project.repo_path)
+        if not (repo_path / ".git").exists():
+            return _err(f"project repo missing: {repo_path}")
+        throwaway = Path(tempfile.mkdtemp(prefix=f"oc-orch-genboot-{project.abbrev}-"))
+        try:
+            wt.create_worktree(repo_path, throwaway, branch=f"oc-orch-genboot-{project.abbrev}-{int(time.time())}", base=project.base_branch)
+        except wt.GitError as e:
+            shutil.rmtree(throwaway, ignore_errors=True)
+            return _err(f"throwaway worktree create failed: {e}")
+        try:
+            try:
+                rt.client.ensure_server()
+            except OpencodeError as e:
+                return _err(f"opencode server unavailable: {e}")
+            result = await bootstrap_mod.generate_bootstrap_skill(rt.client, project, throwaway, rt.projects)
+            if not result.ok:
+                return _err(f"generation failed: {result.detail}")
+            updated = rt.projects.get(label)
+            return _ok({
+                "label": label,
+                "method": result.method,
+                "skill_path": result.detail,
+                "bootstrap_skill": updated.bootstrap_skill if updated else None,
+            })
+        finally:
+            wt.remove_worktree(repo_path, throwaway, force=True)
+    return handler
+
+
+def all_tool_specs(rt: Runtime) -> list[dict[str, Any]]:
+    return [
+        {"name": "oc_project_add", "toolset": "opencode_orchestrator",
+         "schema": PROJECT_ADD_SCHEMA, "handler": make_project_add(rt), "is_async": True,
+         "description": "Register a project (label, repo path, base branch, optional abbrev).", "emoji": "📁"},
+        {"name": "oc_project_list", "toolset": "opencode_orchestrator",
+         "schema": PROJECT_LIST_SCHEMA, "handler": make_project_list(rt), "is_async": True,
+         "description": "List registered projects.", "emoji": "📋"},
+        {"name": "oc_project_show", "toolset": "opencode_orchestrator",
+         "schema": PROJECT_SHOW_SCHEMA, "handler": make_project_show(rt), "is_async": True,
+         "description": "Show a single project's configuration.", "emoji": "🔍"},
+        {"name": "oc_project_remove", "toolset": "opencode_orchestrator",
+         "schema": PROJECT_REMOVE_SCHEMA, "handler": make_project_remove(rt), "is_async": True,
+         "description": "Unregister a project (refuses if active agents exist).", "emoji": "🗑️"},
+        {"name": "oc_project_set_repo_path", "toolset": "opencode_orchestrator",
+         "schema": PROJECT_SET_REPO_PATH_SCHEMA, "handler": make_project_set_repo_path(rt), "is_async": True,
+         "description": "Update a project's local repo path.", "emoji": "📍"},
+        {"name": "oc_spawn", "toolset": "opencode_orchestrator",
+         "schema": SPAWN_SCHEMA, "handler": make_spawn(rt), "is_async": True,
+         "description": "Spawn an opencode agent: create worktree, start session, send initial prompt verbatim.", "emoji": "🚀"},
+        {"name": "oc_send", "toolset": "opencode_orchestrator",
+         "schema": SEND_SCHEMA, "handler": make_send(rt), "is_async": True,
+         "description": "Send a verbatim message to a running agent.", "emoji": "💬"},
+        {"name": "oc_status", "toolset": "opencode_orchestrator",
+         "schema": STATUS_SCHEMA, "handler": make_status(rt), "is_async": True,
+         "description": "Show one agent's full status, or all agents in a summary.", "emoji": "📊"},
+        {"name": "oc_wait", "toolset": "opencode_orchestrator",
+         "schema": WAIT_SCHEMA, "handler": make_wait(rt), "is_async": True,
+         "description": "Block until an agent's opencode session goes idle.", "emoji": "⏳"},
+        {"name": "oc_kill", "toolset": "opencode_orchestrator",
+         "schema": KILL_SCHEMA, "handler": make_kill(rt), "is_async": True,
+         "description": "Abort an agent's session and (by default) remove its worktree.", "emoji": "🛑"},
+        {"name": "oc_answer", "toolset": "opencode_orchestrator",
+         "schema": ANSWER_SCHEMA, "handler": make_answer(rt), "is_async": True,
+         "description": "Reply to (or reject) a pending opencode question. The user's reply is forwarded VERBATIM.", "emoji": "✉️"},
+        {"name": "oc_review_now", "toolset": "opencode_orchestrator",
+         "schema": REVIEW_NOW_SCHEMA, "handler": make_review_now(rt), "is_async": True,
+         "description": "Force-trigger the reviewer phase for an agent (escape hatch if auto-detection misses).", "emoji": "🔎"},
+        {"name": "oc_review_again", "toolset": "opencode_orchestrator",
+         "schema": REVIEW_AGAIN_SCHEMA, "handler": make_review_again(rt), "is_async": True,
+         "description": "Run another review cycle on the agent (tears down prior reviewer worktree first).", "emoji": "🔁"},
+        {"name": "oc_skip_review", "toolset": "opencode_orchestrator",
+         "schema": SKIP_REVIEW_SCHEMA, "handler": make_skip_review(rt), "is_async": True,
+         "description": "Skip review and jump straight to commit + open PR. For trivial agents.", "emoji": "⏭️"},
+        {"name": "oc_pr_status", "toolset": "opencode_orchestrator",
+         "schema": PR_STATUS_SCHEMA, "handler": make_pr_status(rt), "is_async": True,
+         "description": "Live `gh pr view` for an agent's PR.", "emoji": "🔗"},
+        {"name": "oc_project_regenerate_bootstrap", "toolset": "opencode_orchestrator",
+         "schema": REGEN_BOOTSTRAP_SCHEMA, "handler": make_regen_bootstrap(rt), "is_async": True,
+         "description": "Regenerate the bootstrap skill for a project via an opencode introspection session.", "emoji": "🧰"},
+        {"name": "oc_set_notify_target", "toolset": "opencode_orchestrator",
+         "schema": SET_NOTIFY_TARGET_SCHEMA, "handler": make_set_notify_target(rt), "is_async": True,
+         "description": "Set the gateway DM target (platform + chat_id) and/or active notify sinks for heartbeats and question alerts.", "emoji": "📡"},
+        {"name": "oc_heartbeat_send_now", "toolset": "opencode_orchestrator",
+         "schema": HEARTBEAT_NOW_SCHEMA, "handler": make_heartbeat_send_now(rt), "is_async": True,
+         "description": "Send the heartbeat report immediately to configured sinks (CLI inject / gateway DM / dashboard).", "emoji": "💓"},
+    ]

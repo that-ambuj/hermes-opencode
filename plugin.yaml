@@ -1,0 +1,30 @@
+name: opencode-orchestrator
+version: 0.3.0
+manifest_version: 1
+description: "Orchestrate multiple opencode agents in git worktrees. Project registry, executor/reviewer cycle, auto-PR, opencode-driven bootstrap with shell + recovery, question routing via pre_llm_call, hourly heartbeat DMs. Dashboard in Phase 4."
+author: hermes-opencode-agents
+kind: standalone
+requires_env: []
+provides_tools:
+  - oc_project_add
+  - oc_project_list
+  - oc_project_show
+  - oc_project_remove
+  - oc_project_set_repo_path
+  - oc_project_regenerate_bootstrap
+  - oc_spawn
+  - oc_send
+  - oc_status
+  - oc_wait
+  - oc_kill
+  - oc_answer
+  - oc_review_now
+  - oc_review_again
+  - oc_skip_review
+  - oc_pr_status
+  - oc_set_notify_target
+  - oc_heartbeat_send_now
+provides_hooks:
+  - on_session_start
+  - on_session_end
+  - pre_llm_call
