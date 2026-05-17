@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.1] — 2026-05-17
+
+### Fixed
+
+- **`/oc` slash command now works through the gateway** (iMessage,
+  Telegram, Discord, Slack, etc.). The `register_command(...)` call alone
+  was sufficient for the CLI dispatch path but the gateway never reached
+  the plugin's command handler. Pattern lifted from `eng-task-system`:
+  also register a `pre_gateway_dispatch` hook that:
+    1. Inspects each incoming gateway message
+    2. Returns immediately for anything that isn't `/oc` followed by EOS
+       or whitespace (so `/oc-list`, `/oclist`, and unrelated text pass
+       straight through)
+    3. For `/oc …` messages, calls the existing `make_oc_dispatcher`
+       handler and echoes the result back via the channel's adapter
+       (in-process gateway runner first, `hermes send-message`
+       subprocess as fallback)
+    4. Returns `{"action": "skip", "reason": "/oc handled inline"}` so
+       the rest of the gateway's command-resolution path doesn't fire
+- AGENTS.md updated with a `gateway slash-command dispatch` section
+  documenting the dual-registration requirement so future contributors
+  know to register both `ctx.register_command` AND a
+  `pre_gateway_dispatch` filter when adding new slash commands.
+
 ## [0.9.0] — 2026-05-17
 
 ### Added

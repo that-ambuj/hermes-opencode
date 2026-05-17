@@ -221,6 +221,41 @@ heartbeat formatting, reviewer classification, bash extraction. Tests
 that need a live opencode (Phase 0 / 1 / 5 smoke scripts) live under
 `scripts/` and are run manually.
 
+## Gateway slash-command dispatch (LOAD-BEARING)
+
+Calling `ctx.register_command("oc", handler=..., ...)` alone makes the
+slash command work in the CLI but **NOT** in the gateway (iMessage,
+Telegram, Discord, Slack). The gateway uses a different code path that
+only resolves built-in commands through `hermes_cli.commands.COMMAND_REGISTRY`;
+plugin commands aren't visible to it.
+
+The pattern (lifted from `eng-task-system`): also register a
+`pre_gateway_dispatch` hook that intercepts `/oc …` messages BEFORE the
+gateway's built-in dispatcher rejects them, dispatches inline via the
+same `make_oc_dispatcher` handler used by the CLI path, echoes the
+result back via the channel adapter, and returns
+`{"action": "skip", "reason": "..."}` to short-circuit the rest of the
+gateway flow.
+
+Helpers are in `__init__.py`:
+- `_pre_gateway_dispatch_hook(event=None, gateway=None, **_)` — the hook
+- `_gateway_send(gateway, event, message)` — echo helper, tries the
+  in-process `_gateway_runner_ref().adapters` first, falls back to
+  `hermes send-message --target <platform>:<chat_id> <message>`
+  subprocess when the runner isn't reachable in the current process
+
+The hook returns `None` (passes through) when:
+- `event` is None
+- `_runtime` or `_oc_dispatcher_cache` isn't initialized yet
+- the message doesn't start with `/oc` followed by EOS or whitespace
+  (so `/oc-list`, `/oclist`, and unrelated chat pass straight through)
+
+The 0.9.0 → 0.9.1 bug: registered `/oc` via `register_command` only;
+worked in CLI, silently failed in iMessage with "Unknown command".
+
+When adding new slash commands in the future, register BOTH ways or
+update `_pre_gateway_dispatch_hook` to match the new prefixes.
+
 ## Anti-patterns (BLOCKING — reject in review)
 
 - **Tool descriptions passed via `register_tool(description=...)` kwarg.**

@@ -75,8 +75,95 @@ def _pre_llm_call_hook(**_: Any) -> dict[str, Any] | None:
     return None
 
 
+_oc_dispatcher_cache: Any = None
+
+
+def _event_text(event: Any) -> str:
+    return str(getattr(event, "text", "") or "")
+
+
+def _gateway_send(gateway: Any, event: Any, message: str) -> None:
+    """Echo *message* back to the channel that sent *event*.
+
+    Mirrors eng-task-system's helper: tries the in-process gateway runner's
+    live adapter first (works for every platform including BlueBubbles /
+    iMessage), then falls back to `hermes send-message` subprocess when the
+    runner isn't available in this process.
+    """
+    import logging
+    log = logging.getLogger("hermes_opencode.gateway_hook")
+    if not message:
+        return
+    source = getattr(event, "source", None)
+    if source is None:
+        return
+    platform = getattr(source, "platform", None)
+    chat_id = getattr(source, "chat_id", None)
+    thread_id = getattr(source, "thread_id", None)
+    if platform is None or chat_id is None:
+        return
+
+    async def _send_async() -> None:
+        try:
+            from gateway.run import _gateway_runner_ref  # type: ignore
+            runner = _gateway_runner_ref()
+        except Exception:
+            runner = None
+        if runner is not None:
+            try:
+                adapter = runner.adapters.get(platform)
+                if adapter is not None:
+                    metadata = {"thread_id": thread_id} if thread_id else None
+                    await adapter.send(chat_id=str(chat_id), content=message, metadata=metadata)
+                    return
+            except Exception as exc:
+                log.warning("adapter.send failed: %s", exc)
+        import subprocess
+        platform_name = platform.value if hasattr(platform, "value") else str(platform)
+        target = f"{platform_name}:{chat_id}"
+        try:
+            subprocess.run(
+                ["hermes", "send-message", "--target", target, message],
+                timeout=10, check=False,
+            )
+        except Exception as exc:
+            log.warning("send-message subprocess failed: %s", exc)
+
+    import asyncio
+    try:
+        loop = asyncio.get_running_loop()
+        loop.call_soon_threadsafe(asyncio.ensure_future, _send_async())
+    except RuntimeError:
+        try:
+            asyncio.run(_send_async())
+        except Exception as exc:
+            log.warning("asyncio.run send failed: %s", exc)
+
+
+def _pre_gateway_dispatch_hook(event: Any = None, gateway: Any = None, **_: Any) -> dict[str, Any] | None:
+    if event is None or _runtime is None or _oc_dispatcher_cache is None:
+        return None
+    text = _event_text(event)
+    if not text:
+        return None
+    stripped = text.lstrip()
+    parts = stripped.split(None, 1)
+    if not parts or parts[0] != "/oc":
+        return None
+    raw_args = parts[1] if len(parts) > 1 else ""
+    try:
+        output = _oc_dispatcher_cache(raw_args)
+    except Exception as exc:
+        import logging
+        logging.getLogger("hermes_opencode.gateway_hook").exception("/oc dispatch failed")
+        output = f"/oc error: {exc}"
+    if output:
+        _gateway_send(gateway, event, output)
+    return {"action": "skip", "reason": "/oc handled inline"}
+
+
 def register(ctx: Any) -> None:
-    global _runtime
+    global _runtime, _oc_dispatcher_cache
     config = Config.from_plugin_entry(load_entry_config())
     config.ensure_dirs()
 
@@ -85,6 +172,7 @@ def register(ctx: Any) -> None:
     agents = AgentStore(config.agents_file)
 
     _runtime = Runtime(config=config, client=client, projects=projects, agents=agents)
+    _oc_dispatcher_cache = commands_mod.make_oc_dispatcher(_runtime)
 
     for spec in all_tool_specs(_runtime):
         ctx.register_tool(**spec)
@@ -92,6 +180,7 @@ def register(ctx: Any) -> None:
     ctx.register_hook("on_session_start", lambda **kw: _runtime.on_session_start(**kw))
     ctx.register_hook("on_session_end", lambda **kw: _runtime.on_session_end(**kw))
     ctx.register_hook("pre_llm_call", _pre_llm_call_hook)
+    ctx.register_hook("pre_gateway_dispatch", _pre_gateway_dispatch_hook)
 
     inject = getattr(ctx, "inject_message", None)
     if callable(inject):
@@ -101,9 +190,9 @@ def register(ctx: Any) -> None:
     if callable(register_cmd):
         register_cmd(
             "oc",
-            handler=commands_mod.make_oc_dispatcher(_runtime),
-            description="Opencode-orchestrator commands: list / attach / questions. Run /oc for help.",
-            args_hint="[list|attach <agent_id>|questions|help]",
+            handler=_oc_dispatcher_cache,
+            description="hermes-opencode commands: list / attach / questions / doctor. Run /oc for help.",
+            args_hint="[list|attach <agent_id>|questions|doctor|help]",
         )
 
     register_cli = getattr(ctx, "register_cli_command", None)
