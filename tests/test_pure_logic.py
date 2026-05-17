@@ -269,7 +269,8 @@ class TestServeDownNotificationBody:
             logs_dir=tmp_path / "logs",
             notifications_file=tmp_path / "notifications.jsonl",
             events_log=tmp_path / "events.log",
-            server_url="http://127.0.0.1:9999",
+            host="127.0.0.1",
+            port=9999,
         )
         cfg.ensure_dirs()
 
@@ -279,15 +280,18 @@ class TestServeDownNotificationBody:
 
         return _Stub()
 
-    def test_body_includes_server_url_and_attempt_count(self, tmp_path: Path):
+    def test_body_includes_endpoint_and_attempt_count(self, tmp_path: Path):
         rt = self._runtime(tmp_path)
         with patch.object(event_loop_mod, "_runtime", rt):
             title, body, meta = event_loop_mod._build_serve_down_notification()
         assert "unreachable" in title.lower()
         assert "127.0.0.1:9999" in body
+        assert "http://" not in body, (
+            "user-facing serve-down body must show host:port, not a URL"
+        )
         assert str(event_loop_mod.SERVE_RESTART_MAX_ATTEMPTS) in body
         assert meta["kind"] == "serve_down"
-        assert meta["server_url"] == "http://127.0.0.1:9999"
+        assert meta["endpoint"] == "127.0.0.1:9999"
         assert meta["attempts"] == event_loop_mod.SERVE_RESTART_MAX_ATTEMPTS
 
 
@@ -932,62 +936,66 @@ class TestAtAgentDirectDispatch:
         assert captured == [], "send_message_async must NOT be called for /oc"
 
 
-class TestHostConfig:
-    """v0.14.5 introduced a bind-host override for `opencode serve`; v0.16.0
-    renamed the YAML / dataclass / kwarg knob `serve_hostname` -> `host`.
-    The outgoing CLI flag stays `--hostname=` because that is the actual
-    flag opencode's serve subcommand accepts (v0.16.0 briefly broke this
-    by emitting `--host=`, fixed in v0.16.2). The override sets the bind
-    address independently of the connect URL, so a user can expose
-    opencode serve to other hosts (e.g. 0.0.0.0) while hermes itself
-    still connects via loopback. The connect path never uses the bind
-    host because 0.0.0.0 is bind-only.
+class TestHostPortConfig:
+    """v0.16.4: opencode_server config is `host` + `port` only. The
+    previous `url` knob is gone (opencode CLI itself does not accept
+    --url, and keeping a derived knob caused parsing drift between
+    YAML, the spawn cmdline, and status output). The connect URL is
+    built as `http://{host}:{port}` directly, with no bind-vs-connect
+    distinction. Defaults: host=127.0.0.1, port=4096.
     """
 
     def setup_method(self):
         self._config_mod = sys.modules["_oco_test_pkg.config"]
         self._transport_mod = sys.modules["_oco_test_pkg.transport"]
 
-    def test_config_default_host_is_none(self):
+    def test_config_defaults(self):
         cfg = self._config_mod.Config.from_plugin_entry({})
-        assert cfg.host is None
+        assert cfg.host == "127.0.0.1"
+        assert cfg.port == 4096
+        assert cfg.endpoint == "127.0.0.1:4096"
+        assert cfg.connect_url == "http://127.0.0.1:4096"
 
-    def test_config_reads_yaml_host(self):
+    def test_config_reads_yaml_host_and_port(self):
         cfg = self._config_mod.Config.from_plugin_entry({
-            "opencode_server": {"url": "http://127.0.0.1:4096", "host": "0.0.0.0"},
+            "opencode_server": {"host": "0.0.0.0", "port": 9999},
         })
         assert cfg.host == "0.0.0.0"
+        assert cfg.port == 9999
+        assert cfg.endpoint == "0.0.0.0:9999"
+        assert cfg.connect_url == "http://0.0.0.0:9999"
 
-    def test_config_reads_env_var_host(self, monkeypatch):
+    def test_config_reads_env_var_host_and_port(self, monkeypatch):
         monkeypatch.setenv("OPENCODE_HOST", "192.168.1.10")
+        monkeypatch.setenv("OPENCODE_PORT", "5555")
         cfg = self._config_mod.Config.from_plugin_entry({})
         assert cfg.host == "192.168.1.10"
+        assert cfg.port == 5555
 
     def test_config_yaml_overrides_env_var(self, monkeypatch):
         monkeypatch.setenv("OPENCODE_HOST", "from-env")
+        monkeypatch.setenv("OPENCODE_PORT", "1111")
         cfg = self._config_mod.Config.from_plugin_entry({
-            "opencode_server": {"host": "from-yaml"},
+            "opencode_server": {"host": "from-yaml", "port": 2222},
         })
         assert cfg.host == "from-yaml"
+        assert cfg.port == 2222
 
-    def test_client_default_host_falls_back_to_url_host(self):
-        c = self._transport_mod.OpencodeClient("http://127.0.0.1:4096")
-        assert c._connect_host == "127.0.0.1"
-        assert c._bind_host == "127.0.0.1"
+    def test_client_signature_takes_host_and_port(self):
+        c = self._transport_mod.OpencodeClient("0.0.0.0", 4096)
+        assert c._host == "0.0.0.0"
+        assert c._port == 4096
+        assert c.base_url == "http://0.0.0.0:4096"
+        assert c.endpoint == "0.0.0.0:4096"
 
-    def test_client_host_override_does_not_change_connect_host(self):
-        c = self._transport_mod.OpencodeClient(
-            "http://127.0.0.1:4096", None, host="0.0.0.0",
-        )
-        assert c._connect_host == "127.0.0.1", "connect host stays parsed from URL"
-        assert c._bind_host == "0.0.0.0", "bind host honors override"
-
-    def test_client_host_empty_falls_back_to_url_host(self):
-        c = self._transport_mod.OpencodeClient(
-            "http://10.0.0.5:9000", None, host=None,
-        )
-        assert c._connect_host == "10.0.0.5"
-        assert c._bind_host == "10.0.0.5"
+    def test_client_defaults_no_loopback_substitution(self):
+        """User mandated: `http://{host}:{port}` is built directly,
+        no bind-vs-connect split. If they pin host=0.0.0.0, the
+        client's base_url is `http://0.0.0.0:4096` literally.
+        """
+        c = self._transport_mod.OpencodeClient("0.0.0.0", 4096)
+        assert "0.0.0.0" in c.base_url
+        assert "127.0.0.1" not in c.base_url
 
 
 class TestParsePrOpenedAcceptsVariants:
@@ -2796,9 +2804,7 @@ class TestServeCmdlineUsesOpencodeHostnameFlag:
         monkeypatch.setattr(subprocess, "Popen", FakePopen)
         monkeypatch.setattr(transport_mod.shutil, "which", lambda _name: "/fake/opencode")
         monkeypatch.setattr(transport_mod.OpencodeClient, "_port_open", staticmethod(_fake_port_open))
-        client = transport_mod.OpencodeClient(
-            "http://127.0.0.1:4096", None, host="0.0.0.0",
-        )
+        client = transport_mod.OpencodeClient("0.0.0.0", 4096)
         client.ensure_server(deadline_sec=1.0, log_dir=None)
 
         args = captured.get("args") or []

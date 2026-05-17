@@ -130,9 +130,9 @@ async def main(opencode_port: int) -> int:
     from _oc_orchestrator.tools import Runtime, all_tool_specs
     from _oc_orchestrator.transport import OpencodeClient
 
-    config = Config.from_plugin_entry({"opencode_server": {"url": f"http://127.0.0.1:{opencode_port}"}, "auto_spawn_server": True})
+    config = Config.from_plugin_entry({"opencode_server": {"host": "127.0.0.1", "port": opencode_port}, "auto_spawn_server": True})
     config.ensure_dirs()
-    client = OpencodeClient(config.server_url, config.server_password)
+    client = OpencodeClient(config.host, config.port, config.server_password)
     projects = ProjectRegistry(config.projects_file)
     agents = AgentStore(config.agents_file)
     rt = Runtime(config=config, client=client, projects=projects, agents=agents)

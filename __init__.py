@@ -259,7 +259,7 @@ def register(ctx: Any) -> None:
     config = Config.from_plugin_entry(load_entry_config())
     config.ensure_dirs()
 
-    client = OpencodeClient(config.server_url, config.server_password, config.host)
+    client = OpencodeClient(config.host, config.port, config.server_password)
     projects = ProjectRegistry(config.projects_file)
     agents = AgentStore(config.agents_file)
 

@@ -93,11 +93,11 @@ async def run(opencode_port, sandbox_repo: Path):
     from _oc_orch_smoke.transport import OpencodeClient
 
     cfg = Config.from_plugin_entry({
-        "opencode_server": {"url": f"http://127.0.0.1:{opencode_port}"},
+        "opencode_server": {"host": "127.0.0.1", "port": opencode_port},
         "auto_spawn_server": False,
     })
     cfg.ensure_dirs()
-    client = OpencodeClient(cfg.server_url, cfg.server_password)
+    client = OpencodeClient(cfg.host, cfg.port, cfg.server_password)
     projects = ProjectRegistry(cfg.projects_file)
     agents = AgentStore(cfg.agents_file)
     rt = Runtime(config=cfg, client=client, projects=projects, agents=agents)

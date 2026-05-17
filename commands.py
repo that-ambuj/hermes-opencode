@@ -193,7 +193,7 @@ def _fmt_doctor(runtime: "Runtime") -> str:
 
     lines.append(f"  version              · {plugin_version}")
     lines.append(f"  state dir            · {cfg.projects_file.parent}")
-    lines.append(f"  opencode server      · {cfg.server_url}")
+    lines.append(f"  opencode server      · {cfg.endpoint}")
 
     bg_alive = eloop._thread is not None and eloop._thread.is_alive()
     lines.append(f"  bg event loop alive  · {'yes' if bg_alive else 'NO'}")

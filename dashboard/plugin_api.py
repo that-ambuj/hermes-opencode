@@ -66,7 +66,7 @@ def _state_dir() -> Path:
 def _server_url_from_config() -> str:
     try:
         from .. import config as cfg_mod
-        return cfg_mod.Config.from_plugin_entry(cfg_mod.load_entry_config()).server_url
+        return cfg_mod.Config.from_plugin_entry(cfg_mod.load_entry_config()).connect_url
     except Exception:
         return ""
 

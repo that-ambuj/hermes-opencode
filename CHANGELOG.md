@@ -5,6 +5,94 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.4] - 2026-05-18
+
+Drops the `opencode_server.url` knob entirely. Server config is now
+`host` + `port` only. The connect URL is constructed internally as
+`http://{host}:{port}`; opencode's serve CLI does not accept `--url`,
+so keeping a derived knob caused parsing drift between YAML, the
+spawn cmdline, and status output. Status/log messages now print
+`{host}:{port}` instead of a URL.
+
+### Changed (BREAKING)
+
+- **`Config` shape: `host` + `port` only.** The `server_url` field +
+  `DEFAULT_SERVER_URL` constant are removed. Two new fields:
+  `host: str = "127.0.0.1"` and `port: int = 4096`. New properties
+  `Config.endpoint` (`f"{host}:{port}"`, for user-facing display) and
+  `Config.connect_url` (`f"http://{host}:{port}"`, for internal client
+  construction).
+
+- **`OpencodeClient` signature: `(host, port, password=None)`.** Was
+  `(base_url, password=None, host=None)` which parsed `base_url`
+  internally and split bind vs connect host. The new constructor
+  takes host + port directly; `base_url` is built once as
+  `http://{host}:{port}`. The previous `_connect_host` / `_bind_host`
+  attributes are gone (no split — `--hostname={host} --port={port}`
+  goes to `opencode serve`, and httpx connects to the same
+  `{host}:{port}`).
+
+- **YAML schema:**
+
+  ```yaml
+  # OLD (v0.16.3 and earlier):
+  opencode_server:
+    url: "http://127.0.0.1:4096"
+    host: "0.0.0.0"  # bind override
+
+  # NEW (v0.16.4):
+  opencode_server:
+    host: "127.0.0.1"
+    port: 4096
+  ```
+
+  Any `url` setting in user YAML is silently ignored. `host` and
+  `port` are read from `opencode_server.host` / `opencode_server.port`
+  with env-var fallbacks `OPENCODE_HOST` and `OPENCODE_PORT`.
+  Defaults: `127.0.0.1` and `4096`.
+
+- **Status / log output uses `host:port`, not URL.** `/oc doctor`
+  prints `opencode server · 127.0.0.1:4096`. The serve-down /
+  serve-recovered notification bodies say `\`opencode serve\` at
+  127.0.0.1:4096 is down`. Event metadata key renamed `server_url`
+  -> `endpoint`.
+
+- Dashboard JSON field `server_url` in API responses is preserved
+  (frontend compat) but now sourced from `Config.connect_url`.
+
+### Why
+
+The user explicitly requested this in the v0.16.0 work: "pass only
+`--host` and `--port`, not `--url`, as they can conflict." v0.16.0
+addressed the spawn-cmdline part (and v0.16.2 fixed the wrong
+`--host=` -> `--hostname=` revert) but kept the misleading `url`
+config knob and `server_url` plumbing throughout. v0.16.4 finishes
+the cleanup so there is exactly one source of truth for where
+opencode serve binds and where the plugin connects: `host` + `port`.
+
+### Migration
+
+Users with `opencode_server.url: "http://x:y"` in their YAML must
+change to:
+
+```yaml
+opencode_server:
+  host: "x"
+  port: y
+```
+
+Users with no opencode_server config get the new defaults
+(`127.0.0.1:4096`) which match the previous default URL exactly.
+
+### Tests
+
+`TestHostPortConfig` (6 tests) replaces `TestHostConfig`. Covers
+defaults, YAML reads, env-var fallback (`OPENCODE_HOST` +
+`OPENCODE_PORT`), YAML-over-env precedence, client construction,
+and the no-loopback-substitution invariant. Full suite: 357 passed
+(was 358 at v0.16.3 — net -1 from consolidating the previous 8
+bind/connect tests down to 6 unified ones).
+
 ## [0.16.3] - 2026-05-18
 
 Day-one bugfix surfaced by v0.16.2: `load_entry_config()` has been

@@ -86,7 +86,7 @@ def test_wrap_transport_errors_returns_normal_values():
 
 
 def test_wait_idle_wraps_connect_error(monkeypatch):
-    client = transport_mod.OpencodeClient("http://127.0.0.1:0")
+    client = transport_mod.OpencodeClient("127.0.0.1", 0)
 
     class _FailingClient:
         async def __aenter__(self):
@@ -195,13 +195,13 @@ def test_fetch_last_assistant_text_does_not_iterate_agent_directly(monkeypatch):
 
 def test_build_serve_recovered_notification_shape(monkeypatch):
     cfg = MagicMock()
-    cfg.server_url = "http://127.0.0.1:4096"
+    cfg.endpoint = "127.0.0.1:4096"
     runtime = MagicMock()
     runtime.config = cfg
     monkeypatch.setattr(event_loop_mod, "_runtime", runtime)
 
     title, body, meta = event_loop_mod._build_serve_recovered_notification()
     assert "recovered" in title.lower()
-    assert "http://127.0.0.1:4096" in body
+    assert "127.0.0.1:4096" in body
     assert meta["kind"] == "serve_recovered"
-    assert meta["server_url"] == "http://127.0.0.1:4096"
+    assert meta["endpoint"] == "127.0.0.1:4096"

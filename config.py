@@ -6,7 +6,8 @@ from pathlib import Path
 from typing import Any
 
 PLUGIN_NAME = "hermes-opencode"
-DEFAULT_SERVER_URL = "http://127.0.0.1:4096"
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 4096
 DEFAULT_PR_FALLBACK_MODELS: tuple[str, ...] = (
     "openai/gpt-5.5",
     "opencode/deepseek-v4-flash-free",
@@ -109,9 +110,9 @@ def _load_entry_from_raw_yaml() -> dict:
 
 @dataclass
 class Config:
-    server_url: str = DEFAULT_SERVER_URL
+    host: str = DEFAULT_HOST
+    port: int = DEFAULT_PORT
     server_password: str | None = None
-    host: str | None = None
     pr_fallback_models: list[str] = field(default_factory=lambda: list(DEFAULT_PR_FALLBACK_MODELS))
     default_base_branch: str = "main"
     worktrees_root: Path = field(default_factory=lambda: plugin_state_dir() / "wt")
@@ -175,10 +176,13 @@ class Config:
         else:
             sinks = ["cli", "dashboard"]
 
+        host_value = server.get("host") or os.environ.get("OPENCODE_HOST") or DEFAULT_HOST
+        port_raw = server.get("port") if server.get("port") is not None else os.environ.get("OPENCODE_PORT")
+        port_value = int(port_raw) if port_raw is not None else DEFAULT_PORT
         return cls(
-            server_url=server.get("url", DEFAULT_SERVER_URL),
+            host=host_value,
+            port=port_value,
             server_password=server.get("password") or os.environ.get("OPENCODE_SERVER_PASSWORD") or None,
-            host=server.get("host") or os.environ.get("OPENCODE_HOST") or None,
             pr_fallback_models=cls._resolve_pr_fallback_models(server.get("pr_fallback_models")),
             default_base_branch=pr.get("base_branch", "main"),
             auto_spawn_server=bool(entry.get("auto_spawn_server", True)),
@@ -199,6 +203,14 @@ class Config:
             awaiting_input_stall_timeout_sec=float(awaiting.get("stall_timeout_sec", 300.0)),
             awaiting_input_reminder_interval_sec=float(awaiting.get("reminder_interval_sec", 1800.0)),
         )
+
+    @property
+    def endpoint(self) -> str:
+        return f"{self.host}:{self.port}"
+
+    @property
+    def connect_url(self) -> str:
+        return f"http://{self.host}:{self.port}"
 
     def ensure_dirs(self) -> None:
         for p in (self.worktrees_root, self.logs_dir, self.projects_file.parent):

@@ -765,7 +765,7 @@ async def _serve_watchdog_loop() -> None:
         if alive:
             was_down = _serve_down_notified_at != 0.0
             if not _serve_seen_alive:
-                logger.info("opencode serve detected alive at %s; watchdog armed", _runtime.config.server_url)
+                logger.info("opencode serve detected alive at %s; watchdog armed", _runtime.config.endpoint)
             _serve_seen_alive = True
             if was_down:
                 _notify_serve_recovered()
@@ -775,7 +775,7 @@ async def _serve_watchdog_loop() -> None:
         now = time.time()
         cooldown_elapsed = now - _serve_down_notified_at >= SERVE_DOWN_NOTIFY_COOLDOWN_SEC
         if cooldown_elapsed:
-            logger.warning("opencode serve at %s appears down", _runtime.config.server_url)
+            logger.warning("opencode serve at %s appears down", _runtime.config.endpoint)
             _notify_serve_down()
             _serve_down_notified_at = now
         if not _runtime.config.auto_spawn_server:
@@ -831,14 +831,14 @@ def _build_serve_down_notification() -> tuple[str, str, dict]:
     assert _runtime is not None
     title = "✗ opencode serve unreachable"
     body = (
-        f"`opencode serve` at {_runtime.config.server_url} is down and "
+        f"`opencode serve` at {_runtime.config.endpoint} is down and "
         f"{SERVE_RESTART_MAX_ATTEMPTS} exponential restart attempts failed. "
         f"Agents will stall until the server is restored. Check the host, "
         f"or run `hermes oco doctor` for diagnostics."
     )
     meta = {
         "kind": "serve_down",
-        "server_url": _runtime.config.server_url,
+        "endpoint": _runtime.config.endpoint,
         "attempts": SERVE_RESTART_MAX_ATTEMPTS,
         "auto_spawn_server": _runtime.config.auto_spawn_server,
     }
@@ -853,12 +853,12 @@ def _build_serve_recovered_notification() -> tuple[str, str, dict]:
     assert _runtime is not None
     title = "✓ opencode serve recovered"
     body = (
-        f"`opencode serve` at {_runtime.config.server_url} is reachable again. "
+        f"`opencode serve` at {_runtime.config.endpoint} is reachable again. "
         f"Agents will resume next tick."
     )
     meta = {
         "kind": "serve_recovered",
-        "server_url": _runtime.config.server_url,
+        "endpoint": _runtime.config.endpoint,
     }
     return title, body, meta
 
