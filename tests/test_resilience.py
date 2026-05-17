@@ -175,6 +175,24 @@ def test_agent_store_update_can_clear_fields(tmp_path):
     assert refreshed.consecutive_tick_failures == 0
 
 
+def test_last_assistant_text_helpers_have_distinct_signatures():
+    items_fn = event_loop_mod._last_assistant_text
+    agent_fn = event_loop_mod._fetch_last_assistant_text
+    assert items_fn is not agent_fn
+    assert not asyncio.iscoroutinefunction(items_fn)
+    assert asyncio.iscoroutinefunction(agent_fn)
+    sample = [{"parts": [{"type": "text", "text": "hello"}]}]
+    assert items_fn(sample) == "hello"
+
+
+def test_fetch_last_assistant_text_does_not_iterate_agent_directly(monkeypatch):
+    agent = _make_agent()
+    monkeypatch.setattr(event_loop_mod, "_runtime", None)
+    monkeypatch.setattr(event_loop_mod, "get_text_buffer", lambda _: {})
+    result = asyncio.run(event_loop_mod._fetch_last_assistant_text(agent))
+    assert result == ""
+
+
 def test_build_serve_recovered_notification_shape(monkeypatch):
     cfg = MagicMock()
     cfg.server_url = "http://127.0.0.1:4096"

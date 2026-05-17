@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.2] - 2026-05-17
+
+### Fixed
+
+- **`TypeError: 'Agent' object is not reversible` crash** in `_phase_executing`,
+  `_phase_executor_addressing`, and `_awaiting_input_blocks_review` — the
+  three call sites for the v0.14.0 SSE-buffer-first last-assistant-text
+  lookup. A pre-existing `_last_assistant_text(items: list[dict])` helper
+  (from v0.3.0, used by `_phase_reviewing` to extract reviewer-session
+  text from already-fetched items) was shadowed by the new
+  `async def _last_assistant_text(agent: Agent)` I added in v0.14.0.
+  Python kept the later definition, so the three async callers ended up
+  invoking the sync items-based function with an `Agent` object — which
+  promptly tried `for item in reversed(agent)` and crashed. The
+  awaiting-input gate, the pending-question notify body context, and the
+  cascade entry-point all failed every tick, leaving agents stuck in
+  `EXECUTING` forever. v0.14.1's `_wrap_transport_errors` was working
+  exactly as designed — but THIS error was a `TypeError`, not an
+  `OpencodeError`, so it propagated up to `_agent_loop`'s outer
+  `except Exception` and looked identical to the v0.14.1-fixed
+  transport leak.
+
+  Fix: renamed my v0.14.0 function to `_fetch_last_assistant_text` to
+  make the side-effect (HTTP fetch + SSE buffer read) explicit and
+  avoid the name collision with the pre-existing pure-function
+  `_last_assistant_text(items)`. All three async call sites updated.
+  Both helpers now have distinct purposes:
+  - `_last_assistant_text(items: list[dict])` — sync, pure, extracts
+    text from an already-fetched message-items list (reviewer flow).
+  - `_fetch_last_assistant_text(agent: Agent)` — async, side-effectful,
+    reads the SSE text buffer first then falls back to
+    `client.get_messages` (awaiting-input flow).
+
+  Regression test added to lock the rename in: asserts both helpers
+  exist with the right async/sync signature and that
+  `_fetch_last_assistant_text(agent)` returns `""` without iterating
+  the agent when `_runtime is None`.
+
 ## [0.14.1] - 2026-05-17
 
 ### Fixed

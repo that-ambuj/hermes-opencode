@@ -209,7 +209,7 @@ def _maybe_notify_awaiting_classified(
     _notify_event(agent, "awaiting_human", body)
 
 
-async def _last_assistant_text(agent: "Agent") -> str:
+async def _fetch_last_assistant_text(agent: "Agent") -> str:
     sse = get_text_buffer(agent.agent_id)
     if sse:
         joined = "\n".join(v for v in sse.values() if v).strip()
@@ -240,7 +240,7 @@ async def _last_assistant_text(agent: "Agent") -> str:
 async def _awaiting_input_blocks_review(agent: "Agent") -> bool:
     if _runtime is None:
         return False
-    last_text = await _last_assistant_text(agent)
+    last_text = await _fetch_last_assistant_text(agent)
     if not last_text:
         return False
     check = await awaiting_input_mod.check(_runtime, last_text)
@@ -927,7 +927,7 @@ async def _phase_executing(agent: Agent) -> None:
     pending_p = [p for p in permissions if p.get("sessionID") == agent.session_id]
     _update_snapshots(agent.agent_id, pending_q, pending_p)
     if pending_q or pending_p:
-        last_text = await _last_assistant_text(agent)
+        last_text = await _fetch_last_assistant_text(agent)
         if _maybe_notify_new_pending(agent, pending_q, pending_p, context_text=last_text):
             _runtime.agents.update(agent.agent_id, last_awaiting_notify_at=time.time())
         return
@@ -1042,7 +1042,7 @@ async def _phase_executor_addressing(agent: Agent) -> None:
     pending_p = [p for p in permissions if p.get("sessionID") == agent.session_id]
     _update_snapshots(agent.agent_id, pending_q, pending_p)
     if pending_q or pending_p:
-        last_text = await _last_assistant_text(agent)
+        last_text = await _fetch_last_assistant_text(agent)
         if _maybe_notify_new_pending(agent, pending_q, pending_p, context_text=last_text):
             _runtime.agents.update(agent.agent_id, last_awaiting_notify_at=time.time())
         return
