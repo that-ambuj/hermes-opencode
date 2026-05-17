@@ -64,7 +64,7 @@ plugins:
         url: "http://127.0.0.1:4096"
         password: "${OPENCODE_SERVER_PASSWORD}"
         # v0.16.0 (renamed from v0.14.5 `serve_hostname`): override the
-        # bind host the plugin passes to `opencode serve --host=...`,
+        # bind host the plugin passes to `opencode serve --hostname=...`,
         # independent of the connect URL. Defaults to the host parsed
         # from `url`. Set to 0.0.0.0 to expose opencode serve to other
         # machines on the LAN while hermes itself keeps connecting via

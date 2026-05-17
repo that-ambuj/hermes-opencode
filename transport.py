@@ -53,7 +53,7 @@ class OpencodeClient:
         self._connect_host = parsed.hostname or "127.0.0.1"
         self._port = parsed.port or 80
         # `_connect_host` is used to CONNECT (loopback probe + httpx target via
-        # base_url). `_bind_host` is what we pass to `opencode serve --host=...`
+        # base_url). `_bind_host` is what we pass to `opencode serve --hostname=...`
         # when auto-spawning. The two diverge when the user wants opencode to
         # bind to e.g. 0.0.0.0 (reachable from other hosts) while hermes
         # itself still connects via 127.0.0.1. The connect path NEVER uses
@@ -106,7 +106,7 @@ class OpencodeClient:
             log_path = self._prepare_serve_log_path(log_dir)
             log_handle = self._open_serve_log(log_path)
             self._spawned = subprocess.Popen(
-                [binary, "serve", f"--host={self._bind_host}", f"--port={self._port}"],
+                [binary, "serve", f"--hostname={self._bind_host}", f"--port={self._port}"],
                 stdout=log_handle if log_handle is not None else subprocess.DEVNULL,
                 stderr=subprocess.STDOUT if log_handle is not None else subprocess.DEVNULL,
                 text=True,

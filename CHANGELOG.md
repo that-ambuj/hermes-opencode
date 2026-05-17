@@ -5,6 +5,97 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.2] - 2026-05-18
+
+Two bugfixes shipped together: (1) opencode CLI spawn flag regression
+that broke `opencode serve` startup, and (2) `awaiting_human_resumed`
+firing spuriously on classifier non-determinism (gateway restart
+notification "Human reply received" when no human had replied), plus
+restored full last-assistant-text in awaiting-human notifications
+(previously head-truncated with ellipsis).
+
+### Fixed
+
+- **`opencode serve` spawn flag reverted to `--hostname=`.** v0.16.0
+  renamed the YAML knob `serve_hostname` -> `host` AND the outgoing
+  CLI flag `--hostname=` -> `--host=` in one step. The YAML rename
+  was intentional and user-facing; the CLI flag rename was wrong
+  because opencode's actual `serve` subcommand accepts `--hostname`
+  (visible in `opencode serve --help`), not `--host`. The bad flag
+  caused every spawn to fail with `opencode serve exited during
+  startup (rc=1)` and the executor never started. v0.16.2 emits
+  `--hostname=` again. YAML / dataclass / kwarg name stays `host` as
+  user requested in v0.16.0; only the wire-level CLI flag is
+  reverted. New `TestServeCmdlineUsesOpencodeHostnameFlag` patches
+  `subprocess.Popen` to pin the cmdline so the regression cannot
+  recur.
+
+- **`awaiting_human_resumed` no longer fires on classifier flip.**
+  v0.16.0's `_phase_awaiting_human` exited AWAITING_HUMAN whenever
+  pending `/question` + `/permission` were empty AND the
+  awaiting-input classifier said "not awaiting" on the latest
+  assistant text. The classifier is an LLM heuristic and flips
+  non-deterministically on borderline prose (e.g. `Before I pick a
+  direction, let me confirm scope.`). On gateway / process restart
+  the supervisor re-ran `_phase_awaiting_human` first tick, the
+  classifier disagreed with itself vs entry, the agent's phase was
+  restored, and a misleading `Human reply received after Xm` event
+  fired with no human input.
+
+  v0.16.2 makes classifier verdict alone insufficient. Exit now
+  requires authoritative forward-progress signal:
+
+  1. Entry was triggered by a pending `/question` / `/permission`
+     (`awaiting_entry_had_pending_qp=True`) and the pending set is
+     now empty. The opencode server is the source of truth on
+     question / permission resolution.
+  2. Entry was triggered by prose-question classifier alone
+     (`awaiting_entry_had_pending_qp=False`) AND the latest assistant
+     `message.id` differs from `awaiting_entry_message_id`. A new
+     assistant turn proves the executor moved past the awaiting
+     state (the only way it produces a new turn while paused is for
+     a human to type a reply via opencode CLI / web UI). In this
+     path the classifier is re-run on the NEW text; if it flags the
+     new turn as also asking, the entry message-id is re-anchored
+     to the new turn and the agent stays AWAITING_HUMAN.
+
+  New `Agent` fields `awaiting_entry_message_id: str | None` and
+  `awaiting_entry_had_pending_qp: bool` capture entry context.
+  `_enter_awaiting_human` is now `async` so it can fetch the latest
+  message id at entry; on idempotent re-entry the first trigger
+  wins. `_maybe_notify_new_pending` and `_maybe_notify_awaiting_classified`
+  also became `async` to support this.
+
+  Legacy agents in AWAITING_HUMAN before this release have
+  `awaiting_entry_message_id=None`. First tick after upgrade
+  backfills the field from the current latest assistant message id
+  and sleeps; the next tick runs the new exit gate.
+
+  Event body for the poll-driven exit no longer claims "Human reply
+  received" (which was a lie). It now reports the actual signal:
+  "Pending question/permission resolved" or "Executor produced new
+  assistant turn". The v0.16.1 helper (`_resume_from_awaiting_human`)
+  still uses the precise `reason` it was given by its caller (e.g.
+  "oc_send human reply").
+
+- **Full last-assistant-text in awaiting-human notifications.**
+  Three sites in `event_loop.py` head-truncated the context that
+  surfaced in the gateway DM / dashboard notification body:
+  `_maybe_notify_new_pending` (500 chars), `_maybe_notify_awaiting_classified`
+  (800 chars), and `_run_awaiting_input_reminders` (600 chars).
+  Truncated output was prefixed with `... ` which made the message
+  start in the middle of a sentence and obscured the context the
+  human needed to answer the executor's question. All three sites
+  now emit the full text. Three new tests in
+  `TestAwaitingContextNotTruncated` pin this with multi-KB samples.
+
+### Added
+
+- 11 new regression tests across `TestServeCmdlineUsesOpencodeHostnameFlag`,
+  `TestAwaitingContextNotTruncated`, `TestPhaseAwaitingHumanHandler`
+  (new-turn / classifier-flip / legacy-backfill / multi-turn re-anchor
+  scenarios). Full suite: 354 passed (was 346 at v0.16.1).
+
 ## [0.16.1] - 2026-05-17
 
 Closes a v0.16.0 UX gap: a human reply on an `AWAITING_HUMAN` agent

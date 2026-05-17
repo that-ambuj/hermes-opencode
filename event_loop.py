@@ -208,6 +208,8 @@ async def _resume_from_awaiting_human(agent: "Agent", reason: str = "human reply
         phase=restored,
         phase_before_awaiting=None,
         awaiting_human_since=None,
+        awaiting_entry_message_id=None,
+        awaiting_entry_had_pending_qp=False,
     )
     _notify_event(
         refreshed, "awaiting_human_resumed",
@@ -216,16 +218,29 @@ async def _resume_from_awaiting_human(agent: "Agent", reason: str = "human reply
     return refreshed
 
 
-def _enter_awaiting_human(agent: "Agent", body: str) -> "Agent":
+async def _enter_awaiting_human(
+    agent: "Agent",
+    body: str,
+    *,
+    had_pending_qp: bool,
+) -> "Agent":
     """Transition agent into the AWAITING_HUMAN phase and fire the
     `awaiting_human` notification with `body`. v0.16.0 promoted
     `awaiting_human` from a recurring event-only signal to a proper phase
     so dashboards can show it as a distinct state instead of leaving the
     agent in EXECUTING (which looks active).
 
+    v0.16.2 captures `awaiting_entry_message_id` (latest assistant
+    message.id at entry) and `awaiting_entry_had_pending_qp` (whether
+    the trigger was an opencode /question or /permission, vs a pure
+    prose-question classifier hit) so the poll exit logic can demand
+    an authoritative forward-progress signal rather than trusting a
+    classifier that may flip non-deterministically across ticks.
+
     Idempotent: if already in AWAITING_HUMAN, only re-fires the event
-    (reminder-style) without resetting `awaiting_human_since` or
-    overwriting `phase_before_awaiting`.
+    (reminder-style) without resetting `awaiting_human_since`,
+    `phase_before_awaiting`, or entry-tracking fields. The first
+    trigger wins.
     """
     if _runtime is None:
         return agent
@@ -235,18 +250,21 @@ def _enter_awaiting_human(agent: "Agent", body: str) -> "Agent":
             agent.agent_id, last_awaiting_notify_at=now,
         )
     else:
+        entry_mid = await _fetch_last_assistant_message_id(agent)
         updated = _runtime.agents.update(
             agent.agent_id,
             phase="AWAITING_HUMAN",
             phase_before_awaiting=agent.phase,
             awaiting_human_since=now,
             last_awaiting_notify_at=now,
+            awaiting_entry_message_id=entry_mid,
+            awaiting_entry_had_pending_qp=had_pending_qp,
         )
     _notify_event(updated, "awaiting_human", body)
     return updated
 
 
-def _maybe_notify_new_pending(
+async def _maybe_notify_new_pending(
     agent: "Agent",
     pending_q: list[dict],
     pending_p: list[dict],
@@ -268,31 +286,27 @@ def _maybe_notify_new_pending(
 
     sections: list[str] = []
     if context_text:
-        snippet = context_text if len(context_text) <= 500 else "... " + context_text[-500:]
-        sections.append(f"Context (last assistant text):\n{snippet}")
+        sections.append(f"Context (last assistant text):\n{context_text}")
     q_blocks = [_format_question_block(q) for q in pending_q if q.get("id") in new_q_ids]
     if q_blocks:
         sections.append("Pending questions:\n\n" + "\n\n".join(q_blocks))
     p_blocks = [_format_permission_block(p) for p in pending_p if p.get("id") in new_p_ids]
     if p_blocks:
         sections.append("Pending permission requests:\n\n" + "\n\n".join(p_blocks))
-    _enter_awaiting_human(agent, "\n\n".join(sections))
+    await _enter_awaiting_human(agent, "\n\n".join(sections), had_pending_qp=True)
     return True
 
 
-def _maybe_notify_awaiting_classified(
+async def _maybe_notify_awaiting_classified(
     agent: "Agent",
     check: "awaiting_input_mod.AwaitingInputCheck",
 ) -> None:
-    snippet = check.last_assistant_text
-    if len(snippet) > 800:
-        snippet = "... " + snippet[-800:]
     body = (
         f"Detector: {check.source} (confidence={check.confidence})\n"
         f"Reason: {check.reason}\n\n"
-        f"Last assistant text:\n{snippet}"
+        f"Last assistant text:\n{check.last_assistant_text}"
     )
-    _enter_awaiting_human(agent, body)
+    await _enter_awaiting_human(agent, body, had_pending_qp=False)
 
 
 async def _fetch_last_assistant_text(agent: "Agent") -> str:
@@ -323,6 +337,24 @@ async def _fetch_last_assistant_text(agent: "Agent") -> str:
     return "\n".join(reversed(parts_text)).strip()
 
 
+async def _fetch_last_assistant_message_id(agent: "Agent") -> str | None:
+    if _runtime is None:
+        return None
+    try:
+        body = await _runtime.client.get_messages(agent.session_id, Path(agent.worktree_path))
+    except OpencodeError:
+        return None
+    items = body.get("items") or []
+    for item in reversed(items):
+        message = item.get("message") or {}
+        if message.get("role") != "assistant" and message.get("type") != "assistant":
+            continue
+        mid = message.get("id")
+        if isinstance(mid, str) and mid:
+            return mid
+    return None
+
+
 async def _awaiting_input_blocks_review(agent: "Agent") -> bool:
     if _runtime is None:
         return False
@@ -336,7 +368,7 @@ async def _awaiting_input_blocks_review(agent: "Agent") -> bool:
     )
     if not check.awaiting:
         return False
-    _maybe_notify_awaiting_classified(agent, check)
+    await _maybe_notify_awaiting_classified(agent, check)
     _runtime.agents.update(agent.agent_id, last_awaiting_notify_at=time.time())
     return True
 _sse_text_buffers: dict[str, dict[str, str]] = {}
@@ -595,8 +627,6 @@ def _run_awaiting_input_reminders() -> None:
             continue
         verdict = agent.last_classifier_verdict or {}
         snippet = str(verdict.get("last_assistant_text") or "")
-        if len(snippet) > 600:
-            snippet = "... " + snippet[-600:]
         elapsed = _humanize_seconds(now - last_notify)
         reason = verdict.get("reason") or "(no reason recorded)"
         body = (
@@ -1310,12 +1340,44 @@ async def _phase_queued(agent: Agent) -> None:
 
 
 async def _phase_awaiting_human(agent: Agent) -> None:
-    """Tick handler for AWAITING_HUMAN agents. Polls opencode for pending
-    `/question` and `/permission` entries on the executor session, then
-    re-runs the awaiting-input classifier on the latest assistant text.
-    If neither says still-awaiting, restores `phase_before_awaiting` (or
-    EXECUTING as fallback) and fires the `awaiting_human_resumed` event
-    so the user sees forward progress in the dashboard.
+    """Tick handler for AWAITING_HUMAN agents.
+
+    v0.16.2 fix: never exit AWAITING_HUMAN on classifier verdict alone.
+    The awaiting-input classifier is an LLM heuristic and can flip its
+    mind across ticks on borderline prose (e.g. a soft `let me confirm
+    scope.` ending). Pre-v0.16.2 a flip on the first tick after a
+    process restart would fire a misleading `Human reply received`
+    notification even though no human input occurred.
+
+    Exit gate is now an authoritative server-side signal of forward
+    progress:
+
+      1. Entry was triggered by a pending `/question` or `/permission`
+         (`awaiting_entry_had_pending_qp=True`) and the pending set
+         is now empty for this session. The opencode server is the
+         source of truth on whether a question/permission has been
+         resolved.
+
+      2. Entry was triggered by the prose-question classifier
+         (`awaiting_entry_had_pending_qp=False`) AND a NEW assistant
+         message has arrived since entry (the latest assistant
+         `message.id` differs from `awaiting_entry_message_id`). A
+         new assistant turn proves the executor moved past the
+         awaiting state. The only way the executor produces a new
+         turn while paused is for a human to type a reply via the
+         opencode CLI / web UI / `/question` answer.
+
+    In case (2) the classifier is re-run on the NEW text; if it
+    flags the new turn as also awaiting (executor asked again), the
+    entry message-id is re-anchored to the new turn and we keep
+    sleeping. This keeps the resume-only-once invariant while
+    accommodating multi-turn questioning.
+
+    Legacy agents (pre-v0.16.2) entered AWAITING_HUMAN without
+    capturing `awaiting_entry_message_id`. On the first tick after
+    upgrade those agents backfill the field from the current latest
+    assistant message and sleep; subsequent ticks use the proper
+    gate.
     """
     assert _runtime is not None
     worktree = Path(agent.worktree_path)
@@ -1331,16 +1393,44 @@ async def _phase_awaiting_human(agent: Agent) -> None:
     if pending_q or pending_p:
         await asyncio.sleep(5.0)
         return
-    last_text = await _fetch_last_assistant_text(agent)
-    if last_text:
-        check = await awaiting_input_mod.check(_runtime, last_text)
+
+    if agent.awaiting_entry_message_id is None and not agent.awaiting_entry_had_pending_qp:
+        backfilled_mid = await _fetch_last_assistant_message_id(agent)
         _runtime.agents.update(
-            agent.agent_id,
-            last_classifier_verdict=awaiting_input_mod.to_dict(check),
+            agent.agent_id, awaiting_entry_message_id=backfilled_mid,
         )
-        if check.awaiting:
-            await asyncio.sleep(5.0)
-            return
+        await asyncio.sleep(5.0)
+        return
+
+    current_mid = await _fetch_last_assistant_message_id(agent)
+    new_turn_arrived = (
+        current_mid is not None
+        and current_mid != agent.awaiting_entry_message_id
+    )
+
+    if agent.awaiting_entry_had_pending_qp:
+        exit_reason = "Pending question/permission resolved"
+    elif new_turn_arrived:
+        last_text = await _fetch_last_assistant_text(agent)
+        if last_text:
+            check = await awaiting_input_mod.check(_runtime, last_text)
+            _runtime.agents.update(
+                agent.agent_id,
+                last_classifier_verdict=awaiting_input_mod.to_dict(check),
+            )
+            if check.awaiting:
+                _runtime.agents.update(
+                    agent.agent_id,
+                    awaiting_entry_message_id=current_mid,
+                    awaiting_entry_had_pending_qp=False,
+                )
+                await asyncio.sleep(5.0)
+                return
+        exit_reason = "Executor produced new assistant turn"
+    else:
+        await asyncio.sleep(5.0)
+        return
+
     restored = agent.phase_before_awaiting or "EXECUTING"
     duration = time.time() - (agent.awaiting_human_since or time.time())
     refreshed = _runtime.agents.update(
@@ -1348,10 +1438,12 @@ async def _phase_awaiting_human(agent: Agent) -> None:
         phase=restored,
         phase_before_awaiting=None,
         awaiting_human_since=None,
+        awaiting_entry_message_id=None,
+        awaiting_entry_had_pending_qp=False,
     )
     _notify_event(
         refreshed, "awaiting_human_resumed",
-        f"Human reply received after {_humanize_seconds(duration)}; "
+        f"{exit_reason} after {_humanize_seconds(duration)}; "
         f"agent resumed at phase={restored}.",
     )
 
@@ -1378,7 +1470,7 @@ async def _phase_executing(agent: Agent) -> None:
     _update_snapshots(agent.agent_id, pending_q, pending_p)
     if pending_q or pending_p:
         last_text = await _fetch_last_assistant_text(agent)
-        if _maybe_notify_new_pending(agent, pending_q, pending_p, context_text=last_text):
+        if await _maybe_notify_new_pending(agent, pending_q, pending_p, context_text=last_text):
             _runtime.agents.update(agent.agent_id, last_awaiting_notify_at=time.time())
         return
     await asyncio.sleep(IDLE_DEBOUNCE_SEC)
@@ -1501,7 +1593,7 @@ async def _phase_executor_addressing(agent: Agent) -> None:
     _update_snapshots(agent.agent_id, pending_q, pending_p)
     if pending_q or pending_p:
         last_text = await _fetch_last_assistant_text(agent)
-        if _maybe_notify_new_pending(agent, pending_q, pending_p, context_text=last_text):
+        if await _maybe_notify_new_pending(agent, pending_q, pending_p, context_text=last_text):
             _runtime.agents.update(agent.agent_id, last_awaiting_notify_at=time.time())
         return
     await asyncio.sleep(IDLE_DEBOUNCE_SEC)

@@ -67,6 +67,8 @@ class Agent:
     queued_blocked_by: list[str] = field(default_factory=list)
     phase_before_awaiting: str | None = None
     awaiting_human_since: float | None = None
+    awaiting_entry_message_id: str | None = None
+    awaiting_entry_had_pending_qp: bool = False
 
 
 class AgentExists(ValueError):

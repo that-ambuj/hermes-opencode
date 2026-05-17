@@ -934,12 +934,14 @@ class TestAtAgentDirectDispatch:
 
 class TestHostConfig:
     """v0.14.5 introduced a bind-host override for `opencode serve`; v0.16.0
-    renamed it `serve_hostname` -> `host` and changed the spawn flag from
-    `--hostname=` to `--host=`. The override sets the bind address
-    independently of the connect URL, so a user can expose opencode serve
-    to other hosts (e.g. 0.0.0.0) while hermes itself still connects via
-    loopback. The connect path never uses the bind host because 0.0.0.0
-    is bind-only.
+    renamed the YAML / dataclass / kwarg knob `serve_hostname` -> `host`.
+    The outgoing CLI flag stays `--hostname=` because that is the actual
+    flag opencode's serve subcommand accepts (v0.16.0 briefly broke this
+    by emitting `--host=`, fixed in v0.16.2). The override sets the bind
+    address independently of the connect URL, so a user can expose
+    opencode serve to other hosts (e.g. 0.0.0.0) while hermes itself
+    still connects via loopback. The connect path never uses the bind
+    host because 0.0.0.0 is bind-only.
     """
 
     def setup_method(self):
@@ -2069,37 +2071,67 @@ class TestAwaitingHumanPhase:
         event_loop_mod._runtime = rt
         return agents
 
+    def _attach_fake_client(self, agents, latest_message_id: str | None = "m-entry"):
+        cfg = plugin_mod._runtime.config
+        class FakeClient:
+            async def get_messages(self_inner, session_id, directory, cursor=None):
+                if latest_message_id is None:
+                    return {"items": []}
+                return {"items": [{
+                    "message": {"role": "assistant", "id": latest_message_id},
+                    "parts": [{"type": "text", "text": "entry text"}],
+                }]}
+        tools_mod = sys.modules["_oco_test_pkg.tools"]
+        rt = tools_mod.Runtime(config=cfg, client=FakeClient(), projects=None, agents=agents)
+        plugin_mod._runtime = rt
+        event_loop_mod._runtime = rt
+
     def test_enter_from_executing_saves_prior_phase(self, tmp_path: Path):
+        import asyncio
         agents = self._setup(tmp_path, "EXECUTING")
+        self._attach_fake_client(agents, "m-entry")
         agent = agents.get("bck/test")
-        event_loop_mod._enter_awaiting_human(agent, "test body")
+        asyncio.run(event_loop_mod._enter_awaiting_human(agent, "test body", had_pending_qp=True))
         refreshed = agents.get("bck/test")
         assert refreshed.phase == "AWAITING_HUMAN"
         assert refreshed.phase_before_awaiting == "EXECUTING"
         assert refreshed.awaiting_human_since is not None
         assert refreshed.last_awaiting_notify_at is not None
+        assert refreshed.awaiting_entry_message_id == "m-entry", (
+            "entry message id must be captured on first transition"
+        )
+        assert refreshed.awaiting_entry_had_pending_qp is True
         kinds = [k for (k, _b, _p) in self._notified]
         assert kinds == ["awaiting_human"]
 
     def test_enter_from_executor_addressing_saves_prior_phase(self, tmp_path: Path):
+        import asyncio
         agents = self._setup(tmp_path, "EXECUTOR_ADDRESSING")
+        self._attach_fake_client(agents, "m-entry")
         agent = agents.get("bck/test")
-        event_loop_mod._enter_awaiting_human(agent, "...")
-        assert agents.get("bck/test").phase_before_awaiting == "EXECUTOR_ADDRESSING"
+        asyncio.run(event_loop_mod._enter_awaiting_human(agent, "...", had_pending_qp=False))
+        refreshed = agents.get("bck/test")
+        assert refreshed.phase_before_awaiting == "EXECUTOR_ADDRESSING"
+        assert refreshed.awaiting_entry_had_pending_qp is False
 
     def test_re_enter_does_not_overwrite_prior_phase(self, tmp_path: Path):
+        import asyncio
         agents = self._setup(tmp_path, "EXECUTING")
+        self._attach_fake_client(agents, "m-entry")
         agent = agents.get("bck/test")
-        event_loop_mod._enter_awaiting_human(agent, "first")
+        asyncio.run(event_loop_mod._enter_awaiting_human(agent, "first", had_pending_qp=True))
         first_since = agents.get("bck/test").awaiting_human_since
         agent_after_first = agents.get("bck/test")
-        event_loop_mod._enter_awaiting_human(agent_after_first, "reminder")
+        asyncio.run(event_loop_mod._enter_awaiting_human(agent_after_first, "reminder", had_pending_qp=False))
         refreshed = agents.get("bck/test")
         assert refreshed.phase_before_awaiting == "EXECUTING", (
             "re-entry from AWAITING_HUMAN must not overwrite phase_before"
         )
         assert refreshed.awaiting_human_since == first_since, (
             "awaiting_human_since must not reset on reminder fire"
+        )
+        assert refreshed.awaiting_entry_had_pending_qp is True, (
+            "re-entry must preserve original had_pending_qp; first trigger wins"
         )
         kinds = [k for (k, _b, _p) in self._notified]
         assert kinds == ["awaiting_human", "awaiting_human"]
@@ -2125,7 +2157,16 @@ class TestPhaseAwaitingHumanHandler:
         event_loop_mod._notify_event = self._saved_notify
         sys.modules["_oco_test_pkg.awaiting_input"].check = self._saved_check
 
-    def _setup(self, tmp_path, questions: list, permissions: list, latest_text="resumed work"):
+    def _setup(
+        self,
+        tmp_path,
+        questions: list,
+        permissions: list,
+        latest_text="resumed work",
+        latest_message_id: str = "m-current",
+        entry_message_id: str | None = "m-entry",
+        had_pending_qp: bool = True,
+    ):
         cfg = config_mod.Config(
             projects_file=tmp_path / "projects.json",
             agents_file=tmp_path / "agents.json",
@@ -2142,6 +2183,8 @@ class TestPhaseAwaitingHumanHandler:
             phase="AWAITING_HUMAN",
             phase_before_awaiting="EXECUTING",
             awaiting_human_since=time.time() - 30.0,
+            awaiting_entry_message_id=entry_message_id,
+            awaiting_entry_had_pending_qp=had_pending_qp,
         )
         agents.add(agent)
         text_box = [latest_text]
@@ -2153,7 +2196,7 @@ class TestPhaseAwaitingHumanHandler:
                 return permissions
             async def get_messages(self_inner, session_id, directory, cursor=None):
                 return {"items": [{
-                    "message": {"role": "assistant", "id": "m"},
+                    "message": {"role": "assistant", "id": latest_message_id},
                     "parts": [{"type": "text", "text": text_box[0]}],
                 }]}
 
@@ -2185,7 +2228,7 @@ class TestPhaseAwaitingHumanHandler:
         asyncio.run(event_loop_mod._phase_awaiting_human(agent))
         assert agents.get("bck/test").phase == "AWAITING_HUMAN"
 
-    def test_classifier_still_awaiting_keeps_phase(self, tmp_path: Path):
+    def test_new_turn_classifier_still_awaiting_keeps_phase(self, tmp_path: Path):
         import asyncio
         from dataclasses import dataclass
         awaiting_mod = sys.modules["_oco_test_pkg.awaiting_input"]
@@ -2199,36 +2242,42 @@ class TestPhaseAwaitingHumanHandler:
         async def _stub_check(runtime, text):
             return StubCheck()
         awaiting_mod.check = _stub_check
-        agents = self._setup(tmp_path, questions=[], permissions=[], latest_text="what should I do?")
+        agents = self._setup(
+            tmp_path, questions=[], permissions=[],
+            latest_text="what should I do?",
+            latest_message_id="m-followup",
+            entry_message_id="m-entry",
+            had_pending_qp=False,
+        )
         agent = agents.get("bck/test")
         asyncio.run(event_loop_mod._phase_awaiting_human(agent))
         assert agents.get("bck/test").phase == "AWAITING_HUMAN"
 
-    def test_clear_restores_prior_phase_and_fires_resumed(self, tmp_path: Path):
+    def test_qp_resolved_path_exits_with_authoritative_body(self, tmp_path: Path):
         import asyncio
-        from dataclasses import dataclass
-        awaiting_mod = sys.modules["_oco_test_pkg.awaiting_input"]
-        @dataclass
-        class StubCheck:
-            awaiting: bool = False
-            source: str = "test"
-            confidence: str = "high"
-            reason: str = "not asking"
-            last_assistant_text: str = "done with that"
-        async def _stub_check(runtime, text):
-            return StubCheck()
-        awaiting_mod.check = _stub_check
-        agents = self._setup(tmp_path, questions=[], permissions=[], latest_text="done with that")
+        agents = self._setup(
+            tmp_path, questions=[], permissions=[],
+            latest_text="same text as entry",
+            latest_message_id="m-entry",
+            entry_message_id="m-entry",
+            had_pending_qp=True,
+        )
         agent = agents.get("bck/test")
         asyncio.run(event_loop_mod._phase_awaiting_human(agent))
         refreshed = agents.get("bck/test")
         assert refreshed.phase == "EXECUTING"
         assert refreshed.phase_before_awaiting is None
         assert refreshed.awaiting_human_since is None
+        assert refreshed.awaiting_entry_message_id is None
         kinds = [k for (k, _b) in self._notified]
         assert "awaiting_human_resumed" in kinds
+        body = next(b for (k, b) in self._notified if k == "awaiting_human_resumed")
+        assert "Pending question/permission resolved" in body, body
+        assert "Human reply received" not in body, (
+            "must not claim human reply when only Q/P resolution is the signal"
+        )
 
-    def test_clear_with_no_prior_phase_defaults_to_executing(self, tmp_path: Path):
+    def test_new_assistant_turn_path_exits_when_classifier_clears(self, tmp_path: Path):
         import asyncio
         from dataclasses import dataclass
         awaiting_mod = sys.modules["_oco_test_pkg.awaiting_input"]
@@ -2237,12 +2286,132 @@ class TestPhaseAwaitingHumanHandler:
             awaiting: bool = False
             source: str = "test"
             confidence: str = "high"
-            reason: str = ""
-            last_assistant_text: str = ""
+            reason: str = "moved on"
+            last_assistant_text: str = "ok working on it"
         async def _stub_check(runtime, text):
             return StubCheck()
         awaiting_mod.check = _stub_check
-        agents = self._setup(tmp_path, questions=[], permissions=[])
+        agents = self._setup(
+            tmp_path, questions=[], permissions=[],
+            latest_text="ok working on it",
+            latest_message_id="m-after-reply",
+            entry_message_id="m-entry",
+            had_pending_qp=False,
+        )
+        agent = agents.get("bck/test")
+        asyncio.run(event_loop_mod._phase_awaiting_human(agent))
+        refreshed = agents.get("bck/test")
+        assert refreshed.phase == "EXECUTING"
+        body = next(b for (k, b) in self._notified if k == "awaiting_human_resumed")
+        assert "Executor produced new assistant turn" in body, body
+
+    def test_classifier_flip_with_same_message_id_stays_awaiting(self, tmp_path: Path):
+        """v0.16.2 regression guard. Reproduces the gateway-restart bug:
+        agent in AWAITING_HUMAN via classifier-prose-only entry, Q/P
+        empty, latest message id unchanged from entry, classifier
+        flips and now says NOT awaiting. Must NOT exit AWAITING_HUMAN
+        because no human input actually occurred.
+        """
+        import asyncio
+        from dataclasses import dataclass
+        awaiting_mod = sys.modules["_oco_test_pkg.awaiting_input"]
+        @dataclass
+        class StubCheck:
+            awaiting: bool = False
+            source: str = "test"
+            confidence: str = "high"
+            reason: str = "classifier non-determinism"
+            last_assistant_text: str = "let me confirm scope."
+        async def _stub_check(runtime, text):
+            return StubCheck()
+        awaiting_mod.check = _stub_check
+        agents = self._setup(
+            tmp_path, questions=[], permissions=[],
+            latest_text="let me confirm scope.",
+            latest_message_id="m-entry",
+            entry_message_id="m-entry",
+            had_pending_qp=False,
+        )
+        agent = agents.get("bck/test")
+        asyncio.run(event_loop_mod._phase_awaiting_human(agent))
+        refreshed = agents.get("bck/test")
+        assert refreshed.phase == "AWAITING_HUMAN", (
+            "classifier flip alone must NOT exit AWAITING_HUMAN; "
+            "requires authoritative forward-progress signal"
+        )
+        kinds = [k for (k, _b) in self._notified]
+        assert "awaiting_human_resumed" not in kinds, (
+            "must not fire awaiting_human_resumed without forward-progress signal"
+        )
+
+    def test_legacy_agent_with_null_entry_id_backfills_and_sleeps(self, tmp_path: Path):
+        """v0.16.2 backward-compat: agents that entered AWAITING_HUMAN
+        before this release have awaiting_entry_message_id=None. First
+        tick after upgrade backfills the field, sleeps, and lets the
+        next tick run the proper exit gate.
+        """
+        import asyncio
+        agents = self._setup(
+            tmp_path, questions=[], permissions=[],
+            latest_text="legacy",
+            latest_message_id="m-legacy",
+            entry_message_id=None,
+            had_pending_qp=False,
+        )
+        agent = agents.get("bck/test")
+        asyncio.run(event_loop_mod._phase_awaiting_human(agent))
+        refreshed = agents.get("bck/test")
+        assert refreshed.phase == "AWAITING_HUMAN"
+        assert refreshed.awaiting_entry_message_id == "m-legacy", (
+            "backfill must populate awaiting_entry_message_id from current latest"
+        )
+        kinds = [k for (k, _b) in self._notified]
+        assert "awaiting_human_resumed" not in kinds
+
+    def test_new_turn_that_also_asks_re_anchors_entry_id(self, tmp_path: Path):
+        """Multi-turn questioning: executor produced a new turn after
+        the human's reply, but that new turn is itself another
+        question. Stay AWAITING_HUMAN, but re-anchor the entry message
+        id to the new turn so the next tick's `new_turn_arrived` check
+        does not spuriously re-trigger on this same new turn.
+        """
+        import asyncio
+        from dataclasses import dataclass
+        awaiting_mod = sys.modules["_oco_test_pkg.awaiting_input"]
+        @dataclass
+        class StubCheck:
+            awaiting: bool = True
+            source: str = "test"
+            confidence: str = "high"
+            reason: str = "still asking"
+            last_assistant_text: str = "ok and one more thing?"
+        async def _stub_check(runtime, text):
+            return StubCheck()
+        awaiting_mod.check = _stub_check
+        agents = self._setup(
+            tmp_path, questions=[], permissions=[],
+            latest_text="ok and one more thing?",
+            latest_message_id="m-followup",
+            entry_message_id="m-entry",
+            had_pending_qp=False,
+        )
+        agent = agents.get("bck/test")
+        asyncio.run(event_loop_mod._phase_awaiting_human(agent))
+        refreshed = agents.get("bck/test")
+        assert refreshed.phase == "AWAITING_HUMAN"
+        assert refreshed.awaiting_entry_message_id == "m-followup", (
+            "must re-anchor to the new turn so subsequent ticks don't "
+            "re-flag this same message id as forward progress"
+        )
+
+    def test_qp_resolved_with_no_prior_phase_defaults_to_executing(self, tmp_path: Path):
+        import asyncio
+        agents = self._setup(
+            tmp_path, questions=[], permissions=[],
+            latest_message_id="m-entry",
+            entry_message_id="m-entry",
+            had_pending_qp=True,
+        )
         agents.update("bck/test", phase_before_awaiting=None)
         agent = agents.get("bck/test")
         asyncio.run(event_loop_mod._phase_awaiting_human(agent))
@@ -2590,3 +2759,168 @@ class TestResumeFromAwaitingHuman:
         assert "awaiting_human_resumed" not in kinds, (
             "oc_send to a non-AWAITING agent must not spuriously fire resumed"
         )
+
+
+class TestServeCmdlineUsesOpencodeHostnameFlag:
+    """v0.16.2 regression guard.
+
+    Opencode's CLI accepts `--hostname=` for `opencode serve`, not
+    `--host=`. v0.16.0 mistakenly renamed the YAML/dataclass/kwarg
+    `serve_hostname` -> `host` AND the spawn flag `--hostname=` ->
+    `--host=` in one go; the latter rename made opencode reject every
+    spawn ("opencode serve exited during startup rc=1"). The YAML knob
+    stays `host` (user-facing API), the outgoing CLI flag stays
+    `--hostname=` (opencode requirement). This test pins the cmdline
+    so the regression cannot recur.
+    """
+
+    def test_spawn_uses_hostname_flag(self, tmp_path, monkeypatch):
+        import subprocess
+        transport_mod = sys.modules["_oco_test_pkg.transport"]
+        captured: dict = {}
+        port_open_calls: list = []
+
+        class FakePopen:
+            def __init__(self, args, **kwargs):
+                captured["args"] = args
+                captured["kwargs"] = kwargs
+                self.pid = 12345
+                self.returncode = None
+            def poll(self):
+                return None
+
+        def _fake_port_open(host, port, timeout: float = 0.3) -> bool:
+            port_open_calls.append((host, port))
+            return len(port_open_calls) > 1
+
+        monkeypatch.setattr(subprocess, "Popen", FakePopen)
+        monkeypatch.setattr(transport_mod.shutil, "which", lambda _name: "/fake/opencode")
+        monkeypatch.setattr(transport_mod.OpencodeClient, "_port_open", staticmethod(_fake_port_open))
+        client = transport_mod.OpencodeClient(
+            "http://127.0.0.1:4096", None, host="0.0.0.0",
+        )
+        client.ensure_server(deadline_sec=1.0, log_dir=None)
+
+        args = captured.get("args") or []
+        assert args[:2] == ["/fake/opencode", "serve"], args
+        joined = " ".join(args)
+        assert "--hostname=0.0.0.0" in joined, (
+            f"opencode CLI requires --hostname= (not --host=); got: {joined}"
+        )
+        assert "--host=" not in joined, (
+            f"--host= is not a real opencode flag; got: {joined}"
+        )
+        assert "--port=4096" in joined
+
+
+class TestAwaitingContextNotTruncated:
+    """v0.16.2: the awaiting_human notification body must carry the
+    FULL last assistant text (no head-truncation with ellipsis). The
+    previous 500/800/600 char caps in
+    `_maybe_notify_new_pending` / `_maybe_notify_awaiting_classified` /
+    `_run_awaiting_input_reminders` were silently swallowing context the
+    human needs to answer the executor's question.
+    """
+
+    def setup_method(self):
+        self._notified: list = []
+        self._saved_pkg_runtime = plugin_mod._runtime
+        self._saved_evloop_runtime = event_loop_mod._runtime
+        self._saved_notify = event_loop_mod._notify_event
+        event_loop_mod._notify_event = lambda agent, kind, body="": self._notified.append((kind, body))
+
+    def teardown_method(self):
+        plugin_mod._runtime = self._saved_pkg_runtime
+        event_loop_mod._runtime = self._saved_evloop_runtime
+        event_loop_mod._notify_event = self._saved_notify
+
+    def _agent(self, tmp_path: Path, phase: str = "EXECUTING") -> state_mod.Agent:
+        cfg = config_mod.Config(
+            projects_file=tmp_path / "projects.json",
+            agents_file=tmp_path / "agents.json",
+            worktrees_root=tmp_path / "wt",
+            logs_dir=tmp_path / "logs",
+            notifications_file=tmp_path / "notifications.jsonl",
+        )
+        cfg.ensure_dirs()
+        agents = state_mod.AgentStore(cfg.agents_file)
+        agent = state_mod.Agent(
+            agent_id="oco/long-context-test", project_label="oco",
+            worktree_path=str(tmp_path), session_id="s",
+            branch="oco/long-context-test", initial_prompt="p", phase=phase,
+        )
+        agents.add(agent)
+        tools_mod = sys.modules["_oco_test_pkg.tools"]
+        rt = tools_mod.Runtime(config=cfg, client=None, projects=None, agents=agents)
+        plugin_mod._runtime = rt
+        event_loop_mod._runtime = rt
+        return agent
+
+    def _attach_fake_messages_client(self, agents, mid: str = "m-x"):
+        cfg = plugin_mod._runtime.config
+        class FakeClient:
+            async def get_messages(self_inner, session_id, directory, cursor=None):
+                return {"items": [{
+                    "message": {"role": "assistant", "id": mid},
+                    "parts": [{"type": "text", "text": "x"}],
+                }]}
+        tools_mod = sys.modules["_oco_test_pkg.tools"]
+        rt = tools_mod.Runtime(config=cfg, client=FakeClient(), projects=None, agents=agents)
+        plugin_mod._runtime = rt
+        event_loop_mod._runtime = rt
+
+    def test_pending_question_path_sends_full_context(self, tmp_path: Path):
+        import asyncio
+        agent = self._agent(tmp_path)
+        agents = plugin_mod._runtime.agents
+        self._attach_fake_messages_client(agents)
+        long_text = "A" * 5000 + " mid " + "B" * 5000
+        asyncio.run(event_loop_mod._maybe_notify_new_pending(
+            agent,
+            pending_q=[{"id": "q1", "text": "Pick A or B?"}],
+            pending_p=[],
+            context_text=long_text,
+        ))
+        assert any(k == "awaiting_human" for (k, _b) in self._notified)
+        body = next(b for (k, b) in self._notified if k == "awaiting_human")
+        assert long_text in body, "pending-question path must include full context_text"
+        first_line = body.split("Context (last assistant text):")[1].splitlines()[1]
+        assert not first_line.startswith("... "), (
+            "must not prefix context with `... ` head-truncation marker"
+        )
+
+    def test_classifier_path_sends_full_last_assistant_text(self, tmp_path: Path):
+        import asyncio
+        agent = self._agent(tmp_path)
+        agents = plugin_mod._runtime.agents
+        self._attach_fake_messages_client(agents)
+        long_text = "X" * 5000 + " question mark? " + "Y" * 3000
+        awaiting_input_mod = sys.modules["_oco_test_pkg.awaiting_input"]
+        check = awaiting_input_mod.AwaitingInputCheck(
+            awaiting=True, confidence="high", reason="trailing question mark",
+            source="regex", last_assistant_text=long_text,
+        )
+        asyncio.run(event_loop_mod._maybe_notify_awaiting_classified(agent, check))
+        body = next(b for (k, b) in self._notified if k == "awaiting_human")
+        assert long_text in body, "classifier path must include full last_assistant_text"
+        head_line = body.split("Last assistant text:\n", 1)[1].splitlines()[0]
+        assert not head_line.startswith("... "), (
+            f"must not prefix last assistant text with `... `; got line: {head_line!r}"
+        )
+
+    def test_reminder_loop_sends_full_last_assistant_text(self, tmp_path: Path):
+        agent = self._agent(tmp_path, phase="AWAITING_HUMAN")
+        long_text = "Z" * 4000 + " reminder " + "W" * 4000
+        now = time.time()
+        rt = event_loop_mod._runtime
+        rt.agents.update(
+            "oco/long-context-test",
+            last_awaiting_notify_at=now - 60 * 60,
+            last_classifier_verdict={
+                "last_assistant_text": long_text, "reason": "stalled awaiting",
+            },
+        )
+        rt.config.awaiting_input_reminder_interval_sec = 1
+        event_loop_mod._run_awaiting_input_reminders()
+        body = next(b for (k, b) in self._notified if k == "awaiting_human")
+        assert long_text in body, "reminder loop must include full last_assistant_text"
