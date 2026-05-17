@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from datetime import datetime
+from . import awaiting_input as awaiting_input_mod
 from . import heartbeat as heartbeat_mod
 from . import pr as pr_mod
 from . import reviewer as reviewer_mod
@@ -51,8 +52,10 @@ _permission_snapshot: dict[str, list[dict]] = {}
 _snapshot_lock = threading.Lock()
 
 _notified_questions: dict[str, set[str]] = {}
+_notified_permissions: dict[str, set[str]] = {}
 _notified_phases: dict[str, set[str]] = {}
 _notify_dedup_lock = threading.Lock()
+AWAITING_INPUT_REMINDER_TICK_SEC = 60.0
 
 _serve_seen_alive: bool = False
 _serve_down_notified_at: float = 0.0
@@ -136,30 +139,120 @@ def _maybe_notify_phase(agent: "Agent", kind: str, body: str = "") -> None:
     _notify_event(agent, kind, body)
 
 
-def _maybe_notify_new_questions(agent: "Agent", pending_q: list[dict]) -> None:
-    if not pending_q:
-        return
+def _format_question_block(q: dict) -> str:
+    inner = (q.get("questions") or [{}])[0]
+    text = (inner.get("question") or "").strip() or "(no body)"
+    opts = inner.get("options") or []
+    bullets = [f"  - {o.get('label')!r}: {o.get('description', '')}" for o in opts if isinstance(o, dict)]
+    chunk = f"[{q.get('id')}] {text}"
+    if bullets:
+        chunk += "\n" + "\n".join(bullets)
+    return chunk
+
+
+def _format_permission_block(p: dict) -> str:
+    pid = p.get("id")
+    ptype = p.get("permission") or p.get("type") or "(unknown)"
+    patterns = p.get("patterns") or []
+    detail = f"type={ptype!r}"
+    if patterns:
+        detail += f" patterns={patterns}"
+    return f"[{pid}] {detail}\n  Reply: /oc answer {pid} <once|always|reject>"
+
+
+def _maybe_notify_new_pending(
+    agent: "Agent",
+    pending_q: list[dict],
+    pending_p: list[dict],
+    context_text: str | None = None,
+) -> bool:
     with _notify_dedup_lock:
-        seen = _notified_questions.setdefault(agent.agent_id, set())
-        new_ids = [q.get("id") for q in pending_q if q.get("id") and q.get("id") not in seen]
-        for qid in new_ids:
+        q_seen = _notified_questions.setdefault(agent.agent_id, set())
+        new_q_ids = [q.get("id") for q in pending_q if q.get("id") and q.get("id") not in q_seen]
+        for qid in new_q_ids:
             if qid:
-                seen.add(qid)
-    if not new_ids:
-        return
-    bodies: list[str] = []
-    for q in pending_q:
-        if q.get("id") not in new_ids:
+                q_seen.add(qid)
+        p_seen = _notified_permissions.setdefault(agent.agent_id, set())
+        new_p_ids = [p.get("id") for p in pending_p if p.get("id") and p.get("id") not in p_seen]
+        for pid in new_p_ids:
+            if pid:
+                p_seen.add(pid)
+    if not new_q_ids and not new_p_ids:
+        return False
+
+    sections: list[str] = []
+    if context_text:
+        snippet = context_text if len(context_text) <= 500 else "... " + context_text[-500:]
+        sections.append(f"Context (last assistant text):\n{snippet}")
+    q_blocks = [_format_question_block(q) for q in pending_q if q.get("id") in new_q_ids]
+    if q_blocks:
+        sections.append("Pending questions:\n\n" + "\n\n".join(q_blocks))
+    p_blocks = [_format_permission_block(p) for p in pending_p if p.get("id") in new_p_ids]
+    if p_blocks:
+        sections.append("Pending permission requests:\n\n" + "\n\n".join(p_blocks))
+    _notify_event(agent, "awaiting_human", "\n\n".join(sections))
+    return True
+
+
+def _maybe_notify_awaiting_classified(
+    agent: "Agent",
+    check: "awaiting_input_mod.AwaitingInputCheck",
+) -> None:
+    snippet = check.last_assistant_text
+    if len(snippet) > 800:
+        snippet = "... " + snippet[-800:]
+    body = (
+        f"Detector: {check.source} (confidence={check.confidence})\n"
+        f"Reason: {check.reason}\n\n"
+        f"Last assistant text:\n{snippet}"
+    )
+    _notify_event(agent, "awaiting_human", body)
+
+
+async def _last_assistant_text(agent: "Agent") -> str:
+    sse = get_text_buffer(agent.agent_id)
+    if sse:
+        joined = "\n".join(v for v in sse.values() if v).strip()
+        if joined:
+            return joined
+    if _runtime is None:
+        return ""
+    try:
+        body = await _runtime.client.get_messages(agent.session_id, Path(agent.worktree_path))
+    except OpencodeError:
+        return ""
+    items = body.get("items") or []
+    parts_text: list[str] = []
+    for item in reversed(items):
+        message = item.get("message") or {}
+        if message.get("role") != "assistant" and message.get("type") != "assistant":
             continue
-        inner = (q.get("questions") or [{}])[0]
-        text = (inner.get("question") or "").strip()
-        opts = inner.get("options") or []
-        bullet_lines = [f"  - {o.get('label')!r}: {o.get('description', '')}" for o in opts if isinstance(o, dict)]
-        chunk = f"[{q.get('id')}] {text}"
-        if bullet_lines:
-            chunk += "\n" + "\n".join(bullet_lines)
-        bodies.append(chunk)
-    _notify_event(agent, "awaiting_human", "Pending questions:\n\n" + "\n\n".join(bodies))
+        for part in reversed(item.get("parts") or []):
+            if isinstance(part, dict) and part.get("type") == "text":
+                text = part.get("text")
+                if isinstance(text, str) and text.strip():
+                    parts_text.append(text)
+        if parts_text:
+            break
+    return "\n".join(reversed(parts_text)).strip()
+
+
+async def _awaiting_input_blocks_review(agent: "Agent") -> bool:
+    if _runtime is None:
+        return False
+    last_text = await _last_assistant_text(agent)
+    if not last_text:
+        return False
+    check = await awaiting_input_mod.check(_runtime, last_text)
+    _runtime.agents.update(
+        agent.agent_id,
+        last_classifier_verdict=awaiting_input_mod.to_dict(check),
+    )
+    if not check.awaiting:
+        return False
+    _maybe_notify_awaiting_classified(agent, check)
+    _runtime.agents.update(agent.agent_id, last_awaiting_notify_at=time.time())
+    return True
 _sse_text_buffers: dict[str, dict[str, str]] = {}
 _sse_buffer_lock = threading.Lock()
 
@@ -316,6 +409,7 @@ async def _supervisor() -> None:
     heartbeat = asyncio.create_task(_heartbeat_loop())
     cleanup = asyncio.create_task(_cleanup_loop())
     watchdog = asyncio.create_task(_serve_watchdog_loop())
+    awaiting_reminder = asyncio.create_task(_awaiting_input_reminder_loop())
     try:
         while not _stop_flag.is_set():
             if _runtime is not None:
@@ -324,7 +418,7 @@ async def _supervisor() -> None:
                         await _ensure_agent_task_async(agent.agent_id)
             await asyncio.sleep(2.0)
     finally:
-        for t in (pruner, heartbeat, cleanup, watchdog):
+        for t in (pruner, heartbeat, cleanup, watchdog, awaiting_reminder):
             t.cancel()
             try:
                 await t
@@ -342,6 +436,60 @@ async def _cleanup_loop() -> None:
         except Exception as e:
             logger.warning("cleanup tick failed: %s", e)
         await asyncio.sleep(CLEANUP_INTERVAL_SEC)
+
+
+async def _awaiting_input_reminder_loop() -> None:
+    while not _stop_flag.is_set():
+        await asyncio.sleep(AWAITING_INPUT_REMINDER_TICK_SEC)
+        if _runtime is None:
+            continue
+        try:
+            _run_awaiting_input_reminders()
+        except Exception as e:
+            logger.warning("awaiting_input reminder tick failed: %s", e)
+
+
+def _run_awaiting_input_reminders() -> None:
+    assert _runtime is not None
+    cfg = _runtime.config
+    if cfg.awaiting_input_reminder_interval_sec <= 0:
+        return
+    now = time.time()
+    interval = cfg.awaiting_input_reminder_interval_sec
+    for agent in _runtime.agents.list():
+        if agent.phase not in {"EXECUTING", "EXECUTOR_ADDRESSING"}:
+            continue
+        last_notify = agent.last_awaiting_notify_at
+        if last_notify is None:
+            continue
+        if now - last_notify < interval:
+            continue
+        verdict = agent.last_classifier_verdict or {}
+        snippet = str(verdict.get("last_assistant_text") or "")
+        if len(snippet) > 600:
+            snippet = "... " + snippet[-600:]
+        elapsed = _humanize_seconds(now - last_notify)
+        reason = verdict.get("reason") or "(no reason recorded)"
+        body = (
+            f"Agent has been awaiting input for {elapsed}. "
+            f"Detector reason: {reason}\n\n"
+            f"Last assistant text:\n{snippet}"
+        ) if snippet else (
+            f"Agent has been awaiting input for {elapsed}. Detector reason: {reason}"
+        )
+        _notify_event(agent, "awaiting_human", body)
+        _runtime.agents.update(agent.agent_id, last_awaiting_notify_at=now)
+
+
+def _humanize_seconds(s: float) -> str:
+    s = max(0.0, float(s))
+    if s < 60:
+        return f"{int(s)}s"
+    if s < 3600:
+        return f"{int(s // 60)}m"
+    h = int(s // 3600)
+    m = int((s % 3600) // 60)
+    return f"{h}h{m:02d}m"
 
 
 def _run_cleanup() -> None:
@@ -714,13 +862,17 @@ async def _phase_executing(agent: Agent) -> None:
     pending_p = [p for p in permissions if p.get("sessionID") == agent.session_id]
     _update_snapshots(agent.agent_id, pending_q, pending_p)
     if pending_q or pending_p:
-        _maybe_notify_new_questions(agent, pending_q)
+        last_text = await _last_assistant_text(agent)
+        if _maybe_notify_new_pending(agent, pending_q, pending_p, context_text=last_text):
+            _runtime.agents.update(agent.agent_id, last_awaiting_notify_at=time.time())
         return
     await asyncio.sleep(IDLE_DEBOUNCE_SEC)
     confirm = await _runtime.client.wait_idle(agent.session_id, worktree, timeout=2.0)
     if not confirm:
         return
     if not _has_diff(worktree):
+        return
+    if await _awaiting_input_blocks_review(agent):
         return
     _runtime.agents.update(agent.agent_id, phase="IDLE_TASK_COMPLETE")
 
@@ -825,8 +977,13 @@ async def _phase_executor_addressing(agent: Agent) -> None:
     pending_p = [p for p in permissions if p.get("sessionID") == agent.session_id]
     _update_snapshots(agent.agent_id, pending_q, pending_p)
     if pending_q or pending_p:
+        last_text = await _last_assistant_text(agent)
+        if _maybe_notify_new_pending(agent, pending_q, pending_p, context_text=last_text):
+            _runtime.agents.update(agent.agent_id, last_awaiting_notify_at=time.time())
         return
     await asyncio.sleep(IDLE_DEBOUNCE_SEC)
+    if await _awaiting_input_blocks_review(agent):
+        return
     _runtime.agents.update(agent.agent_id, phase="COMMITTING")
 
 

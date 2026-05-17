@@ -91,6 +91,13 @@ class Config:
     heartbeat_day_end: int = 23
     review_max_cycles: int = 1
     auto_bootstrap_on_first_spawn: bool = True
+    classifier_enabled: bool = True
+    classifier_task_name: str = "hermes_opencode.awaiting_input"
+    classifier_max_input_chars: int = 2000
+    classifier_max_output_tokens: int = 80
+    classifier_timeout_sec: float = 8.0
+    awaiting_input_stall_timeout_sec: float = 300.0
+    awaiting_input_reminder_interval_sec: float = 1800.0
 
     @classmethod
     def from_plugin_entry(cls, entry: dict | None) -> "Config":
@@ -101,6 +108,8 @@ class Config:
         gateway = notify.get("gateway") or {}
         events = (notify.get("events") or {})
         heartbeat = entry.get("heartbeat") or {}
+        classifier = entry.get("classifier") or {}
+        awaiting = entry.get("awaiting_input") or {}
         day_window = heartbeat.get("unconditional_hours", [9, 23])
         default_events = {"pr_opened", "done", "failed", "awaiting_human", "review_started", "cancelled"}
 
@@ -139,6 +148,13 @@ class Config:
             heartbeat_timezone=heartbeat.get("timezone"),
             heartbeat_day_start=int(day_window[0]) if len(day_window) >= 1 else 9,
             heartbeat_day_end=int(day_window[1]) if len(day_window) >= 2 else 23,
+            classifier_enabled=bool(classifier.get("enabled", True)),
+            classifier_task_name=str(classifier.get("task", "hermes_opencode.awaiting_input")),
+            classifier_max_input_chars=int(classifier.get("max_input_chars", 2000)),
+            classifier_max_output_tokens=int(classifier.get("max_output_tokens", 80)),
+            classifier_timeout_sec=float(classifier.get("timeout_sec", 8.0)),
+            awaiting_input_stall_timeout_sec=float(awaiting.get("stall_timeout_sec", 300.0)),
+            awaiting_input_reminder_interval_sec=float(awaiting.get("reminder_interval_sec", 1800.0)),
         )
 
     def ensure_dirs(self) -> None:

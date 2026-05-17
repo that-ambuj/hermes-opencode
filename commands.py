@@ -215,6 +215,26 @@ def _fmt_doctor(runtime: "Runtime") -> str:
         f"  heartbeat            · enabled={cfg.heartbeat_enabled} "
         f"window={cfg.heartbeat_day_start}-{cfg.heartbeat_day_end} tz={cfg.heartbeat_timezone or '(system)'}"
     )
+    classifier_state = "enabled" if cfg.classifier_enabled else "disabled"
+    lines.append(
+        f"  classifier           · {classifier_state} task={cfg.classifier_task_name!r} "
+        f"max_input={cfg.classifier_max_input_chars} timeout={cfg.classifier_timeout_sec}s"
+    )
+    lines.append(
+        f"  awaiting input       · stall_after={int(cfg.awaiting_input_stall_timeout_sec)}s "
+        f"reminder_every={int(cfg.awaiting_input_reminder_interval_sec)}s"
+    )
+    awaiting_agents = [a for a in agents if a.last_awaiting_notify_at]
+    if awaiting_agents:
+        for a in awaiting_agents:
+            verdict = a.last_classifier_verdict or {}
+            src = verdict.get("source", "?")
+            conf = verdict.get("confidence", "?")
+            awaiting = verdict.get("awaiting", "?")
+            lines.append(
+                f"  awaiting · {a.agent_id} · phase={a.phase} "
+                f"verdict=awaiting={awaiting} src={src} conf={conf}"
+            )
 
     deps = []
     deps.append(("opencode", shutil_mod.which("opencode")))

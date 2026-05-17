@@ -126,6 +126,76 @@ If you add new phases or shortcuts that bypass `_phase_committing`,
 either route them through this same executor-driven path or document
 why the slug-based fallback is acceptable for that path.
 
+## Awaiting-input gate and classifier cascade (LOAD-BEARING)
+
+`_phase_executing` and `_phase_executor_addressing` do NOT transition the
+agent forward (to `IDLE_TASK_COMPLETE` / `COMMITTING`) the moment the
+worktree has a non-empty diff and opencode reports the session as idle.
+They first ask the awaiting-input cascade whether the executor's last
+assistant message is plausibly waiting on a human reply.
+
+Cascade in [awaiting_input.py](awaiting_input.py):
+
+1. **Regex layer** — 10 patterns (trailing `?`, "which option", "should I",
+   "would you prefer", "let me know", "please confirm", "y/n", "awaiting
+   your input", labeled options). Always runs. Cost zero.
+2. **LLM layer** — invokes hermes' canonical auxiliary client
+   `agent.auxiliary_client.async_call_llm(task=cfg.classifier_task_name, ...)`.
+   The task name (default `hermes_opencode.awaiting_input`) routes
+   through hermes' `auxiliary.<task>.{provider,model}` config, so the
+   user picks their model in `~/.hermes/config.yaml` and we work with
+   Anthropic, OpenAI, Gemini, OpenRouter, or any other provider hermes
+   routes. Falls back to the regex result on `ImportError`, network
+   error, parse error, or timeout.
+3. **Stalled-idle reminder** — `_awaiting_input_reminder_loop()`
+   re-notifies `awaiting_human` for any `EXECUTING` / `EXECUTOR_ADDRESSING`
+   agent whose `last_awaiting_notify_at` is older than
+   `cfg.awaiting_input_reminder_interval_sec` (default 30min).
+
+Why this gate exists: opencode's `Message` schema has NO field that
+distinguishes "asked a question" from "made a statement" — the assistant's
+last text part looks identical in both cases. Without the gate, an
+executor that emits "I see two options. Which would you prefer?" with a
+non-empty diff would be sent straight to the reviewer, which would LGTM
+or reject incomplete work and trigger a premature PR open. The cascade
+catches the cases where the executor noncompliantly used plain text
+instead of the `/question` API.
+
+The `/question` API is still the authoritative signal. The
+`ORCHESTRATOR_DIRECTIVE` in `tools.py` instructs the executor to use it.
+The cascade is the safety net for noncompliance, not the primary path.
+
+When extending the state machine: any phase that wants to gate review
+or commit on "executor is plausibly done" must call
+`_awaiting_input_blocks_review(agent)` before transitioning. Do NOT
+re-implement the cascade inline.
+
+## OMO directive coexistence (LOAD-BEARING)
+
+Every executor session runs inside an opencode instance that loads
+[oh-my-openagent](https://github.com/code-yeongyu/oh-my-openagent) (OMO)
+as an opencode plugin (registered globally via
+`~/.config/opencode/opencode.json::plugin`). OMO injects directives into
+the executor's conversation using the prefix
+`[SYSTEM DIRECTIVE: OH-MY-OPENCODE - <TYPE>]` and `<system-reminder>`
+tags.
+
+hermes-opencode uses the parallel prefix
+`[SYSTEM DIRECTIVE: HERMES-OPENCODE - ORCHESTRATOR RULES]` ... `[END
+SYSTEM DIRECTIVE]` for the directive wrapped around the initial prompt
+in `tools.py::make_spawn`. OMO's `isSystemDirective()` parser checks for
+the OH-MY-OPENCODE prefix specifically, so our HERMES-OPENCODE directive
+flows through OMO untouched.
+
+When adding new orchestrator-emitted directives:
+
+- Use the `[SYSTEM DIRECTIVE: HERMES-OPENCODE - <TYPE>]` ... `[END SYSTEM
+  DIRECTIVE]` envelope. Keep the user's verbatim prompt unchanged below
+  it.
+- Never use the OH-MY-OPENCODE prefix.
+- Pick a `<TYPE>` that is unique within hermes-opencode (so future
+  grep / parser work can target specific directives).
+
 ## CANCELLED vs KILLED (LOAD-BEARING)
 
 Two terminal phases mean different things:

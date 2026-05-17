@@ -21,6 +21,33 @@ from .state import Agent, AgentNotFound, AgentStore
 from .transport import OpencodeClient, OpencodeError
 
 
+ORCHESTRATOR_DIRECTIVE = (
+    "[SYSTEM DIRECTIVE: HERMES-OPENCODE - ORCHESTRATOR RULES]\n"
+    "You are running under hermes-opencode orchestration. Two rules govern how "
+    "you communicate with the human:\n"
+    "\n"
+    "1. Asking for human input. When you need a decision, clarification, "
+    "approval, or any other reply from the human user before proceeding, you "
+    "MUST use opencode's /question API with explicit options (or a free-form "
+    "field when options don't apply). The orchestrator forwards /question "
+    "entries to the user's DM channel reliably. Plain-text 'which option do "
+    "you prefer?' prompts in your message body are detected by a classifier "
+    "as a fallback, but the classifier may be wrong; the /question API is the "
+    "authoritative signal. Do NOT trail off in plain text expecting the human "
+    "to read your prose as a question.\n"
+    "\n"
+    "2. Opening the pull request. When the human reviewer approves your "
+    "changes, you will be instructed to commit and open the PR yourself. Emit "
+    "PR_OPENED: <github-pr-url> on its own line in your response so the "
+    "orchestrator can capture the URL.\n"
+    "[END SYSTEM DIRECTIVE]"
+)
+
+
+def wrap_initial_prompt(user_prompt: str) -> str:
+    return f"{ORCHESTRATOR_DIRECTIVE}\n\n{user_prompt}"
+
+
 class Runtime:
     def __init__(
         self,
@@ -384,8 +411,9 @@ def make_spawn(rt: Runtime) -> Callable[..., Awaitable[str]]:
         )
         rt.agents.add(agent)
 
+        wrapped_prompt = wrap_initial_prompt(prompt)
         try:
-            await rt.client.send_message_async(session_id, worktree_path, prompt)
+            await rt.client.send_message_async(session_id, worktree_path, wrapped_prompt)
         except OpencodeError as e:
             rt.agents.update(agent_id, phase="FAILED", last_error=str(e))
             return _err(f"send_message_async failed: {e}", agent_id=agent_id)

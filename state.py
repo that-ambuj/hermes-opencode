@@ -50,6 +50,9 @@ class Agent:
     archived_at: float | None = None
     cancelled_at: float | None = None
     cancellation_reason: str | None = None
+    last_progress_at: float = field(default_factory=time.time)
+    last_awaiting_notify_at: float | None = None
+    last_classifier_verdict: dict | None = None
 
 
 class AgentExists(ValueError):

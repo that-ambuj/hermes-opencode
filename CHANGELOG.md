@@ -5,6 +5,83 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.0] - 2026-05-17
+
+### Fixed
+
+- **Reviewer no longer races into incomplete work.** Before, the
+  `_phase_executing` gate transitioned to `IDLE_TASK_COMPLETE → REVIEW_SPAWNING`
+  the moment the executor went idle with a non-empty worktree diff —
+  including when the executor had just emitted a plain-text "which option do
+  you prefer?" prompt with no formal `/question` entry. The reviewer would
+  then review partial work; if it LGTM'd, the executor would commit and open
+  a PR for incomplete changes. New gate: after the diff check, run the
+  awaiting-input classifier on the last assistant message. If the
+  classifier (or its regex fallback) says the executor is awaiting human
+  input, stay in `EXECUTING` and fire an `awaiting_human` notify with
+  context. Same gate applies to `_phase_executor_addressing` before
+  `COMMITTING`.
+
+- **Permission requests now fire `awaiting_human` notifications.**
+  Previously `_maybe_notify_new_questions` only fanned out for `/question`
+  entries — pending `/permission` entries silently stalled the agent
+  without any DM. Renamed to `_maybe_notify_new_pending`; renders both
+  questions and permissions with separate dedup-id sets, and prepends the
+  last assistant text (≤500 chars) as a `Context:` block so the user sees
+  the why alongside the prompt.
+
+### Added
+
+- **Awaiting-input cascade detector** ([awaiting_input.py](opencode-orchestrator/awaiting_input.py)).
+  Three-layer classifier that decides whether the executor's most recent
+  assistant message is waiting on a human reply when there's no formal
+  `/question` or `/permission` entry:
+  1. **Regex layer** (always on, free): 10 patterns covering trailing `?`,
+     "which option", "should I", "would you prefer", "let me know",
+     "please confirm", "y/n", explicit "awaiting your input", labeled-option
+     enumeration ("Option A:", "Option B:").
+  2. **LLM layer** (configurable, off-by-default disable supported): calls
+     `agent.auxiliary_client.async_call_llm(task=cfg.classifier_task_name, ...)`.
+     Users pick their model by adding
+     `auxiliary.hermes_opencode.awaiting_input.{provider,model}` to
+     `~/.hermes/config.yaml` — works with Anthropic, OpenAI, Gemini,
+     OpenRouter, or any other provider hermes-agent routes. Falls back
+     gracefully when the auxiliary client isn't reachable, times out, or
+     emits unparseable output.
+  3. **Stalled-idle reminder loop**: per-agent
+     `last_awaiting_notify_at` tracks when we last DM'd. The reminder loop
+     ticks every 60s; if an `EXECUTING` / `EXECUTOR_ADDRESSING` agent has
+     been awaiting input for `awaiting_input.reminder_interval_sec` (default
+     1800s = 30min), re-notify with elapsed time and the cached
+     last-assistant snippet. Dedup-safe — won't spam.
+
+- **Initial-prompt system directive.** `tools.py::make_spawn` now wraps the
+  user's verbatim initial prompt with a `[SYSTEM DIRECTIVE: HERMES-OPENCODE
+  - ORCHESTRATOR RULES]` ... `[END SYSTEM DIRECTIVE]` block instructing the
+  executor to (a) use the `/question` API for human input (so the cascade
+  detector is the safety net, not the primary path) and (b) emit
+  `PR_OPENED:` when opening the PR. The user's prompt body remains
+  bit-for-bit unchanged below the directive; the format mirrors OMO's
+  `[SYSTEM DIRECTIVE: OH-MY-OPENCODE - ...]` convention so OMO's
+  directive parser does not collide.
+
+- **`Agent` carries** `last_progress_at`, `last_awaiting_notify_at`, and
+  `last_classifier_verdict` (all migration-tolerant defaults). Surfaced in
+  `/oc doctor` so the user can see which agents are awaiting input and the
+  detector verdict that flagged them.
+
+### Changed
+
+- `Config` gains `classifier_*` (enabled, task name, max input/output,
+  timeout) and `awaiting_input_*` (stall timeout, reminder interval)
+  fields. All have safe defaults; users override under
+  `plugins.entries.hermes-opencode.{classifier,awaiting_input}.*` in
+  `~/.hermes/config.yaml`.
+
+- `/oc doctor` adds three sections: `classifier`, `awaiting input`, and
+  per-agent `awaiting · <agent_id>` lines for any agent with a recent
+  awaiting-input notification.
+
 ## [0.13.0] - 2026-05-17
 
 ### Fixed
