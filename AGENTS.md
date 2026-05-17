@@ -293,6 +293,18 @@ top of the handler. Rate-limit takes precedence over abort because
 the abort detector would also fire on 429s but with less useful
 context (no retry-after).
 
+v0.15.1 generalized the detector. `_check_session_rate_limited(agent,
+session_id, worktree, session_label="executor"|"reviewer")` is now the
+underlying primitive; `_check_executor_rate_limited(agent)` is a
+back-compat one-arg wrapper. `_phase_reviewing` calls the generic
+helper with the reviewer's session and `session_label="reviewer"` so
+reviewer-session 429s also transition the agent to RATE_LIMITED with
+`phase_before_rate_limit=REVIEWING`. The notification body and
+`agent.last_error` include the session label, so the user knows which
+session was rate-limited. When adding handlers for other sessions
+(reviewer-2, dashboard-driven probes, etc.) call the same generic
+helper with the appropriate label.
+
 ## Error surfacing (LOAD-BEARING)
 
 The orchestrator has TWO orthogonal error-surfacing paths. Both are

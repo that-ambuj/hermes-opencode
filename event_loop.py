@@ -1015,22 +1015,25 @@ def _message_is_rate_limited(item: dict) -> float | None:
     return retry_after_sec
 
 
-async def _check_executor_rate_limited(agent: Agent) -> bool:
-    """If opencode's latest assistant turn on the executor session is a
-    provider rate-limit error, transition the agent to RATE_LIMITED,
-    record the retry-after window, and notify. Returns True when the
-    agent was transitioned (caller MUST NOT continue this tick's normal
-    flow).
+async def _check_session_rate_limited(
+    agent: Agent, session_id: str, worktree: Path, *, session_label: str = "executor",
+) -> bool:
+    """Generic rate-limit check against any opencode session belonging to
+    this agent. Caller passes the session_id + worktree of the session to
+    inspect (executor or reviewer). On hit: transitions the agent to
+    `RATE_LIMITED`, saves `phase_before_rate_limit`, records the retry
+    window, fires the `rate_limited` notification. Returns True when the
+    caller MUST NOT continue this tick's normal flow.
 
     The wait-and-resume path is intentional per v0.15.0 design: review
     is NOT bypassed; the original task continues through its own flow
-    once the limit clears, including any pending review cycle.
+    once the limit clears. v0.15.1 extends this coverage to the reviewer
+    session (previously only the executor was instrumented).
     """
     if _runtime is None or agent.phase == "RATE_LIMITED":
         return False
-    worktree = Path(agent.worktree_path)
     try:
-        body = await _runtime.client.get_messages(agent.session_id, worktree)
+        body = await _runtime.client.get_messages(session_id, worktree)
     except OpencodeError:
         return False
     items = body.get("items") or []
@@ -1049,15 +1052,28 @@ async def _check_executor_rate_limited(agent: Agent) -> bool:
             phase_before_rate_limit=agent.phase,
             rate_limited_at=time.time(),
             rate_limit_retry_after_at=retry_at,
-            last_error=f"rate-limited; retry after ~{int(wait_for)}s",
+            last_error=f"rate-limited on {session_label} session; retry after ~{int(wait_for)}s",
         )
         body_text = (
-            f"Agent rate-limited by provider. Will retry in ~{int(wait_for)}s. "
+            f"Agent rate-limited by provider on {session_label} session "
+            f"(phase={agent.phase}). Will retry in ~{int(wait_for)}s. "
             f"New tasks queued until clear."
         )
         _notify_event(updated, "rate_limited", body_text)
         return True
     return False
+
+
+async def _check_executor_rate_limited(agent: Agent) -> bool:
+    """v0.15.0 entry point. Thin back-compat wrapper around
+    `_check_session_rate_limited` for the executor session, retained so
+    every executor-touching phase handler in this module can call the
+    same one-arg helper without threading the session_id through.
+    """
+    return await _check_session_rate_limited(
+        agent, agent.session_id, Path(agent.worktree_path),
+        session_label="executor",
+    )
 
 
 async def _check_executor_abort(agent: Agent) -> bool:
@@ -1267,6 +1283,10 @@ async def _phase_reviewing(agent: Agent) -> None:
     sister = Path(agent.reviewer_worktree_path)
     became_idle = await _runtime.client.wait_idle(agent.reviewer_session_id, sister, timeout=60.0)
     if not became_idle:
+        return
+    if await _check_session_rate_limited(
+        agent, agent.reviewer_session_id, sister, session_label="reviewer",
+    ):
         return
     try:
         body = await _runtime.client.get_messages(agent.reviewer_session_id, sister)

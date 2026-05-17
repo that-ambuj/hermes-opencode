@@ -1864,3 +1864,164 @@ class TestOneshotOpenPr:
         assert "invalid spec" in attempts[0]
         assert "openai" in attempts[1]
         assert len(self._created_sessions) == 1
+
+
+class TestCheckSessionRateLimited:
+    """v0.15.1: _check_session_rate_limited is the generic detector that
+    can run against ANY of the agent's sessions (executor OR reviewer).
+    Closes the v0.15.0 known gap: previously _phase_reviewing did not
+    detect rate-limits on the reviewer session.
+    """
+
+    def setup_method(self):
+        self._notified: list = []
+        self._saved_pkg_runtime = plugin_mod._runtime
+        self._saved_evloop_runtime = event_loop_mod._runtime
+        self._saved_notify = event_loop_mod._notify_event
+        event_loop_mod._notify_event = lambda agent, kind, body="": self._notified.append((kind, body))
+
+    def teardown_method(self):
+        plugin_mod._runtime = self._saved_pkg_runtime
+        event_loop_mod._runtime = self._saved_evloop_runtime
+        event_loop_mod._notify_event = self._saved_notify
+
+    def _setup(self, tmp_path, messages_by_session: dict, phase="REVIEWING"):
+        cfg = config_mod.Config(
+            projects_file=tmp_path / "projects.json",
+            agents_file=tmp_path / "agents.json",
+            worktrees_root=tmp_path / "wt",
+            logs_dir=tmp_path / "logs",
+            notifications_file=tmp_path / "notifications.jsonl",
+        )
+        cfg.ensure_dirs()
+        agents = state_mod.AgentStore(cfg.agents_file)
+        sister_path = tmp_path / "sister"
+        agent = state_mod.Agent(
+            agent_id="bck/test", project_label="bck",
+            worktree_path=str(tmp_path), session_id="exec-s",
+            reviewer_session_id="rev-s", reviewer_worktree_path=str(sister_path),
+            branch="bck/test", initial_prompt="p", phase=phase,
+        )
+        agents.add(agent)
+        store = messages_by_session
+        class FakeClient:
+            async def get_messages(self_inner, session_id, directory, cursor=None):
+                return {"items": store.get(session_id, [])}
+        tools_mod = sys.modules["_oco_test_pkg.tools"]
+        rt = tools_mod.Runtime(config=cfg, client=FakeClient(), projects=None, agents=agents)
+        plugin_mod._runtime = rt
+        event_loop_mod._runtime = rt
+        return agents, sister_path
+
+    def test_reviewer_session_rate_limit_transitions_agent(self, tmp_path: Path):
+        import asyncio
+        agents, sister = self._setup(tmp_path, {
+            "exec-s": [{
+                "message": {"role": "assistant", "id": "e1"},
+                "parts": [{"type": "text", "text": "executor was fine"}],
+            }],
+            "rev-s": [{
+                "message": {
+                    "role": "assistant", "id": "r1",
+                    "error": {
+                        "name": "APIError", "statusCode": 429,
+                        "message": "rate limited",
+                        "responseHeaders": {"retry-after": "45"},
+                    },
+                },
+            }],
+        }, phase="REVIEWING")
+        agent = agents.get("bck/test")
+        result = asyncio.run(event_loop_mod._check_session_rate_limited(
+            agent, agent.reviewer_session_id, sister, session_label="reviewer",
+        ))
+        assert result is True
+        refreshed = agents.get("bck/test")
+        assert refreshed.phase == "RATE_LIMITED"
+        assert refreshed.phase_before_rate_limit == "REVIEWING"
+        assert refreshed.rate_limit_retry_after_at is not None
+        kinds = [k for (k, _b) in self._notified]
+        assert "rate_limited" in kinds
+        bodies = [b for (_k, b) in self._notified]
+        assert any("reviewer session" in b for b in bodies), (
+            "v0.15.1 body must mention the session_label so the user "
+            "knows which session was rate-limited"
+        )
+        last_err = refreshed.last_error or ""
+        assert "reviewer" in last_err
+
+    def test_executor_session_label_in_body(self, tmp_path: Path):
+        import asyncio
+        agents, sister = self._setup(tmp_path, {
+            "exec-s": [{
+                "message": {
+                    "role": "assistant", "id": "e1",
+                    "error": {"name": "APIError", "statusCode": 429, "message": "rl"},
+                },
+            }],
+        }, phase="EXECUTING")
+        agent = agents.get("bck/test")
+        asyncio.run(event_loop_mod._check_session_rate_limited(
+            agent, agent.session_id, Path(agent.worktree_path),
+            session_label="executor",
+        ))
+        bodies = [b for (_k, b) in self._notified]
+        assert any("executor session" in b for b in bodies)
+        last_err = agents.get("bck/test").last_error or ""
+        assert "executor" in last_err
+
+    def test_no_rate_limit_returns_false(self, tmp_path: Path):
+        import asyncio
+        agents, sister = self._setup(tmp_path, {
+            "rev-s": [{
+                "message": {"role": "assistant", "id": "r1"},
+                "parts": [{"type": "text", "text": "REVIEW: LGTM"}],
+            }],
+        }, phase="REVIEWING")
+        agent = agents.get("bck/test")
+        result = asyncio.run(event_loop_mod._check_session_rate_limited(
+            agent, agent.reviewer_session_id, sister, session_label="reviewer",
+        ))
+        assert result is False
+        assert agents.get("bck/test").phase == "REVIEWING"
+        assert self._notified == []
+
+    def test_executor_wrapper_still_works(self, tmp_path: Path):
+        """v0.15.0 _check_executor_rate_limited is a back-compat shim;
+        ensure it still routes through the generalized helper."""
+        import asyncio
+        agents, sister = self._setup(tmp_path, {
+            "exec-s": [{
+                "message": {
+                    "role": "assistant", "id": "e1",
+                    "error": {
+                        "name": "APIError", "statusCode": 429,
+                        "message": "rl", "responseHeaders": {"retry-after": "30"},
+                    },
+                },
+            }],
+        }, phase="EXECUTING")
+        agent = agents.get("bck/test")
+        result = asyncio.run(event_loop_mod._check_executor_rate_limited(agent))
+        assert result is True
+        refreshed = agents.get("bck/test")
+        assert refreshed.phase == "RATE_LIMITED"
+        assert refreshed.phase_before_rate_limit == "EXECUTING"
+        assert "executor" in (refreshed.last_error or "")
+
+    def test_already_RATE_LIMITED_noop_on_either_session(self, tmp_path: Path):
+        import asyncio
+        agents, sister = self._setup(tmp_path, {
+            "rev-s": [{
+                "message": {
+                    "role": "assistant", "id": "r1",
+                    "error": {"name": "APIError", "statusCode": 429, "message": "rl"},
+                },
+            }],
+        }, phase="RATE_LIMITED")
+        agent = agents.get("bck/test")
+        result = asyncio.run(event_loop_mod._check_session_rate_limited(
+            agent, agent.reviewer_session_id, sister, session_label="reviewer",
+        ))
+        assert result is False
+        assert self._notified == []

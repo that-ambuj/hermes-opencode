@@ -5,6 +5,64 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.1] - 2026-05-17
+
+Closes the known gap documented in v0.15.0: reviewer-session
+rate-limit detection.
+
+### Added
+
+- **Generic session-level rate-limit detector**
+  `_check_session_rate_limited(agent, session_id, worktree, session_label)`
+  in event_loop.py. Same semantics as v0.15.0's
+  `_check_executor_rate_limited` (transition agent to RATE_LIMITED,
+  save `phase_before_rate_limit`, record retry-after window, fire
+  `rate_limited` notification) but parameterized by session_id +
+  worktree + label so it can run against the executor OR the reviewer
+  session.
+
+- **`_phase_reviewing` now detects reviewer-session rate limits.**
+  After `wait_idle` succeeds, the handler calls
+  `_check_session_rate_limited(agent, agent.reviewer_session_id,
+  sister, session_label="reviewer")`. On a 429 hit during review, the
+  agent transitions to RATE_LIMITED with
+  `phase_before_rate_limit="REVIEWING"`, so `_phase_rate_limited`'s
+  wait-and-resume path restores it back to REVIEWING when the limit
+  clears. Same behavior as the executor-side path: review is NOT
+  bypassed.
+
+- **Notification body + `last_error` now include the session label.**
+  Previously the rate-limit notification was generic ("rate-limited by
+  provider; retry in Ns"). Now it reads "rate-limited by provider on
+  reviewer session (phase=REVIEWING); ..." so the user sees which
+  session hit the limit. `agent.last_error` carries the same label.
+
+- **5 new regression tests** in `tests/test_pure_logic.py::TestCheckSessionRateLimited`:
+  - reviewer-session 429 transitions agent with reviewer label in body
+    and `last_error`
+  - executor-session 429 emits "executor session" label (precedence /
+    string-content check)
+  - no rate-limit returns False without notify
+  - back-compat: `_check_executor_rate_limited` still routes through
+    the generalized helper
+  - already-RATE_LIMITED is a noop on either session
+
+  Full suite: 319 passed (was 314 at v0.15.0).
+
+### Changed
+
+- `_check_executor_rate_limited(agent)` is now a thin back-compat
+  wrapper around `_check_session_rate_limited(agent, agent.session_id,
+  Path(agent.worktree_path), session_label="executor")`. All v0.15.0
+  callsites (`_phase_executing`, `_phase_executor_addressing`, two
+  call points inside `_phase_committing`) continue to work unchanged.
+
+### Docs
+
+- `AGENTS.md::Rate limits and queue` section gained a note on the
+  v0.15.1 generalization and the new `session_label` convention for
+  future handlers that touch additional sessions.
+
 ## [0.15.0] - 2026-05-17
 
 Minor bump: introduces two new phases (`QUEUED`, `RATE_LIMITED`),
