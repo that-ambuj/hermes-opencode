@@ -5,6 +5,53 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.0] - 2026-05-17
+
+### Fixed
+
+- **Gateway notify sink now actually delivers.** `notify._send_gateway`
+  previously called `platform_registry.create_adapter(...)`, which
+  returned `None` in every observed runtime because the registry's
+  `_entries` factory table isn't populated by anything in our load
+  path. Real notifications (`agent_done`, `pr_opened`, `cancelled`,
+  `serve_down`, heartbeat) silently failed the gateway sink and only
+  the dashboard JSONL appended; users with `notify_sinks=["gateway",
+  "dashboard"]` thought their DM channel was working when it wasn't.
+  The fix: a new `notify._resolve_live_adapter(platform_enum)` helper
+  reads `gateway.run._gateway_runner_ref().adapters` directly — the
+  already-instantiated adapter dict the gateway uses to send and
+  receive messages. `_send_gateway` tries the live runner first, falls
+  back to `create_adapter` for CLI / out-of-gateway-process contexts,
+  and emits an explicit `"create_adapter returned None ... and no live
+  runner found (notify is firing outside the gateway process)"` when
+  both fail so the next failure is easy to triage. The `NotifyResult`
+  detail now also names which path delivered the message (`live
+  runner` vs `create_adapter`).
+
+- **Removed dead `hermes send-message` subprocess fallback** from
+  `_gateway_send` in `__init__.py`. `hermes send-message` was never a
+  real subcommand (verified against `hermes -h`); the branch only ever
+  logged a warning and dropped the echo on the floor. `_gateway_send`
+  now resolves the adapter via the same shared
+  `notify._resolve_live_adapter` helper as the notify path — one
+  adapter-resolution path for the whole plugin.
+
+### Added
+
+- **`/oc test-notify [message ...]` subcommand.** Forces a full
+  notify fanout (gateway DM + dashboard + cli) with a synthetic event
+  and prints a per-sink `[ok]` / `[FAIL]` line with the failure detail
+  for each. Intended for verifying the gateway DM trigger end-to-end
+  without waiting for a real agent state transition; also useful for
+  debugging future notify regressions. Also wired into the dispatcher,
+  the `/oc help` text, and behind the gateway slash-command dispatch
+  hook so it works from iMessage / Telegram / Discord / Slack.
+
+### Changed
+
+- `register_command("oc", description=...)` text now mentions `cancel`
+  (was stale — listed only `list / attach / questions / doctor`).
+
 ## [0.12.1] - 2026-05-17
 
 ### Fixed

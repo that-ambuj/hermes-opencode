@@ -54,6 +54,21 @@ def _send_dashboard(title: str, body: str, meta: dict[str, Any], path: Path) -> 
         return NotifyResult("dashboard", False, repr(e))
 
 
+def _resolve_live_adapter(platform_enum: Any) -> Any | None:
+    try:
+        from gateway.run import _gateway_runner_ref  # type: ignore
+    except ImportError:
+        return None
+    try:
+        runner = _gateway_runner_ref()
+    except Exception:
+        return None
+    if runner is None:
+        return None
+    adapters = getattr(runner, "adapters", None) or {}
+    return adapters.get(platform_enum)
+
+
 def _send_gateway(title: str, body: str, _meta: dict[str, Any], platform: str | None, chat_id: str | None) -> NotifyResult:
     if not platform or not chat_id:
         return NotifyResult("gateway", False, "platform or chat_id not configured")
@@ -66,20 +81,33 @@ def _send_gateway(title: str, body: str, _meta: dict[str, Any], platform: str | 
         platform_enum = Platform(platform) if not isinstance(platform, Platform) else platform
     except Exception as e:
         return NotifyResult("gateway", False, f"unknown platform {platform!r}: {e}")
-    try:
-        gconfig = load_gateway_config()
-    except Exception as e:
-        return NotifyResult("gateway", False, f"load_gateway_config failed: {e}")
-    pconfig = (gconfig.platforms or {}).get(platform_enum)
-    if pconfig is None:
-        return NotifyResult("gateway", False, f"no platform config for {platform_enum!r} in gateway config")
-    try:
-        adapter = platform_registry.create_adapter(str(platform_enum.value if hasattr(platform_enum, 'value') else platform_enum), pconfig)
-    except Exception as e:
-        return NotifyResult("gateway", False, f"create_adapter failed: {e}")
-    if adapter is None:
-        return NotifyResult("gateway", False, f"create_adapter returned None for {platform_enum!r}")
+    platform_value = platform_enum.value if hasattr(platform_enum, "value") else str(platform_enum)
     content = f"*{title}*\n{body}"
+
+    adapter = _resolve_live_adapter(platform_enum)
+    adapter_source = "live runner"
+
+    if adapter is None:
+        try:
+            gconfig = load_gateway_config()
+        except Exception as e:
+            return NotifyResult("gateway", False, f"load_gateway_config failed: {e}")
+        pconfig = (gconfig.platforms or {}).get(platform_enum)
+        if pconfig is None:
+            return NotifyResult("gateway", False, f"no platform config for {platform_enum!r} in gateway config")
+        try:
+            adapter = platform_registry.create_adapter(platform_value, pconfig)
+        except Exception as e:
+            return NotifyResult("gateway", False, f"create_adapter failed: {e}")
+        adapter_source = "create_adapter"
+        if adapter is None:
+            return NotifyResult(
+                "gateway",
+                False,
+                f"create_adapter returned None for {platform_enum!r} and no live runner found "
+                "(notify is firing outside the gateway process)",
+            )
+
     try:
         from model_tools import _run_async  # type: ignore
         result = _run_async(adapter.send(chat_id=chat_id, content=content))
@@ -92,7 +120,8 @@ def _send_gateway(title: str, body: str, _meta: dict[str, Any], platform: str | 
     except Exception as e:
         return NotifyResult("gateway", False, repr(e))
     ok = bool(getattr(result, "ok", True) if result is not None else False)
-    return NotifyResult("gateway", ok, "" if ok else "send returned non-ok")
+    detail = adapter_source if ok else f"{adapter_source}: send returned non-ok"
+    return NotifyResult("gateway", ok, detail)
 
 
 def fanout(

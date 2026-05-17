@@ -319,6 +319,39 @@ def make_oc_cancel(runtime: "Runtime") -> Callable[[str], str]:
     return handler
 
 
+def make_oc_test_notify(runtime: "Runtime") -> Callable[[str], str]:
+    def handler(raw_args: str) -> str:
+        from . import notify as notify_mod
+        cfg = runtime.config
+        body = (raw_args or "").strip() or "Gateway DM trigger test from /oc test-notify."
+        title = "test-notify"
+        sinks = list(dict.fromkeys(["gateway", *cfg.notify_sinks]))
+        results = notify_mod.fanout(
+            sinks=sinks,
+            title=title,
+            body=body,
+            meta={"kind": "test_notify"},
+            dashboard_path=cfg.notifications_file,
+            gateway_platform=cfg.notify_gateway_platform,
+            gateway_chat_id=cfg.notify_gateway_chat_id,
+        )
+        target = f"{cfg.notify_gateway_platform or '(unset)'}:{cfg.notify_gateway_chat_id or '(unset)'}"
+        lines = [
+            "test-notify dispatched",
+            f"  title:     {title}",
+            f"  body:      {body}",
+            f"  sinks:     {','.join(sinks)}",
+            f"  gateway:   {target}",
+            f"  discovery: {cfg.notify_discovery_source or '(unknown)'}",
+        ]
+        for r in results:
+            tag = "ok  " if r.ok else "FAIL"
+            detail = f" · {r.detail}" if r.detail else ""
+            lines.append(f"  [{tag}] {r.sink}{detail}")
+        return "\n".join(lines)
+    return handler
+
+
 def make_oc_questions(runtime: "Runtime") -> Callable[[str], str]:
     def handler(raw_args: str) -> str:
         questions, _permissions = event_loop.get_pending_snapshot()
@@ -353,6 +386,7 @@ _OC_HELP_TEXT = (
     "  /oc questions                         list pending opencode questions awaiting a human answer\n"
     "  /oc cancel <agent_id> [reason ...]    wind down an agent without merging; keeps record as CANCELLED\n"
     "  /oc doctor                            plugin health report (versions, bg loop alive, deps, state files)\n"
+    "  /oc test-notify [message ...]         force a notify fanout (gateway DM + dashboard + cli); reports per-sink ok/FAIL with detail\n"
     "  /oc help                              show this help\n"
     "\n"
     "for richer ops outside an active chat session, use the `hermes oco` CLI subcommand."
@@ -365,12 +399,14 @@ def make_oc_dispatcher(runtime: "Runtime") -> Callable[[str], str]:
     questions_fn = make_oc_questions(runtime)
     doctor_fn = make_oc_doctor(runtime)
     cancel_fn = make_oc_cancel(runtime)
+    test_notify_fn = make_oc_test_notify(runtime)
     subcommands = {
         "list": list_fn,
         "attach": attach_fn,
         "questions": questions_fn,
         "doctor": doctor_fn,
         "cancel": cancel_fn,
+        "test-notify": test_notify_fn,
     }
 
     def handler(raw_args: str) -> str:

@@ -83,13 +83,6 @@ def _event_text(event: Any) -> str:
 
 
 def _gateway_send(gateway: Any, event: Any, message: str) -> None:
-    """Echo *message* back to the channel that sent *event*.
-
-    Mirrors eng-task-system's helper: tries the in-process gateway runner's
-    live adapter first (works for every platform including BlueBubbles /
-    iMessage), then falls back to `hermes send-message` subprocess when the
-    runner isn't available in this process.
-    """
     import logging
     log = logging.getLogger("hermes_opencode.gateway_hook")
     if not message:
@@ -102,32 +95,17 @@ def _gateway_send(gateway: Any, event: Any, message: str) -> None:
     thread_id = getattr(source, "thread_id", None)
     if platform is None or chat_id is None:
         return
+    adapter = notify._resolve_live_adapter(platform)
+    if adapter is None:
+        log.warning("no live gateway adapter for platform=%r; slash-command echo dropped", platform)
+        return
 
     async def _send_async() -> None:
         try:
-            from gateway.run import _gateway_runner_ref  # type: ignore
-            runner = _gateway_runner_ref()
-        except Exception:
-            runner = None
-        if runner is not None:
-            try:
-                adapter = runner.adapters.get(platform)
-                if adapter is not None:
-                    metadata = {"thread_id": thread_id} if thread_id else None
-                    await adapter.send(chat_id=str(chat_id), content=message, metadata=metadata)
-                    return
-            except Exception as exc:
-                log.warning("adapter.send failed: %s", exc)
-        import subprocess
-        platform_name = platform.value if hasattr(platform, "value") else str(platform)
-        target = f"{platform_name}:{chat_id}"
-        try:
-            subprocess.run(
-                ["hermes", "send-message", "--target", target, message],
-                timeout=10, check=False,
-            )
+            metadata = {"thread_id": thread_id} if thread_id else None
+            await adapter.send(chat_id=str(chat_id), content=message, metadata=metadata)
         except Exception as exc:
-            log.warning("send-message subprocess failed: %s", exc)
+            log.warning("adapter.send failed: %s", exc)
 
     import asyncio
     try:
@@ -191,8 +169,8 @@ def register(ctx: Any) -> None:
         register_cmd(
             "oc",
             handler=_oc_dispatcher_cache,
-            description="hermes-opencode commands: list / attach / questions / doctor. Run /oc for help.",
-            args_hint="[list|attach <agent_id>|questions|doctor|help]",
+            description="hermes-opencode commands: list / attach / questions / cancel / doctor. Run /oc for help.",
+            args_hint="[list|attach <agent_id>|questions|cancel <agent_id>|doctor|help]",
         )
 
     register_cli = getattr(ctx, "register_cli_command", None)
