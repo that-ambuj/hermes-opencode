@@ -63,6 +63,20 @@ plugins:
       opencode_server:
         url: "http://127.0.0.1:4096"
         password: "${OPENCODE_SERVER_PASSWORD}"
+        # v0.14.5: override the host opencode serve binds to, independent of
+        # the connect URL. Defaults to the host parsed from `url`. Set to
+        # 0.0.0.0 to expose opencode serve to other machines on the LAN while
+        # hermes itself keeps connecting via loopback.
+        serve_hostname: null
+        # v0.15.0: when the executor session fails to author its own PR
+        # title + body (no `PR_OPENED:` sentinel), the plugin spawns a
+        # fresh opencode session per fallback model in this list and asks
+        # it to author the PR. First success wins. All exhausted -> agent
+        # FAILED. The default list deliberately avoids Anthropic models
+        # because Claude is the most common rate-limit victim.
+        pr_fallback_models:
+          - "openai/gpt-5.5"
+          - "opencode/deepseek-v4-flash-free"
       pr:
         base_branch: main
       auto_spawn_server: true
@@ -79,7 +93,10 @@ plugins:
           platform: bluebubbles
           chat_id: "+15551234567"   # optional if BLUEBUBBLES_HOME_CHANNEL is set
         events:
-          enabled: ["pr_opened", "done", "failed", "awaiting_human", "review_started", "cancelled"]
+          # v0.14.6 added tick_error + aborted; v0.15.0 added rate_limited,
+          # rate_limit_cleared, queued, queue_drained. Trim this list to
+          # mute kinds you don't want.
+          enabled: ["pr_opened", "done", "failed", "awaiting_human", "review_started", "cancelled", "tick_error", "aborted", "rate_limited", "rate_limit_cleared", "queued", "queue_drained"]
       heartbeat:
         enabled: true
         unconditional_hours: [9, 23]
@@ -110,8 +127,12 @@ for a project with no skill triggers an automatic SKILL.md generation pass.
 | `cli` | Injects an in-session hermes message. Useful when you're driving hermes interactively. |
 
 Events that fire notifications: `pr_opened`, `done`, `failed`, `awaiting_human`, `review_started`,
-`cancelled`. Disable any subset by reducing `notify.events.enabled`. The `serve_down` event
-(opencode-server crash) always fires to `cli`, `dashboard`, and `gateway` regardless of config.
+`cancelled`, plus `tick_error` (v0.14.6, transient executor failure surfaced on first occurrence),
+`aborted` (v0.14.6, opencode-side tool-execution-aborted; auto-sends `continue` to the executor),
+`rate_limited` / `rate_limit_cleared` (v0.15.0, provider 429 detected and wait-and-resume),
+`queued` / `queue_drained` (v0.15.0, new spawns parked while rate-limited agents clear). Disable
+any subset by reducing `notify.events.enabled`. The `serve_down` event (opencode-server crash)
+always fires to `cli`, `dashboard`, and `gateway` regardless of config.
 
 ### Awaiting-input classifier
 
@@ -192,6 +213,7 @@ Slack, …). No LLM round-trip — they call into the plugin directly via the
 | `/oc cancel <agent_id> [reason ...]` | Wind down an agent without merging; runs the full cleanup sequence (sessions, sister worktree, cleanup skill, executor worktree) and keeps the record as `CANCELLED`. |
 | `/oc doctor` | Single-message plugin health report (versions, bg loop, deps, state files, notify config, classifier config, per-agent awaiting-input verdicts, last events). Paste into bug reports. |
 | `/oc test-notify [message ...]` | Force a full notify fanout (gateway DM + dashboard + cli) with a synthetic event; prints per-sink `[ok]` / `[FAIL]` with detail. For verifying the gateway DM trigger end-to-end. |
+| `@<agent_id> <text>` | **v0.14.4 direct dispatch.** Forwards `<text>` VERBATIM to the agent's opencode session, fully bypassing the hermes chat LLM. Zero paraphrasing surface, zero latency. Unknown `@<id>` falls through to the chat LLM so unrelated `@mentions` in group chats are never eaten. Terminal-phase agents and empty bodies get a one-line rejection echoed back. |
 
 ## CLI subcommand
 
@@ -224,9 +246,10 @@ Agent ids are `<abbrev>/<task>`, max 20 chars total:
 ## State machine
 
 ```
-CREATED → BOOTSTRAPPING → EXECUTING → IDLE_TASK_COMPLETE →
-REVIEW_SPAWNING → REVIEWING → REVIEW_DELIVERED → EXECUTOR_ADDRESSING →
-IDLE_REVIEW_ADDRESSED → COMMITTING → PR_OPEN → DONE
+CREATED → QUEUED? → BOOTSTRAPPING → EXECUTING ⇄ RATE_LIMITED →
+IDLE_TASK_COMPLETE → REVIEW_SPAWNING → REVIEWING ⇄ RATE_LIMITED →
+REVIEW_DELIVERED → EXECUTOR_ADDRESSING ⇄ RATE_LIMITED →
+IDLE_REVIEW_ADDRESSED → COMMITTING ⇄ RATE_LIMITED → PR_OPEN → DONE
 ```
 
 Terminal: `DONE` (merged, archived after 12 h), `CANCELLED` (manual / auto on PR closed, archived
@@ -236,6 +259,31 @@ after 12 h), `KILLED` (hard-deleted), `FAILED` (kept indefinitely until manually
 `/question` or `/permission`, worktree has uncommitted or unpushed changes, 30s stable idleness,
 and the awaiting-input cascade does not flag the last assistant text as a question awaiting human
 reply.
+
+**v0.15.0 added two phases:**
+
+- `QUEUED` — entered at `oc_spawn` time when any non-terminal agent is in `RATE_LIMITED`. The
+  worktree, session, and bootstrap run normally; only the initial prompt is deferred. Drains to
+  `EXECUTING` once all rate-limited agents clear.
+- `RATE_LIMITED` — entered when the executor (or reviewer, since v0.15.1) hits a provider 429
+  (Anthropic Claude is the typical victim). The plugin records the `retry-after` window, fires
+  the `rate_limited` notification, parks the agent. Once the window elapses, the agent restores
+  its saved prior phase and continues through its own normal flow. Review is NOT bypassed — the
+  rate-limited task goes through whichever phase it was in.
+
+## PR-creation fallback
+
+The default path is **executor-driven**: after review LGTM, the orchestrator asks the executor
+session to author its own PR title + body and run `gh pr create`. The executor emits
+`PR_OPENED: <url>` on its own line so the plugin can capture the PR number.
+
+When the executor fails to emit the sentinel (most often: it tried `gh pr create --fill` despite
+being told not to, or it hit a non-recoverable provider error), v0.15.0 routes through
+`oneshot_open_pr` — a fresh opencode session in the same worktree with an explicit non-Anthropic
+model from `opencode_server.pr_fallback_models`. Iterates the list until one succeeds; if all
+models exhausted the agent escalates to `FAILED` with the full per-model attempt log in
+`last_error`. The old slug-derived-title + verbatim-initial-prompt fallback was removed in
+v0.15.0 — that fallback produced consistently low-quality PR titles and bodies.
 
 ## Bootstrap
 
@@ -358,5 +406,14 @@ All planned surfaces have shipped. See [CHANGELOG.md](./CHANGELOG.md) for the pe
 | ✓ | `CANCELLED` phase + `oc_cancel` tool/slash/CLI · auto-cancel on PR closed · auto-detected DM channel · opencode-serve watchdog | v0.12.0 / v0.12.1 |
 | ✓ | Gateway notify sink fix (live-runner adapter resolution) + `/oc test-notify` diagnostic | v0.13.0 |
 | ✓ | Awaiting-input classifier cascade + reviewer-eagerness gate + permission-notify · `[SYSTEM DIRECTIVE: HERMES-OPENCODE]` initial-prompt envelope | v0.14.0 |
+| ✓ | Event-loop resilience · opencode-serve forensics + watchdog | v0.14.1 |
+| ✓ | Crash fix for `_last_assistant_text` name collision after the v0.14.0 SSE refactor | v0.14.2 |
+| ✓ | Dispatcher discipline for `oc_spawn` / `oc_send` (verbatim-forwarding tool descriptions + per-turn `pre_llm_call` directive) | v0.14.3 |
+| ✓ | `oc_send` async migration (no more hermes-session blocking) + `@<agent_id> <text>` direct gateway dispatch (bypasses chat LLM) | v0.14.4 |
+| ✓ | Configurable `opencode_server.serve_hostname` + dashboard surfaces serve URL + per-agent session URLs | v0.14.5 |
+| ✓ | Executor PR-title regression fix + tick-failure escalation + opencode-side abort detection with auto-`continue` | v0.14.6 |
+| ✓ | Rate-limit detection (executor) + wait-and-resume + `QUEUED` spawn gate + non-Anthropic `pr_fallback_models` oneshot | v0.15.0 |
+| ✓ | Rate-limit detection generalized to the reviewer session too | v0.15.1 |
+| ✓ | `/oc attach` and `/oc cancel` no longer crash from gateway/TUI dispatch (new `event_loop.run_blocking` helper) | v0.15.2 |
 
 Future work lives as GitHub issues. PRs welcome.
