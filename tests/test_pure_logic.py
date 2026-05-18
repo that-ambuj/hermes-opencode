@@ -200,6 +200,175 @@ class TestSseBuffer:
         assert buffers == {"p1": "alpha", "p2": "beta"}
 
 
+class TestSseConsumerRoleAndTypeFiltering:
+    def _drive(self, agent_id, session_id, events):
+        import asyncio
+
+        async def _run():
+            stop = asyncio.Event()
+
+            class _Client:
+                async def stream_events(self, _wt, _stop):
+                    for ev in events:
+                        yield ev
+                    stop.set()
+
+            class _Agents:
+                def get(self, _id):
+                    return type("A", (), {
+                        "agent_id": agent_id,
+                        "session_id": session_id,
+                        "worktree_path": "/tmp",
+                    })()
+
+            runtime = type("R", (), {"client": _Client(), "agents": _Agents()})()
+            old = event_loop_mod._runtime
+            event_loop_mod._runtime = runtime
+            try:
+                event_loop_mod.clear_text_buffer(agent_id)
+                await event_loop_mod._sse_consumer_loop(agent_id, stop)
+            finally:
+                event_loop_mod._runtime = old
+
+        asyncio.run(_run())
+
+    def test_user_message_text_not_buffered(self):
+        agent_id, sid = "test/role-user", "ses_role_user"
+        self._drive(agent_id, sid, [
+            {"type": "message.updated", "properties": {"info": {"id": "m1", "role": "user", "sessionID": sid}}},
+            {"type": "message.part.updated", "properties": {"part": {
+                "id": "p1", "type": "text", "text": "user prompt body",
+                "sessionID": sid, "messageID": "m1",
+            }}},
+        ])
+        assert event_loop_mod.get_text_buffer(agent_id) == {}
+        event_loop_mod.clear_text_buffer(agent_id)
+
+    def test_assistant_message_text_buffered(self):
+        agent_id, sid = "test/role-asst", "ses_role_asst"
+        self._drive(agent_id, sid, [
+            {"type": "message.updated", "properties": {"info": {"id": "m1", "role": "assistant", "sessionID": sid}}},
+            {"type": "message.part.updated", "properties": {"part": {
+                "id": "p1", "type": "text", "text": "hello world",
+                "sessionID": sid, "messageID": "m1",
+            }}},
+        ])
+        assert event_loop_mod.get_text_buffer(agent_id) == {"p1": "hello world"}
+        event_loop_mod.clear_text_buffer(agent_id)
+
+    def test_reasoning_delta_with_field_text_not_buffered(self):
+        agent_id, sid = "test/reason", "ses_reason"
+        self._drive(agent_id, sid, [
+            {"type": "message.updated", "properties": {"info": {"id": "m1", "role": "assistant", "sessionID": sid}}},
+            {"type": "message.part.updated", "properties": {"part": {
+                "id": "pR", "type": "reasoning", "messageID": "m1", "sessionID": sid,
+            }}},
+            {"type": "message.part.delta", "properties": {
+                "sessionID": sid, "messageID": "m1", "partID": "pR",
+                "field": "text", "delta": "thinking out loud",
+            }},
+        ])
+        assert event_loop_mod.get_text_buffer(agent_id) == {}
+        event_loop_mod.clear_text_buffer(agent_id)
+
+    def test_text_delta_buffered_after_part_updated(self):
+        agent_id, sid = "test/text-delta", "ses_text_delta"
+        self._drive(agent_id, sid, [
+            {"type": "message.updated", "properties": {"info": {"id": "m1", "role": "assistant", "sessionID": sid}}},
+            {"type": "message.part.updated", "properties": {"part": {
+                "id": "pT", "type": "text", "text": "", "messageID": "m1", "sessionID": sid,
+            }}},
+            {"type": "message.part.delta", "properties": {
+                "sessionID": sid, "messageID": "m1", "partID": "pT",
+                "field": "text", "delta": "streamed reply",
+            }},
+        ])
+        assert event_loop_mod.get_text_buffer(agent_id) == {"pT": "streamed reply"}
+        event_loop_mod.clear_text_buffer(agent_id)
+
+
+class TestSseSessionStatus:
+    def _drive_status(self, agent_id, session_id, statuses):
+        import asyncio
+
+        async def _run():
+            stop = asyncio.Event()
+
+            class _Client:
+                async def stream_events(self, _wt, _stop):
+                    for s in statuses:
+                        yield {"type": "session.status", "properties": {"sessionID": session_id, "status": s}}
+                    stop.set()
+
+            class _Agents:
+                def get(self, _id):
+                    return type("A", (), {
+                        "agent_id": agent_id,
+                        "session_id": session_id,
+                        "worktree_path": "/tmp",
+                    })()
+
+            runtime = type("R", (), {"client": _Client(), "agents": _Agents()})()
+            old = event_loop_mod._runtime
+            event_loop_mod._runtime = runtime
+            try:
+                event_loop_mod.clear_text_buffer(agent_id)
+                await event_loop_mod._sse_consumer_loop(agent_id, stop)
+            finally:
+                event_loop_mod._runtime = old
+
+        asyncio.run(_run())
+
+    def test_status_busy_captured(self):
+        agent_id, sid = "test/status-busy", "ses_status_busy"
+        self._drive_status(agent_id, sid, [{"type": "busy"}])
+        assert event_loop_mod.get_session_status(agent_id) == {"type": "busy"}
+        event_loop_mod.clear_text_buffer(agent_id)
+
+    def test_status_idle_captured(self):
+        agent_id, sid = "test/status-idle", "ses_status_idle"
+        self._drive_status(agent_id, sid, [{"type": "busy"}, {"type": "idle"}])
+        assert event_loop_mod.get_session_status(agent_id) == {"type": "idle"}
+        event_loop_mod.clear_text_buffer(agent_id)
+
+    def test_status_retry_payload_preserved(self):
+        agent_id, sid = "test/status-retry", "ses_status_retry"
+        retry = {"type": "retry", "attempt": 2, "message": "rate-limited", "next": 60}
+        self._drive_status(agent_id, sid, [retry])
+        assert event_loop_mod.get_session_status(agent_id) == retry
+        event_loop_mod.clear_text_buffer(agent_id)
+
+    def test_clear_text_buffer_clears_status(self):
+        agent_id, sid = "test/status-clear", "ses_status_clear"
+        self._drive_status(agent_id, sid, [{"type": "busy"}])
+        event_loop_mod.clear_text_buffer(agent_id)
+        assert event_loop_mod.get_session_status(agent_id) is None
+
+
+class TestIdleDebounceHelpers:
+    def test_session_status_idle_returns_true_when_no_status_observed(self):
+        import asyncio
+
+        event_loop_mod.clear_text_buffer("test/no-status")
+        agent = type("A", (), {"agent_id": "test/no-status"})()
+        assert asyncio.run(event_loop_mod._session_status_is_idle(agent)) is True
+
+    def test_session_status_idle_returns_false_when_busy(self):
+        import asyncio
+
+        agent_id = "test/busy"
+        with event_loop_mod._sse_buffer_lock:
+            event_loop_mod._sse_session_status[agent_id] = {"type": "busy"}
+        try:
+            agent = type("A", (), {"agent_id": agent_id})()
+            assert asyncio.run(event_loop_mod._session_status_is_idle(agent)) is False
+        finally:
+            event_loop_mod.clear_text_buffer(agent_id)
+
+    def test_idle_debounce_constant_is_two_minutes(self):
+        assert event_loop_mod.IDLE_DEBOUNCE_SEC == 120.0
+
+
 class TestReviewCycleClassifier:
     def test_default_cap_one_allows_first_addressing_round(self):
         assert event_loop_mod.decide_review_action(0, 1) == "address"
@@ -210,6 +379,81 @@ class TestReviewCycleClassifier:
     def test_higher_cap_allows_more_rounds(self):
         assert event_loop_mod.decide_review_action(1, 3) == "address"
         assert event_loop_mod.decide_review_action(3, 3) == "exhausted"
+
+
+class TestParseReadyForReview:
+    def test_detects_sentinel_on_own_line(self):
+        assert reviewer_mod.parse_ready_for_review("All done.\nREADY_FOR_REVIEW\n") is True
+
+    def test_detects_sentinel_at_start(self):
+        assert reviewer_mod.parse_ready_for_review("READY_FOR_REVIEW") is True
+
+    def test_case_insensitive(self):
+        assert reviewer_mod.parse_ready_for_review("ready_for_review\n") is True
+
+    def test_rejects_inline_mention(self):
+        assert reviewer_mod.parse_ready_for_review("I think the diff is READY_FOR_REVIEW now.") is False
+
+    def test_rejects_when_absent(self):
+        assert reviewer_mod.parse_ready_for_review("All done.") is False
+
+    def test_handles_empty_input(self):
+        assert reviewer_mod.parse_ready_for_review("") is False
+        assert reviewer_mod.parse_ready_for_review(None) is False
+
+
+class TestHasIncompleteTodos:
+    def _todowrite_part(self, todos, status="completed"):
+        return {
+            "type": "tool",
+            "tool": "todowrite",
+            "state": {"status": status, "input": {"todos": todos}},
+        }
+
+    def test_none_when_no_todowrite_observed(self):
+        items = [{"message": {"role": "assistant"}, "parts": [{"type": "text", "text": "hi"}]}]
+        assert event_loop_mod._has_incomplete_todos(items) is None
+
+    def test_false_when_all_completed(self):
+        items = [{
+            "parts": [self._todowrite_part([
+                {"content": "a", "status": "completed"},
+                {"content": "b", "status": "completed"},
+            ])]
+        }]
+        assert event_loop_mod._has_incomplete_todos(items) is False
+
+    def test_true_when_any_pending(self):
+        items = [{
+            "parts": [self._todowrite_part([
+                {"content": "a", "status": "completed"},
+                {"content": "b", "status": "pending"},
+            ])]
+        }]
+        assert event_loop_mod._has_incomplete_todos(items) is True
+
+    def test_true_when_any_in_progress(self):
+        items = [{
+            "parts": [self._todowrite_part([
+                {"content": "a", "status": "in_progress"},
+            ])]
+        }]
+        assert event_loop_mod._has_incomplete_todos(items) is True
+
+    def test_true_when_todowrite_call_in_flight(self):
+        items = [{"parts": [self._todowrite_part([], status="running")]}]
+        assert event_loop_mod._has_incomplete_todos(items) is True
+
+    def test_uses_latest_completed_call(self):
+        items = [
+            {"parts": [self._todowrite_part([{"status": "pending"}])]},
+            {"parts": [self._todowrite_part([{"status": "completed"}])]},
+        ]
+        assert event_loop_mod._has_incomplete_todos(items) is False
+
+    def test_skips_error_state(self):
+        items = [{"parts": [self._todowrite_part([{"status": "pending"}], status="error")]}]
+        assert event_loop_mod._has_incomplete_todos(items) is None
 
 
 class TestExecutorOpenPrParse:
@@ -2247,8 +2491,8 @@ class TestPhaseAwaitingHumanHandler:
             confidence: str = "high"
             reason: str = "still asking"
             last_assistant_text: str = "what should I do?"
-        async def _stub_check(runtime, text):
-            return StubCheck()
+        async def _stub_check(runtime, text, *, has_incomplete_todos=None):
+                    return StubCheck()
         awaiting_mod.check = _stub_check
         agents = self._setup(
             tmp_path, questions=[], permissions=[],
@@ -2296,8 +2540,8 @@ class TestPhaseAwaitingHumanHandler:
             confidence: str = "high"
             reason: str = "moved on"
             last_assistant_text: str = "ok working on it"
-        async def _stub_check(runtime, text):
-            return StubCheck()
+        async def _stub_check(runtime, text, *, has_incomplete_todos=None):
+                    return StubCheck()
         awaiting_mod.check = _stub_check
         agents = self._setup(
             tmp_path, questions=[], permissions=[],
@@ -2330,8 +2574,8 @@ class TestPhaseAwaitingHumanHandler:
             confidence: str = "high"
             reason: str = "classifier non-determinism"
             last_assistant_text: str = "let me confirm scope."
-        async def _stub_check(runtime, text):
-            return StubCheck()
+        async def _stub_check(runtime, text, *, has_incomplete_todos=None):
+                    return StubCheck()
         awaiting_mod.check = _stub_check
         agents = self._setup(
             tmp_path, questions=[], permissions=[],
@@ -2393,8 +2637,8 @@ class TestPhaseAwaitingHumanHandler:
             confidence: str = "high"
             reason: str = "still asking"
             last_assistant_text: str = "ok and one more thing?"
-        async def _stub_check(runtime, text):
-            return StubCheck()
+        async def _stub_check(runtime, text, *, has_incomplete_todos=None):
+                    return StubCheck()
         awaiting_mod.check = _stub_check
         agents = self._setup(
             tmp_path, questions=[], permissions=[],

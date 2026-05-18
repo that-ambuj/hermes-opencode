@@ -181,8 +181,27 @@ def test_last_assistant_text_helpers_have_distinct_signatures():
     assert items_fn is not agent_fn
     assert not asyncio.iscoroutinefunction(items_fn)
     assert asyncio.iscoroutinefunction(agent_fn)
-    sample = [{"parts": [{"type": "text", "text": "hello"}]}]
+    sample = [
+        {
+            "message": {"role": "assistant", "id": "msg_1"},
+            "parts": [{"type": "text", "text": "hello"}],
+        }
+    ]
     assert items_fn(sample) == "hello"
+    user_only = [
+        {
+            "message": {"role": "user", "id": "msg_u"},
+            "parts": [{"type": "text", "text": "user prompt"}],
+        }
+    ]
+    assert items_fn(user_only) == ""
+    reasoning_only = [
+        {
+            "message": {"role": "assistant", "id": "msg_r"},
+            "parts": [{"type": "reasoning", "text": "thinking out loud"}],
+        }
+    ]
+    assert items_fn(reasoning_only) == ""
 
 
 def test_fetch_last_assistant_text_does_not_iterate_agent_directly(monkeypatch):

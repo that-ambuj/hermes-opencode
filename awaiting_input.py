@@ -31,7 +31,7 @@ class AwaitingInputCheck:
     awaiting: bool
     confidence: Literal["high", "medium", "low"]
     reason: str
-    source: Literal["regex", "llm", "regex-fallback", "regex-no-llm"]
+    source: Literal["regex", "llm", "regex-fallback", "regex-no-llm", "todo-override"]
     last_assistant_text: str
 
 
@@ -78,7 +78,12 @@ def parse_classifier_response(content: str) -> tuple[bool, str, str]:
         raise ValueError(f"classifier response unparseable: {e}; content={content[:200]!r}") from e
 
 
-async def check(runtime: "Runtime", text: str) -> AwaitingInputCheck:
+async def check(
+    runtime: "Runtime",
+    text: str,
+    *,
+    has_incomplete_todos: bool | None = None,
+) -> AwaitingInputCheck:
     cfg = runtime.config
     text = text or ""
     if not text.strip():
@@ -89,6 +94,14 @@ async def check(runtime: "Runtime", text: str) -> AwaitingInputCheck:
         )
 
     regex_hit, regex_reason = regex_check(text)
+
+    if has_incomplete_todos is True:
+        return AwaitingInputCheck(
+            awaiting=False, confidence="high",
+            reason=f"opencode todo list still in progress; agent working ({regex_reason})",
+            source="todo-override",
+            last_assistant_text=text,
+        )
 
     if not cfg.classifier_enabled:
         return AwaitingInputCheck(

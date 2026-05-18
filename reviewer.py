@@ -15,6 +15,7 @@ from .transport import OpencodeClient, OpencodeError
 
 _LGTM_RE = re.compile(r"\bREVIEW\s*:\s*LGTM\b", re.IGNORECASE)
 _REQUEST_RE = re.compile(r"\bREVIEW\s*:\s*REQUESTS?_CHANGES\b", re.IGNORECASE)
+_READY_FOR_REVIEW_RE = re.compile(r"(?m)^\s*READY_FOR_REVIEW\s*$", re.IGNORECASE)
 _COLLISION_SUFFIX_RE = re.compile(r"-\d+$")
 _PR_OPENED_LINE_RE = re.compile(r"PR_OPENED:\s*(https?://[^\s]+/pull/(\d+))", re.IGNORECASE)
 _PR_OPENED_VARIANT_RE = re.compile(
@@ -79,6 +80,12 @@ def classify_review(text: str) -> ReviewVerdict:
     if _REQUEST_RE.search(text):
         return ReviewVerdict(kind="requests_changes", body=text)
     return ReviewVerdict(kind="ambiguous", body=text)
+
+
+def parse_ready_for_review(text: str) -> bool:
+    if not text:
+        return False
+    return bool(_READY_FOR_REVIEW_RE.search(text))
 
 
 def reviewer_worktree_path(executor_worktree: Path) -> Path:

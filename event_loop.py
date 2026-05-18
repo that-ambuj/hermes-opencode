@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger("hermes_opencode.event_loop")
 
 TERMINAL_PHASES = {"DONE", "KILLED", "FAILED", "CANCELLED"}
-IDLE_DEBOUNCE_SEC = 30.0
+IDLE_DEBOUNCE_SEC = 120.0
 PR_POLL_SEC = 300.0
 PRUNE_INTERVAL_SEC = 60.0
 ARCHIVE_AFTER_SEC = 12 * 3600.0
@@ -34,7 +34,7 @@ HISTORY_RETAIN_DAYS = 30.0
 PR_OPEN_TIMEOUT_SEC = 900.0
 PR_OPENED_RE_PATTERN = r"PR_OPENED:\s*(https?://[^\s]+/pull/\d+)"
 PR_URL_FALLBACK_RE_PATTERN = r"https?://github\.com/[^\s]+/pull/(\d+)"
-SERVE_WATCHDOG_INTERVAL_SEC = 15.0
+SERVE_WATCHDOG_INTERVAL_SEC = 60.0
 SERVE_RESTART_MAX_ATTEMPTS = 5
 SERVE_RESTART_BACKOFF_BASE_SEC = 1.0
 SERVE_DOWN_NOTIFY_COOLDOWN_SEC = 600.0
@@ -355,13 +355,51 @@ async def _fetch_last_assistant_message_id(agent: "Agent") -> str | None:
     return None
 
 
+def _has_incomplete_todos(items: list[dict]) -> bool | None:
+    for item in reversed(items):
+        for part in reversed(item.get("parts") or []):
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") != "tool" or part.get("tool") != "todowrite":
+                continue
+            state = part.get("state") or {}
+            status = state.get("status")
+            if status in ("pending", "running"):
+                return True
+            if status != "completed":
+                continue
+            input_ = state.get("input") or {}
+            todos = input_.get("todos")
+            if not isinstance(todos, list):
+                return False
+            for todo in todos:
+                if isinstance(todo, dict) and todo.get("status") != "completed":
+                    return True
+            return False
+    return None
+
+
+async def _fetch_incomplete_todos(agent: "Agent") -> bool | None:
+    if _runtime is None:
+        return None
+    try:
+        body = await _runtime.client.get_messages(agent.session_id, Path(agent.worktree_path))
+    except OpencodeError:
+        return None
+    items = body.get("items") or []
+    return _has_incomplete_todos(items)
+
+
 async def _awaiting_input_blocks_review(agent: "Agent") -> bool:
     if _runtime is None:
         return False
     last_text = await _fetch_last_assistant_text(agent)
     if not last_text:
         return False
-    check = await awaiting_input_mod.check(_runtime, last_text)
+    incomplete = await _fetch_incomplete_todos(agent)
+    check = await awaiting_input_mod.check(
+        _runtime, last_text, has_incomplete_todos=incomplete,
+    )
     _runtime.agents.update(
         agent.agent_id,
         last_classifier_verdict=awaiting_input_mod.to_dict(check),
@@ -372,6 +410,20 @@ async def _awaiting_input_blocks_review(agent: "Agent") -> bool:
     _runtime.agents.update(agent.agent_id, last_awaiting_notify_at=time.time())
     return True
 _sse_text_buffers: dict[str, dict[str, str]] = {}
+# Per-agent {part_id: type} map populated from `message.part.updated` events.
+# Required because opencode emits `message.part.delta` with `field="text"` for
+# BOTH text parts and reasoning parts; the only reliable way to tell them apart
+# is the part type carried by the preceding `message.part.updated` event.
+_sse_part_types: dict[str, dict[str, str]] = {}
+# Per-agent {message_id: role} map populated from `message.updated` events.
+# Required because the SSE stream emits part events for user messages too
+# (their text parts arrive via `message.part.updated`), so without this map
+# user prompts would leak into the assistant-text buffer.
+_sse_message_roles: dict[str, dict[str, str]] = {}
+# Per-agent latest opencode SessionStatus payload from `session.status` events.
+# Authoritative server-side idle/busy/retry signal, preferred over heuristics
+# whenever it is available. Absent when no status event has been observed yet.
+_sse_session_status: dict[str, dict] = {}
 _sse_buffer_lock = threading.Lock()
 
 
@@ -390,9 +442,18 @@ def get_text_buffer(agent_id: str) -> dict[str, str]:
         return dict(_sse_text_buffers.get(agent_id) or {})
 
 
+def get_session_status(agent_id: str) -> dict | None:
+    with _sse_buffer_lock:
+        status = _sse_session_status.get(agent_id)
+        return dict(status) if status else None
+
+
 def clear_text_buffer(agent_id: str) -> None:
     with _sse_buffer_lock:
         _sse_text_buffers.pop(agent_id, None)
+        _sse_part_types.pop(agent_id, None)
+        _sse_message_roles.pop(agent_id, None)
+        _sse_session_status.pop(agent_id, None)
 
 
 def get_pending_snapshot() -> tuple[dict[str, list[dict]], dict[str, list[dict]]]:
@@ -1039,29 +1100,70 @@ async def _sse_consumer_loop(agent_id: str, stop_event: asyncio.Event) -> None:
                 return
             etype = event.get("type")
             props = event.get("properties") or {}
-            if etype == "message.part.delta":
+            if etype == "session.status":
+                if props.get("sessionID") != session_id:
+                    continue
+                status = props.get("status")
+                if isinstance(status, dict) and isinstance(status.get("type"), str):
+                    with _sse_buffer_lock:
+                        _sse_session_status[agent_id] = dict(status)
+            elif etype == "message.updated":
+                info = props.get("info") or {}
+                if info.get("sessionID") != session_id:
+                    continue
+                msg_id = info.get("id")
+                role = info.get("role")
+                if isinstance(msg_id, str) and isinstance(role, str):
+                    with _sse_buffer_lock:
+                        roles = _sse_message_roles.setdefault(agent_id, {})
+                        roles[msg_id] = role
+            elif etype == "message.part.delta":
                 if props.get("sessionID") != session_id:
                     continue
                 if props.get("field") != "text":
                     continue
                 part_id = props.get("partID") or props.get("part_id") or props.get("id")
+                message_id = props.get("messageID") or props.get("message_id")
                 delta = props.get("delta")
                 if not isinstance(part_id, str) or not isinstance(delta, str):
                     continue
                 with _sse_buffer_lock:
+                    part_type = (_sse_part_types.get(agent_id) or {}).get(part_id)
+                    if part_type is not None and part_type != "text":
+                        continue
+                    role = None
+                    if isinstance(message_id, str):
+                        role = (_sse_message_roles.get(agent_id) or {}).get(message_id)
+                    if role is not None and role != "assistant":
+                        continue
                     buffers = _sse_text_buffers.setdefault(agent_id, {})
                     apply_delta(buffers, part_id, delta)
             elif etype == "message.part.updated":
                 part = props.get("part") or {}
                 if part.get("sessionID") != session_id:
                     continue
-                if part.get("type") != "text":
-                    continue
                 part_id = part.get("id") or part.get("partID")
+                part_type = part.get("type")
+                message_id = part.get("messageID") or part.get("message_id")
+                if not isinstance(part_id, str):
+                    continue
+                if isinstance(part_type, str):
+                    with _sse_buffer_lock:
+                        types = _sse_part_types.setdefault(agent_id, {})
+                        types[part_id] = part_type
+                if part_type != "text":
+                    with _sse_buffer_lock:
+                        _sse_text_buffers.get(agent_id, {}).pop(part_id, None)
+                    continue
                 text = part.get("text")
-                if not isinstance(part_id, str) or not isinstance(text, str):
+                if not isinstance(text, str):
                     continue
                 with _sse_buffer_lock:
+                    role = None
+                    if isinstance(message_id, str):
+                        role = (_sse_message_roles.get(agent_id) or {}).get(message_id)
+                    if role is not None and role != "assistant":
+                        continue
                     buffers = _sse_text_buffers.setdefault(agent_id, {})
                     apply_snapshot(buffers, part_id, text)
     except asyncio.CancelledError:
@@ -1413,7 +1515,10 @@ async def _phase_awaiting_human(agent: Agent) -> None:
     elif new_turn_arrived:
         last_text = await _fetch_last_assistant_text(agent)
         if last_text:
-            check = await awaiting_input_mod.check(_runtime, last_text)
+            incomplete = await _fetch_incomplete_todos(agent)
+            check = await awaiting_input_mod.check(
+                _runtime, last_text, has_incomplete_todos=incomplete,
+            )
             _runtime.agents.update(
                 agent.agent_id,
                 last_classifier_verdict=awaiting_input_mod.to_dict(check),
@@ -1458,10 +1563,13 @@ async def _phase_executing(agent: Agent) -> None:
         await asyncio.sleep(5.0)
         return
     if not became_idle:
+        _reset_idle_since(agent)
         return
     if await _check_executor_rate_limited(agent):
+        _reset_idle_since(agent)
         return
     if await _check_executor_abort(agent):
+        _reset_idle_since(agent)
         return
     questions = await _runtime.client.list_questions(worktree)
     permissions = await _runtime.client.list_permissions(worktree)
@@ -1472,16 +1580,39 @@ async def _phase_executing(agent: Agent) -> None:
         last_text = await _fetch_last_assistant_text(agent)
         if await _maybe_notify_new_pending(agent, pending_q, pending_p, context_text=last_text):
             _runtime.agents.update(agent.agent_id, last_awaiting_notify_at=time.time())
+        _reset_idle_since(agent)
         return
-    await asyncio.sleep(IDLE_DEBOUNCE_SEC)
+    if not await _session_status_is_idle(agent):
+        _reset_idle_since(agent)
+        return
+    last_text = await _fetch_last_assistant_text(agent)
+    if last_text and reviewer_mod.parse_ready_for_review(last_text):
+        if not _has_diff(worktree):
+            logger.warning(
+                "agent %s: READY_FOR_REVIEW emitted but worktree has no diff; ignoring",
+                agent.agent_id,
+            )
+            return
+        if await _awaiting_input_blocks_review(agent):
+            return
+        _runtime.agents.update(
+            agent.agent_id,
+            phase="IDLE_TASK_COMPLETE",
+            idle_since=None,
+            ready_for_review_at=time.time(),
+        )
+        return
+    if not _idle_debounce_elapsed(agent):
+        return
     confirm = await _runtime.client.wait_idle(agent.session_id, worktree, timeout=2.0)
     if not confirm:
+        _reset_idle_since(agent)
         return
     if not _has_diff(worktree):
         return
     if await _awaiting_input_blocks_review(agent):
         return
-    _runtime.agents.update(agent.agent_id, phase="IDLE_TASK_COMPLETE")
+    _runtime.agents.update(agent.agent_id, phase="IDLE_TASK_COMPLETE", idle_since=None)
 
 
 async def _phase_idle_task_complete(agent: Agent) -> None:
@@ -1581,10 +1712,13 @@ async def _phase_executor_addressing(agent: Agent) -> None:
     worktree = Path(agent.worktree_path)
     became_idle = await _runtime.client.wait_idle(agent.session_id, worktree, timeout=60.0)
     if not became_idle:
+        _reset_idle_since(agent)
         return
     if await _check_executor_rate_limited(agent):
+        _reset_idle_since(agent)
         return
     if await _check_executor_abort(agent):
+        _reset_idle_since(agent)
         return
     questions = await _runtime.client.list_questions(worktree)
     permissions = await _runtime.client.list_permissions(worktree)
@@ -1595,11 +1729,27 @@ async def _phase_executor_addressing(agent: Agent) -> None:
         last_text = await _fetch_last_assistant_text(agent)
         if await _maybe_notify_new_pending(agent, pending_q, pending_p, context_text=last_text):
             _runtime.agents.update(agent.agent_id, last_awaiting_notify_at=time.time())
+        _reset_idle_since(agent)
         return
-    await asyncio.sleep(IDLE_DEBOUNCE_SEC)
+    if not await _session_status_is_idle(agent):
+        _reset_idle_since(agent)
+        return
+    last_text = await _fetch_last_assistant_text(agent)
+    if last_text and reviewer_mod.parse_ready_for_review(last_text):
+        if await _awaiting_input_blocks_review(agent):
+            return
+        _runtime.agents.update(
+            agent.agent_id,
+            phase="COMMITTING",
+            idle_since=None,
+            ready_for_review_at=time.time(),
+        )
+        return
+    if not _idle_debounce_elapsed(agent):
+        return
     if await _awaiting_input_blocks_review(agent):
         return
-    _runtime.agents.update(agent.agent_id, phase="COMMITTING")
+    _runtime.agents.update(agent.agent_id, phase="COMMITTING", idle_since=None)
 
 
 async def _phase_committing(agent: Agent) -> None:
@@ -1707,6 +1857,35 @@ _PHASE_HANDLERS = {
 }
 
 
+def _reset_idle_since(agent: "Agent") -> None:
+    if _runtime is None or agent.idle_since is None:
+        return
+    try:
+        _runtime.agents.update(agent.agent_id, idle_since=None)
+    except Exception as e:
+        logger.debug("could not reset idle_since for %s: %s", agent.agent_id, e)
+
+
+async def _session_status_is_idle(agent: "Agent") -> bool:
+    status = get_session_status(agent.agent_id)
+    if status is None:
+        return True
+    return status.get("type") == "idle"
+
+
+def _idle_debounce_elapsed(agent: "Agent") -> bool:
+    if _runtime is None:
+        return False
+    now = time.time()
+    if agent.idle_since is None:
+        try:
+            _runtime.agents.update(agent.agent_id, idle_since=now)
+        except Exception as e:
+            logger.debug("could not set idle_since for %s: %s", agent.agent_id, e)
+        return False
+    return (now - agent.idle_since) >= IDLE_DEBOUNCE_SEC
+
+
 def _has_diff(worktree: Path) -> bool:
     try:
         res = subprocess.run(
@@ -1727,6 +1906,9 @@ def _has_diff(worktree: Path) -> bool:
 def _last_assistant_text(items: list[dict]) -> str:
     chunks: list[str] = []
     for item in reversed(items):
+        message = item.get("message") or {}
+        if message.get("role") != "assistant" and message.get("type") != "assistant":
+            continue
         for p in item.get("parts") or []:
             if isinstance(p, dict) and p.get("type") == "text":
                 t = p.get("text")

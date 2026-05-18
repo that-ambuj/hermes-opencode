@@ -147,14 +147,26 @@ restores the saved phase. Review is NOT bypassed; the agent continues
 through its own normal flow when the limit clears.
 
 Critical idle-detection rule in `_phase_executing`:
-- `session.status.type == "idle"`
+- `session.status.type == "idle"` (authoritative server-side signal,
+  cached from the `session.status` SSE event in `_sse_session_status`)
 - no pending `/question` entries for this session
 - no pending `/permission` entries for this session
 - worktree has uncommitted or unpushed changes
-- 30 s of stable idleness (debounce)
+- EITHER the executor emitted `READY_FOR_REVIEW` on its own line (the
+  decisive sentinel; see "Review-readiness sentinel" below), OR
+  `IDLE_DEBOUNCE_SEC = 120 s` of wall-clock idleness has elapsed since
+  `agent.idle_since` was set
+- the awaiting-input cascade does not block (see "Awaiting-input
+  gate" below)
 
-All four must hold to transition out of `EXECUTING`. The debounce exists
-because opencode may briefly report idle between tool calls.
+All conditions must hold to transition out of `EXECUTING`. The
+120-second debounce exists because opencode may briefly report idle
+between tool calls, and the previous 30-second window produced
+premature reviews. The debounce is a wall-clock timestamp check on
+`agent.idle_since`, NOT a blocking `asyncio.sleep` — the tick
+continues to run so rate-limit, abort, and question/permission
+arrivals are observed promptly. The READY_FOR_REVIEW sentinel
+bypasses the 120 s debounce entirely when present.
 
 ## Executor-driven PR open (LOAD-BEARING)
 
@@ -217,7 +229,17 @@ Cascade in [awaiting_input.py](awaiting_input.py):
 1. **Regex layer** — 10 patterns (trailing `?`, "which option", "should I",
    "would you prefer", "let me know", "please confirm", "y/n", "awaiting
    your input", labeled options). Always runs. Cost zero.
-2. **LLM layer** — invokes hermes' canonical auxiliary client
+2. **Todo-list override** — when the caller passes
+   `has_incomplete_todos=True` (v0.17.0+) the cascade short-circuits
+   with `awaiting=False, source="todo-override"`. The opencode
+   todowrite tool's latest committed call is the source of truth:
+   any non-completed todo (or a todowrite call still in
+   pending/running state) proves the executor has work in flight,
+   so prose that the regex flagged is more likely status narration
+   than a real question. `event_loop._has_incomplete_todos(items)`
+   parses this from `state.input.todos[*].status` on the latest
+   `type="tool", tool="todowrite"` part.
+3. **LLM layer** — invokes hermes' canonical auxiliary client
    `agent.auxiliary_client.async_call_llm(task=cfg.classifier_task_name, ...)`.
    The task name (default `hermes_opencode.awaiting_input`) routes
    through hermes' `auxiliary.<task>.{provider,model}` config, so the
@@ -225,10 +247,22 @@ Cascade in [awaiting_input.py](awaiting_input.py):
    Anthropic, OpenAI, Gemini, OpenRouter, or any other provider hermes
    routes. Falls back to the regex result on `ImportError`, network
    error, parse error, or timeout.
-3. **Stalled-idle reminder** — `_awaiting_input_reminder_loop()`
+4. **Stalled-idle reminder** — `_awaiting_input_reminder_loop()`
    re-notifies `awaiting_human` for any `EXECUTING` / `EXECUTOR_ADDRESSING`
    agent whose `last_awaiting_notify_at` is older than
    `cfg.awaiting_input_reminder_interval_sec` (default 30min).
+
+Source-of-truth for the executor's last assistant text feeding the
+cascade is `_fetch_last_assistant_text(agent)`. As of v0.17.0 the
+SSE buffer:
+
+- skips parts whose parent `message.role` is not `"assistant"`
+  (tracked via `message.updated` events in `_sse_message_roles`)
+- skips parts whose `type` is not `"text"` (tracked via
+  `message.part.updated` events in `_sse_part_types`; required
+  because opencode emits reasoning deltas with `field="text"`)
+
+The HTTP-API fallback path applies the same role filter.
 
 Why this gate exists: opencode's `Message` schema has NO field that
 distinguishes "asked a question" from "made a statement" — the assistant's
@@ -247,6 +281,55 @@ When extending the state machine: any phase that wants to gate review
 or commit on "executor is plausibly done" must call
 `_awaiting_input_blocks_review(agent)` before transitioning. Do NOT
 re-implement the cascade inline.
+
+## Review-readiness sentinel (LOAD-BEARING, v0.17.0+)
+
+The executor is instructed (rule 2 of `ORCHESTRATOR_DIRECTIVE` in
+`tools.py`) to emit `READY_FOR_REVIEW` on a line by itself when its
+task is complete and the diff is ready for code review.
+`reviewer.parse_ready_for_review(text)` parses the last assistant
+text for the sentinel.
+
+When detected with a non-empty worktree diff:
+
+- `_phase_executing` transitions directly to `IDLE_TASK_COMPLETE`
+  without waiting for the 120-second idle debounce.
+- `_phase_executor_addressing` transitions directly to `COMMITTING`.
+
+The awaiting-input cascade still runs as a safety check before the
+transition: if the same message somehow contains both the sentinel
+and a question, the cascade wins and the agent enters
+`AWAITING_HUMAN`.
+
+Without the sentinel, the orchestrator falls back to the 120-second
+idle-debounce + diff + awaiting-input cascade.
+
+`Agent.ready_for_review_at` is stamped with `time.time()` when the
+sentinel triggers a transition (audit only; the row stays put).
+
+## Session-status SSE tracking (LOAD-BEARING, v0.17.0+)
+
+opencode publishes a `session.status` SSE event whose payload is
+`{sessionID, status: {type: "idle" | "busy" | "retry", ...}}`. The
+status reflects the canonical server-side state of the model loop:
+`busy` while a turn is running or a tool is executing, `retry`
+while opencode is retrying after a recoverable failure, `idle`
+otherwise.
+
+The SSE consumer caches the latest payload per agent in
+`_sse_session_status`. `get_session_status(agent_id)` exposes it.
+
+`_phase_executing` and `_phase_executor_addressing` consult
+`_session_status_is_idle(agent)` before any heuristic. When the
+status is `busy` or `retry`, `agent.idle_since` is reset to None
+and the phase returns early, keeping the agent in EXECUTING. The
+heuristic-based debounce only starts ticking once opencode itself
+reports idle.
+
+When the SSE consumer has not yet observed a status event,
+`_session_status_is_idle` returns True (permissive) so the
+existing idle detection still works during the brief window
+between session creation and first event.
 
 ## Rate limits and queue (LOAD-BEARING)
 

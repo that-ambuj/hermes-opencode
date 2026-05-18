@@ -107,6 +107,35 @@ def test_check_falls_back_when_classifier_raises(monkeypatch):
     assert "forced classifier failure" in result.reason
 
 
+def test_check_todo_override_short_circuits_to_not_awaiting():
+    runtime = _runtime(classifier_enabled=True)
+    result = asyncio.run(
+        awaiting_input_mod.check(runtime, "Should I proceed?", has_incomplete_todos=True)
+    )
+    assert result.awaiting is False
+    assert result.source == "todo-override"
+    assert result.confidence == "high"
+    assert "todo list still in progress" in result.reason
+
+
+def test_check_todo_override_skipped_when_none():
+    runtime = _runtime(classifier_enabled=False)
+    result = asyncio.run(
+        awaiting_input_mod.check(runtime, "Should I proceed?", has_incomplete_todos=None)
+    )
+    assert result.source == "regex-no-llm"
+    assert result.awaiting is True
+
+
+def test_check_todo_override_skipped_when_false():
+    runtime = _runtime(classifier_enabled=False)
+    result = asyncio.run(
+        awaiting_input_mod.check(runtime, "Should I proceed?", has_incomplete_todos=False)
+    )
+    assert result.source == "regex-no-llm"
+    assert result.awaiting is True
+
+
 def test_check_consumes_llm_response_when_classifier_succeeds(monkeypatch):
     runtime = _runtime(classifier_enabled=True)
 

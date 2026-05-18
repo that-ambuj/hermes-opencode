@@ -5,6 +5,78 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.0] - 2026-05-18
+
+Hardens the awaiting-input / review-readiness gate against three
+classes of false positives, and introduces an authoritative
+executor-emitted sentinel for review readiness.
+
+### Awaiting-input cascade fixes
+
+- **Reasoning leak**: opencode emits `message.part.delta` events with
+  `field="text"` for BOTH text and reasoning parts. The SSE consumer
+  previously buffered reasoning deltas alongside actual assistant
+  text. Now it tracks part types from prior `message.part.updated`
+  events and skips reasoning. The awaiting-input classifier (and any
+  consumer of `_fetch_last_assistant_text`) no longer sees inner
+  monologue.
+- **User-message leak**: the SSE consumer also buffered text parts
+  from user messages. Now it tracks message roles from
+  `message.updated` events and only buffers parts whose parent
+  message has `role="assistant"`. The classifier no longer mistakes
+  the user's prompt for an assistant question.
+- **Legacy `_last_assistant_text` reader**: the items-list reader
+  used for reviewer text now filters by assistant role too.
+
+### Todo-list signal
+
+- New `awaiting_input.check(..., has_incomplete_todos=)` parameter +
+  `todo-override` source. When the executor's opencode todo list has
+  any non-completed item (or a todowrite call still in flight), the
+  cascade short-circuits with `awaiting=False`, preventing the
+  classifier from interpreting in-progress narration as a question.
+- `event_loop._has_incomplete_todos(items)` parses the latest
+  `todowrite` tool part to determine open-todo state.
+- `_awaiting_input_blocks_review` and `_phase_awaiting_human` both
+  feed the todo state into the cascade.
+
+### Authoritative review-readiness signal
+
+- New `READY_FOR_REVIEW` sentinel. The executor is now instructed via
+  `ORCHESTRATOR_DIRECTIVE` (rule 2) to emit `READY_FOR_REVIEW` on its
+  own line when the task is complete. `reviewer.parse_ready_for_review`
+  detects it.
+- When the sentinel is present (and there is a non-empty diff), the
+  orchestrator transitions immediately to `IDLE_TASK_COMPLETE` /
+  `COMMITTING` without waiting for the 2-minute idle debounce.
+
+### Session-status SSE tracking
+
+- The SSE consumer now subscribes to `session.status` events and
+  caches the latest `{type: "idle"|"busy"|"retry"}` payload per
+  agent. `get_session_status(agent_id)` exposes it.
+- `_phase_executing` / `_phase_executor_addressing` consult this
+  authoritative server-side signal before any heuristic. While
+  status is `busy` or `retry`, the idle-since timestamp is reset
+  and the agent stays in EXECUTING.
+
+### Idle debounce
+
+- `IDLE_DEBOUNCE_SEC` raised from `30.0` to `120.0`. Premature review
+  was the primary failure mode of v0.16.x. Two minutes of confirmed
+  idleness is the new floor.
+- The debounce is now a wall-clock timestamp check on the new
+  `Agent.idle_since` field, not a blocking `asyncio.sleep`. The tick
+  continues to run every cycle so rate-limit, abort, and
+  question/permission arrivals are observed promptly.
+
+### State / API additions
+
+- `Agent.idle_since: float | None` — when the executor session first
+  went idle. Cleared on any sign of activity.
+- `Agent.ready_for_review_at: float | None` — when the sentinel was
+  observed (audit only).
+
 ## [0.16.4] - 2026-05-18
 
 Drops the `opencode_server.url` knob entirely. Server config is now

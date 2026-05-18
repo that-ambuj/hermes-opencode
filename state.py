@@ -69,6 +69,8 @@ class Agent:
     awaiting_human_since: float | None = None
     awaiting_entry_message_id: str | None = None
     awaiting_entry_had_pending_qp: bool = False
+    idle_since: float | None = None
+    ready_for_review_at: float | None = None
 
 
 class AgentExists(ValueError):
