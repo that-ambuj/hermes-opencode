@@ -8,17 +8,17 @@ DM notifications (or hermes CLI messages) and route back to the right opencode s
 An awaiting-input classifier protects the reviewer from racing into incomplete work when the
 executor stops to ask for clarification.
 
-Resilience (v0.18.0+): every recoverable error path runs a per-phase retry budget before
-escalating; truly stuck agents land in `NEEDS_INTERVENTION` (not `FAILED`) so operators can fix
-the root cause and run `oc_retry` to resume. Hourly heartbeats, phase-stuck warnings, and
-state-transition events keep you informed via your preferred channel (CLI, dashboard, or
-gateway DM — auto-detected from your hermes home channel).
+Recoverable errors run a per-phase retry budget before escalating; failures the orchestrator can't
+resolve on its own land in `NEEDS_INTERVENTION` (not `FAILED`) so an operator can fix the root
+cause and run `oc_retry` to resume. Hourly heartbeats, phase-stuck warnings, and state-transition
+events keep you informed via your preferred channel (CLI, dashboard, or gateway DM — auto-detected
+from your hermes home channel).
 
-Proactive chat UX (v0.19.0+): hermes sees every active agent's phase, session status, latest
-output snippet, and any events that fired since your last message — so it dispatches obsessively
-when you ask for code work and narrates progress without polling. Serve-crash post-mortems
-(v0.20.0+) capture exit codes, signal names (e.g. `SIGKILL`), uptime, and 20 lines of dying log
-into `serve_crashes.jsonl` for forensic recovery after `opencode serve` flaps.
+Hermes itself sees every active agent's phase, session status, latest output snippet, and any
+events that fired since your last message, so it dispatches obsessively when you ask for code
+work and narrates progress without polling. When `opencode serve` crashes, the orchestrator
+captures the exit code, signal name, uptime, and the dying process's log tail into
+`serve_crashes.jsonl` for forensic recovery.
 
 ```bash
 hermes plugins install that-ambuj/hermes-opencode
