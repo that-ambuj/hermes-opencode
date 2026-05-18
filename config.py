@@ -120,6 +120,8 @@ class Config:
     agents_file: Path = field(default_factory=lambda: plugin_state_dir() / "agents.json")
     logs_dir: Path = field(default_factory=lambda: plugin_state_dir() / "logs")
     notifications_file: Path = field(default_factory=lambda: plugin_state_dir() / "notifications.jsonl")
+    serve_crashes_file: Path = field(default_factory=lambda: plugin_state_dir() / "serve_crashes.jsonl")
+    serve_log_retention_count: int = 50
     auto_spawn_server: bool = True
     notify_sinks: list[str] = field(default_factory=lambda: ["cli", "dashboard"])
     notify_gateway_platform: str | None = None

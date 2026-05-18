@@ -99,6 +99,8 @@ _serve_seen_alive: bool = False
 _serve_down_notified_at: float = 0.0
 _serve_recovered_at: float = 0.0
 _unhealthy_tick_notified_agents: set[str] = set()
+_last_serve_crash_info: dict | None = None
+_last_serve_alive_seen_at: float = 0.0
 
 
 def _serve_is_unhealthy_or_healing() -> bool:
@@ -790,6 +792,7 @@ def _run_cleanup() -> None:
     summary["notifications_truncated"] = _truncate_log(cfg.notifications_file, NOTIFICATIONS_MAX_LINES)
     summary["history_truncated"] = _truncate_history(cfg.logs_dir.parent / "history.jsonl", HISTORY_RETAIN_DAYS)
     summary["orphan_worktrees_removed"] = _remove_orphan_worktrees()
+    summary["serve_logs_pruned"] = _prune_serve_logs()
 
     logger.info("cleanup tick: %s", summary)
 
@@ -881,7 +884,7 @@ def _compute_serve_restart_delay(attempt: int, base: float = SERVE_RESTART_BACKO
 
 
 async def _serve_watchdog_loop() -> None:
-    global _serve_seen_alive, _serve_down_notified_at
+    global _serve_seen_alive, _serve_down_notified_at, _last_serve_alive_seen_at
     while not _stop_flag.is_set():
         if _runtime is None:
             await asyncio.sleep(SERVE_WATCHDOG_INTERVAL_SEC)
@@ -896,6 +899,7 @@ async def _serve_watchdog_loop() -> None:
             if not _serve_seen_alive:
                 logger.info("opencode serve detected alive at %s; watchdog armed", _runtime.config.endpoint)
             _serve_seen_alive = True
+            _last_serve_alive_seen_at = time.time()
             if was_down:
                 _notify_serve_recovered()
             _serve_down_notified_at = 0.0
@@ -905,6 +909,10 @@ async def _serve_watchdog_loop() -> None:
         cooldown_elapsed = now - _serve_down_notified_at >= SERVE_DOWN_NOTIFY_COOLDOWN_SEC
         if cooldown_elapsed:
             logger.warning("opencode serve at %s appears down", _runtime.config.endpoint)
+            try:
+                _record_serve_crash(observed_via="ping_failed")
+            except Exception as e:
+                logger.debug("crash record failed: %s", e)
             _notify_serve_down()
             _serve_down_notified_at = now
         if not _runtime.config.auto_spawn_server:
@@ -918,6 +926,7 @@ async def _serve_watchdog_loop() -> None:
         if recovered:
             logger.info("opencode serve recovered after watchdog restart")
             _serve_seen_alive = True
+            _last_serve_alive_seen_at = time.time()
             _notify_serve_recovered()
             _serve_down_notified_at = 0.0
         await asyncio.sleep(SERVE_WATCHDOG_INTERVAL_SEC)
@@ -942,9 +951,25 @@ async def _try_restart_serve_with_backoff() -> bool:
             await asyncio.to_thread(_runtime.client.ensure_server, 15.0, _runtime.config.logs_dir)
         except OpencodeError as e:
             logger.warning("serve restart attempt %d: ensure_server failed: %s", attempt, e)
+            try:
+                _record_serve_crash(
+                    observed_via="restart_attempt_failed",
+                    restart_attempt_n=attempt,
+                    extra={"error": str(e)[:500]},
+                )
+            except Exception as rec_err:
+                logger.debug("crash record on attempt %d failed: %s", attempt, rec_err)
             continue
         except Exception as e:
             logger.exception("serve restart attempt %d crashed: %s", attempt, e)
+            try:
+                _record_serve_crash(
+                    observed_via="restart_attempt_exception",
+                    restart_attempt_n=attempt,
+                    extra={"error": f"{type(e).__name__}: {str(e)[:400]}"},
+                )
+            except Exception as rec_err:
+                logger.debug("crash record on attempt %d failed: %s", attempt, rec_err)
             continue
         try:
             if await _runtime.client.ping():
@@ -953,23 +978,181 @@ async def _try_restart_serve_with_backoff() -> bool:
         except Exception as e:
             logger.debug("serve restart attempt %d post-spawn ping errored: %s", attempt, e)
         logger.warning("serve restart attempt %d: spawn returned but ping failed", attempt)
+        try:
+            _record_serve_crash(
+                observed_via="restart_spawn_ping_failed",
+                restart_attempt_n=attempt,
+            )
+        except Exception as rec_err:
+            logger.debug("crash record on attempt %d post-ping failed: %s", attempt, rec_err)
     return False
+
+
+def _record_serve_crash(
+    *,
+    observed_via: str,
+    restart_attempt_n: int | None = None,
+    exit_info: dict | None = None,
+    log_tail_lines: int = 20,
+    extra: dict | None = None,
+) -> dict | None:
+    if _runtime is None:
+        return None
+    import json as _json
+    if exit_info is None:
+        try:
+            exit_info = _runtime.client.last_exit_info()
+        except Exception as e:
+            logger.debug("last_exit_info failed: %s", e)
+            exit_info = None
+    try:
+        log_tail = _runtime.client.last_serve_log_tail(log_tail_lines)
+    except Exception:
+        log_tail = ""
+    active_agents = []
+    try:
+        active_agents = [a.agent_id for a in _runtime.agents.list() if a.phase not in TERMINAL_PHASES]
+    except Exception:
+        pass
+    uptime_at_alive: float | None = None
+    if _last_serve_alive_seen_at:
+        uptime_at_alive = max(0.0, time.time() - _last_serve_alive_seen_at)
+    record = {
+        "ts": time.time(),
+        "endpoint": _runtime.config.endpoint,
+        "observed_via": observed_via,
+        "restart_attempt_n": restart_attempt_n,
+        "pid": (exit_info or {}).get("pid"),
+        "exit_code": (exit_info or {}).get("exit_code"),
+        "signal_name": (exit_info or {}).get("signal_name"),
+        "exit_kind": (exit_info or {}).get("exit_kind", "unknown_no_spawn_record"),
+        "uptime_sec": (exit_info or {}).get("uptime_sec"),
+        "log_path": (exit_info or {}).get("log_path"),
+        "log_tail": log_tail,
+        "sec_since_last_alive": uptime_at_alive,
+        "agents_active": active_agents,
+    }
+    if extra:
+        record["extra"] = extra
+    path = _runtime.config.serve_crashes_file
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(_json.dumps(record, default=str) + "\n")
+    except OSError as e:
+        logger.warning("serve_crashes.jsonl append failed: %s", e)
+    global _last_serve_crash_info
+    _last_serve_crash_info = record
+    logger.info(
+        "serve crash recorded: observed=%s exit_kind=%s exit_code=%s signal=%s",
+        observed_via, record["exit_kind"], record["exit_code"], record["signal_name"],
+    )
+    return record
+
+
+def _read_serve_crashes(limit: int = 20) -> list[dict]:
+    if _runtime is None:
+        return []
+    import json as _json
+    path = _runtime.config.serve_crashes_file
+    if not path.exists():
+        return []
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        return []
+    out: list[dict] = []
+    for line in lines[-max(limit * 2, 200):]:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(_json.loads(line))
+        except (ValueError, TypeError):
+            continue
+    return out[-limit:]
+
+
+def _prune_serve_logs() -> int:
+    if _runtime is None:
+        return 0
+    keep = max(0, int(getattr(_runtime.config, "serve_log_retention_count", 50)))
+    log_dir = _runtime.config.logs_dir
+    if not log_dir.exists():
+        return 0
+    try:
+        files = sorted(
+            log_dir.glob("opencode-serve.*.log"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return 0
+    removed = 0
+    for p in files[keep:]:
+        try:
+            p.unlink()
+            removed += 1
+        except OSError:
+            pass
+    if removed:
+        logger.info("pruned %d old serve logs (kept newest %d)", removed, keep)
+    return removed
+
+
+def _format_exit_for_notify(info: dict | None) -> str:
+    if not info:
+        return "(no exit info captured)"
+    parts: list[str] = []
+    kind = info.get("exit_kind")
+    rc = info.get("exit_code")
+    sig = info.get("signal_name")
+    pid = info.get("pid")
+    up = info.get("uptime_sec")
+    if pid is not None:
+        parts.append(f"pid={pid}")
+    if kind:
+        parts.append(f"exit_kind={kind}")
+    if rc is not None:
+        parts.append(f"rc={rc}")
+    if sig:
+        parts.append(f"signal={sig}")
+    if isinstance(up, (int, float)):
+        parts.append(f"uptime={_humanize_seconds(float(up))}")
+    return " ".join(parts) if parts else "(no exit info captured)"
 
 
 def _build_serve_down_notification() -> tuple[str, str, dict]:
     assert _runtime is not None
     title = "✗ opencode serve unreachable"
-    body = (
+    body_lines = [
         f"`opencode serve` at {_runtime.config.endpoint} is down and "
         f"{SERVE_RESTART_MAX_ATTEMPTS} exponential restart attempts failed. "
-        f"Agents will stall until the server is restored. Check the host, "
-        f"or run `hermes oco doctor` for diagnostics."
+        f"Agents will stall until the server is restored.",
+    ]
+    if _last_serve_crash_info:
+        body_lines.append("")
+        body_lines.append(
+            f"Last detected exit: {_format_exit_for_notify(_last_serve_crash_info)}"
+        )
+        tail = (_last_serve_crash_info.get("log_tail") or "").strip()
+        if tail:
+            tail_short = "\n".join(tail.splitlines()[-5:])
+            body_lines.append(f"Last log lines:\n{tail_short}")
+    body_lines.append("")
+    body_lines.append(
+        f"Inspect history: `hermes oco serve-crashes` or "
+        f"`{_runtime.config.serve_crashes_file}`. "
+        f"Run `hermes oco doctor` for full diagnostics."
     )
+    body = "\n".join(body_lines)
     meta = {
         "kind": "serve_down",
         "endpoint": _runtime.config.endpoint,
         "attempts": SERVE_RESTART_MAX_ATTEMPTS,
         "auto_spawn_server": _runtime.config.auto_spawn_server,
+        "last_crash": _last_serve_crash_info,
     }
     return title, body, meta
 

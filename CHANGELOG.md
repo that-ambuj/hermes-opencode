@@ -5,6 +5,132 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.20.0] - 2026-05-19
+
+Serve post-mortem capability: when `opencode serve` dies, the
+orchestrator now captures the exit code, signal name, log tail, and
+agents-active-at-crash into a structured `serve_crashes.jsonl` log.
+This is the diagnostic layer the v0.19.x flapping investigations
+demanded but didn't have. Six new surfaces.
+
+Prior to v0.20.0 the orchestrator captured stdout+stderr per spawn
+into a timestamped log file but never read the process's exit code,
+never preserved the dying log across the next spawn, and surfaced
+`serve_down` with no diagnostic detail beyond "5 attempts failed".
+
+### Tier 1: exit-code + signal capture
+
+- `transport.OpencodeClient.last_exit_info()` returns
+  `{pid, exit_code, signal_name, exit_kind, uptime_sec, log_path}`.
+  `exit_kind` classifies as `still_running`, `clean_exit`,
+  `nonzero_exit`, `killed_by_signal`, or `unknown_already_reaped`.
+- Signal-name lookup via `signal.Signals(rc)`; recognizes both
+  POSIX negative-returncode (`rc = -9`) and shell-style positive
+  (`rc = 137`) for SIGKILL, SIGTERM, SIGSEGV, etc.
+- `OpencodeClient` now tracks `_spawn_started_at` + `_last_spawn_pid`
+  so `last_exit_info()` works even after `_spawned` is cleared.
+- New `last_serve_log_tail(lines=20)` returns the last N lines of
+  the most recent serve log.
+
+### Tier 2: `serve_crashes.jsonl` audit log
+
+New file at `~/.hermes/plugins/hermes-opencode/serve_crashes.jsonl`.
+Each row:
+
+```json
+{
+  "ts": 1779129067.66,
+  "endpoint": "0.0.0.0:4096",
+  "observed_via": "ping_failed" | "restart_attempt_failed" |
+                  "restart_attempt_exception" | "restart_spawn_ping_failed",
+  "restart_attempt_n": 1,
+  "pid": 196959,
+  "exit_code": -9,
+  "signal_name": "SIGKILL",
+  "exit_kind": "killed_by_signal",
+  "uptime_sec": 3247.2,
+  "log_path": "logs/opencode-serve.20260519-001355.log",
+  "log_tail": "...last 20 lines of the dying process's stdout+stderr...",
+  "sec_since_last_alive": 60.3,
+  "agents_active": ["BCK/p-list-tests", "BCK/prod-shortlink"]
+}
+```
+
+Written by `_record_serve_crash` from:
+- `_serve_watchdog_loop` when the periodic ping fails
+- `_try_restart_serve_with_backoff` for every failed restart attempt
+  (one row per attempt — see "spawn 1 died with SIGKILL, spawn 2 ran
+  but ping returned 500, spawn 3 succeeded" instead of opaque
+  "5 attempts failed")
+
+### Tier 3: annotated `serve_down` notification
+
+`_build_serve_down_notification` now embeds the captured exit
+information into the body:
+
+```
+opencode serve at 0.0.0.0:4096 is down and 5 exponential restart
+attempts failed.
+
+Last detected exit: pid=196959 exit_kind=killed_by_signal rc=-9
+  signal=SIGKILL uptime=54m
+Last log lines:
+  opencode server listening on http://0.0.0.0:4096
+  [01:31:19.159] INFO (#283): creating instance { ... }
+  fatal: heap OOM
+
+Inspect history: `hermes oco serve-crashes` or
+`~/.hermes/plugins/hermes-opencode/serve_crashes.jsonl`.
+```
+
+The notification `meta` also carries `last_crash` (full record) so
+gateway adapters can render it however they like.
+
+### Tier 4: serve-log retention
+
+`_prune_serve_logs()` runs from the existing `_cleanup_loop` and
+keeps the newest `Config.serve_log_retention_count` files (default
+50). Closes the v0.19.x "60 log files and counting" growth pattern
+without losing recent history needed for diagnosis.
+
+### Tier 5: `oc_serve_crashes` tool / `hermes oco serve-crashes` CLI
+
+- New tool: `oc_serve_crashes(limit=10)` returns recent crash
+  records; LLM should call this proactively when narrating a
+  `serve_down` event or answering "why did it crash?".
+- New CLI: `hermes oco serve-crashes [--limit N] [--json]` —
+  pretty-prints recent records with timestamp, observed_via,
+  exit_kind, exit_code/signal, agents-active, and last 5 log lines.
+- Tool description carries "WHEN TO USE" framing (consistent with
+  v0.19.0 dispatcher directive).
+
+### Tier 6: dashboard endpoint
+
+- `GET /api/plugins/hermes-opencode/serve-crashes?n=20` — returns
+  `{items, count, file}` from the JSONL tail. Frontend can render
+  a crash-log tab without touching backend code.
+
+### Config additions
+
+- `Config.serve_crashes_file: Path = plugin_state_dir() / "serve_crashes.jsonl"`
+- `Config.serve_log_retention_count: int = 50`
+
+### Internal surface
+
+- `OpencodeClient.last_exit_info() -> dict | None`
+- `OpencodeClient.last_serve_log_tail(lines=20) -> str`
+- `OpencodeClient._signal_name_from_returncode(rc) -> str | None`
+- `event_loop._record_serve_crash(*, observed_via, restart_attempt_n,
+  exit_info, log_tail_lines, extra) -> dict | None`
+- `event_loop._read_serve_crashes(limit=20) -> list[dict]`
+- `event_loop._prune_serve_logs() -> int` (count removed)
+- `event_loop._last_serve_crash_info: dict | None` (in-memory cache
+  for the next serve_down notification body)
+- `event_loop._last_serve_alive_seen_at: float` (uptime since last
+  observed-alive ping; included in crash record)
+
+18 new tests; 438 -> 456 total.
+
 ## [0.19.1] - 2026-05-19
 
 Bugfix: serve-down false escalations.

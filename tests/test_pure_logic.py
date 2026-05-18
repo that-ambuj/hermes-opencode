@@ -4038,3 +4038,341 @@ class TestServeHealingGraceWindow:
         finally:
             event_loop_mod._fanout_serve_event = prev
         assert before <= event_loop_mod._serve_recovered_at <= after
+
+
+class TestLastExitInfo:
+    def setup_method(self):
+        from _oco_test_pkg.transport import OpencodeClient
+        self.cls = OpencodeClient
+
+    def test_no_spawn_returns_none(self):
+        client = self.cls("127.0.0.1", 4096)
+        assert client.last_exit_info() is None
+
+    def test_still_running_reports_kind(self):
+        client = self.cls("127.0.0.1", 4096)
+        class _Fake:
+            returncode = None
+            def poll(self): return None
+        client._spawned = _Fake()
+        client._last_spawn_pid = 12345
+        client._spawn_started_at = time.time() - 10.0
+        info = client.last_exit_info()
+        assert info["exit_kind"] == "still_running"
+        assert info["pid"] == 12345
+        assert info["uptime_sec"] >= 9.0
+
+    def test_clean_exit_zero(self):
+        client = self.cls("127.0.0.1", 4096)
+        class _Fake:
+            returncode = 0
+            def poll(self): return 0
+        client._spawned = _Fake()
+        client._last_spawn_pid = 99
+        info = client.last_exit_info()
+        assert info["exit_kind"] == "clean_exit"
+        assert info["exit_code"] == 0
+        assert info["signal_name"] is None
+
+    def test_killed_by_negative_returncode(self):
+        client = self.cls("127.0.0.1", 4096)
+        class _Fake:
+            returncode = -9
+            def poll(self): return -9
+        client._spawned = _Fake()
+        info = client.last_exit_info()
+        assert info["exit_kind"] == "killed_by_signal"
+        assert info["signal_name"] == "SIGKILL"
+
+    def test_killed_by_high_returncode(self):
+        client = self.cls("127.0.0.1", 4096)
+        class _Fake:
+            returncode = 137
+            def poll(self): return 137
+        client._spawned = _Fake()
+        info = client.last_exit_info()
+        assert info["exit_kind"] == "killed_by_signal"
+        assert info["signal_name"] == "SIGKILL"
+
+    def test_nonzero_clean_exit(self):
+        client = self.cls("127.0.0.1", 4096)
+        class _Fake:
+            returncode = 1
+            def poll(self): return 1
+        client._spawned = _Fake()
+        info = client.last_exit_info()
+        assert info["exit_kind"] == "nonzero_exit"
+        assert info["exit_code"] == 1
+        assert info["signal_name"] is None
+
+    def test_signal_name_lookup(self):
+        assert self.cls._signal_name_from_returncode(-15) == "SIGTERM"
+        assert self.cls._signal_name_from_returncode(-9) == "SIGKILL"
+        assert self.cls._signal_name_from_returncode(143) == "SIGTERM"
+        assert self.cls._signal_name_from_returncode(0) is None
+        assert self.cls._signal_name_from_returncode(1) is None
+
+
+class TestServeCrashRecord:
+    def setup_method(self):
+        self._saved_runtime = event_loop_mod._runtime
+        self._saved_last_crash = event_loop_mod._last_serve_crash_info
+
+    def teardown_method(self):
+        event_loop_mod._runtime = self._saved_runtime
+        event_loop_mod._last_serve_crash_info = self._saved_last_crash
+
+    def _make_rt(self, tmp_path):
+        cfg = config_mod.Config(
+            host="127.0.0.1", port=4096,
+            worktrees_root=tmp_path / "wt",
+            agents_file=tmp_path / "agents.json",
+            projects_file=tmp_path / "projects.json",
+            logs_dir=tmp_path / "logs",
+            notifications_file=tmp_path / "notifications.jsonl",
+            events_log=tmp_path / "events.log",
+            serve_crashes_file=tmp_path / "serve_crashes.jsonl",
+        )
+        cfg.ensure_dirs()
+        store = state_mod.AgentStore(cfg.agents_file)
+        class _Client:
+            def last_exit_info(self): return {
+                "pid": 42, "exit_code": -9, "signal_name": "SIGKILL",
+                "exit_kind": "killed_by_signal", "uptime_sec": 60.0,
+                "log_path": "/tmp/x.log",
+            }
+            def last_serve_log_tail(self, n): return "line1\nline2\nline3"
+        class _RT: ...
+        rt = _RT()
+        rt.config = cfg
+        rt.agents = store
+        rt.client = _Client()
+        return rt
+
+    def test_record_serve_crash_writes_jsonl(self, tmp_path):
+        rt = self._make_rt(tmp_path)
+        event_loop_mod._runtime = rt
+        rec = event_loop_mod._record_serve_crash(observed_via="ping_failed")
+        assert rec is not None
+        assert rec["pid"] == 42
+        assert rec["signal_name"] == "SIGKILL"
+        assert rec["exit_kind"] == "killed_by_signal"
+        assert rec["observed_via"] == "ping_failed"
+        assert rec["log_tail"] == "line1\nline2\nline3"
+        assert rt.config.serve_crashes_file.exists()
+        import json as _json
+        rows = [_json.loads(ln) for ln in rt.config.serve_crashes_file.read_text().splitlines() if ln.strip()]
+        assert len(rows) == 1
+        assert rows[0]["pid"] == 42
+
+    def test_record_per_attempt(self, tmp_path):
+        rt = self._make_rt(tmp_path)
+        event_loop_mod._runtime = rt
+        event_loop_mod._record_serve_crash(
+            observed_via="restart_attempt_failed",
+            restart_attempt_n=1,
+            extra={"error": "ensure_server timeout"},
+        )
+        event_loop_mod._record_serve_crash(
+            observed_via="restart_spawn_ping_failed",
+            restart_attempt_n=2,
+        )
+        rows = event_loop_mod._read_serve_crashes(limit=10)
+        assert len(rows) == 2
+        assert rows[0]["restart_attempt_n"] == 1
+        assert rows[0]["extra"]["error"] == "ensure_server timeout"
+        assert rows[1]["restart_attempt_n"] == 2
+
+    def test_record_captures_active_agents(self, tmp_path):
+        rt = self._make_rt(tmp_path)
+        event_loop_mod._runtime = rt
+        rt.agents.add(state_mod.Agent(
+            agent_id="oco/active", project_label="p", worktree_path="/tmp/wt",
+            session_id="s", branch="br", initial_prompt="hi",
+            phase="EXECUTING",
+        ))
+        rt.agents.add(state_mod.Agent(
+            agent_id="oco/done", project_label="p", worktree_path="/tmp/wt2",
+            session_id="s2", branch="br2", initial_prompt="hi",
+            phase="DONE",
+        ))
+        rec = event_loop_mod._record_serve_crash(observed_via="ping_failed")
+        assert "oco/active" in rec["agents_active"]
+        assert "oco/done" not in rec["agents_active"]
+
+    def test_no_runtime_returns_none(self):
+        event_loop_mod._runtime = None
+        assert event_loop_mod._record_serve_crash(observed_via="ping_failed") is None
+        assert event_loop_mod._read_serve_crashes() == []
+
+
+class TestServeDownNotificationAnnotation:
+    def setup_method(self):
+        self._saved_runtime = event_loop_mod._runtime
+        self._saved_last_crash = event_loop_mod._last_serve_crash_info
+
+    def teardown_method(self):
+        event_loop_mod._runtime = self._saved_runtime
+        event_loop_mod._last_serve_crash_info = self._saved_last_crash
+
+    def test_body_contains_exit_info_and_tail(self, tmp_path):
+        cfg = config_mod.Config(
+            host="127.0.0.1", port=4096,
+            worktrees_root=tmp_path / "wt",
+            agents_file=tmp_path / "agents.json",
+            projects_file=tmp_path / "projects.json",
+            logs_dir=tmp_path / "logs",
+            notifications_file=tmp_path / "notifications.jsonl",
+            events_log=tmp_path / "events.log",
+            serve_crashes_file=tmp_path / "serve_crashes.jsonl",
+        )
+        class _RT: ...
+        rt = _RT()
+        rt.config = cfg
+        event_loop_mod._runtime = rt
+        event_loop_mod._last_serve_crash_info = {
+            "ts": time.time(),
+            "pid": 4242,
+            "exit_code": -9,
+            "signal_name": "SIGKILL",
+            "exit_kind": "killed_by_signal",
+            "uptime_sec": 120.0,
+            "log_tail": "Warning: OPENCODE_SERVER_PASSWORD is not set\nopencode server listening on http://0.0.0.0:4096\nfatal: heap OOM",
+        }
+        title, body, meta = event_loop_mod._build_serve_down_notification()
+        assert "exit_kind=killed_by_signal" in body
+        assert "signal=SIGKILL" in body
+        assert "pid=4242" in body
+        assert "heap OOM" in body
+        assert meta["last_crash"]["signal_name"] == "SIGKILL"
+
+    def test_body_no_crash_info_still_works(self, tmp_path):
+        cfg = config_mod.Config(
+            host="127.0.0.1", port=4096,
+            worktrees_root=tmp_path / "wt",
+            agents_file=tmp_path / "agents.json",
+            projects_file=tmp_path / "projects.json",
+            logs_dir=tmp_path / "logs",
+            notifications_file=tmp_path / "notifications.jsonl",
+            events_log=tmp_path / "events.log",
+            serve_crashes_file=tmp_path / "serve_crashes.jsonl",
+        )
+        class _RT: ...
+        rt = _RT()
+        rt.config = cfg
+        event_loop_mod._runtime = rt
+        event_loop_mod._last_serve_crash_info = None
+        title, body, meta = event_loop_mod._build_serve_down_notification()
+        assert "is down" in body
+        assert "exponential restart attempts failed" in body
+
+
+class TestServeLogRotation:
+    def setup_method(self):
+        self._saved_runtime = event_loop_mod._runtime
+
+    def teardown_method(self):
+        event_loop_mod._runtime = self._saved_runtime
+
+    def test_prune_keeps_newest_N(self, tmp_path):
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        for i in range(10):
+            p = log_dir / f"opencode-serve.{20260101 + i}-100000.log"
+            p.write_text(f"log {i}\n")
+            import os as _os
+            _os.utime(p, (time.time() - (10 - i) * 60, time.time() - (10 - i) * 60))
+        cfg = config_mod.Config(
+            host="127.0.0.1", port=4096,
+            worktrees_root=tmp_path / "wt",
+            agents_file=tmp_path / "agents.json",
+            projects_file=tmp_path / "projects.json",
+            logs_dir=log_dir,
+            notifications_file=tmp_path / "notifications.jsonl",
+            events_log=tmp_path / "events.log",
+            serve_log_retention_count=4,
+        )
+        class _RT: ...
+        rt = _RT()
+        rt.config = cfg
+        event_loop_mod._runtime = rt
+        removed = event_loop_mod._prune_serve_logs()
+        assert removed == 6
+        remaining = sorted(log_dir.glob("opencode-serve.*.log"))
+        assert len(remaining) == 4
+
+    def test_prune_no_dir_safe(self, tmp_path):
+        cfg = config_mod.Config(
+            host="127.0.0.1", port=4096,
+            worktrees_root=tmp_path / "wt",
+            agents_file=tmp_path / "agents.json",
+            projects_file=tmp_path / "projects.json",
+            logs_dir=tmp_path / "ghost-dir",
+            notifications_file=tmp_path / "notifications.jsonl",
+            events_log=tmp_path / "events.log",
+        )
+        class _RT: ...
+        rt = _RT()
+        rt.config = cfg
+        event_loop_mod._runtime = rt
+        assert event_loop_mod._prune_serve_logs() == 0
+
+
+class TestOcServeCrashesHandler:
+    def test_handler_returns_recent_records(self, tmp_path):
+        cfg = config_mod.Config(
+            host="127.0.0.1", port=4096,
+            worktrees_root=tmp_path / "wt",
+            agents_file=tmp_path / "agents.json",
+            projects_file=tmp_path / "projects.json",
+            logs_dir=tmp_path / "logs",
+            notifications_file=tmp_path / "notifications.jsonl",
+            events_log=tmp_path / "events.log",
+            serve_crashes_file=tmp_path / "serve_crashes.jsonl",
+        )
+        cfg.ensure_dirs()
+        import json as _json
+        with cfg.serve_crashes_file.open("w") as f:
+            for i in range(5):
+                f.write(_json.dumps({
+                    "ts": 1000.0 + i,
+                    "pid": 100 + i,
+                    "exit_code": -9,
+                    "signal_name": "SIGKILL",
+                    "exit_kind": "killed_by_signal",
+                    "observed_via": "ping_failed",
+                }) + "\n")
+        class _RT: ...
+        rt = _RT()
+        rt.config = cfg
+        rt.agents = state_mod.AgentStore(cfg.agents_file)
+        prev_rt = event_loop_mod._runtime
+        event_loop_mod._runtime = rt
+        tools_mod = sys.modules["_oco_test_pkg.tools"]
+        try:
+            handler = tools_mod.make_serve_crashes(rt)
+            import asyncio as _aio
+            loop = _aio.new_event_loop()
+            try:
+                result = loop.run_until_complete(handler({"limit": 3}))
+            finally:
+                loop.close()
+        finally:
+            event_loop_mod._runtime = prev_rt
+        import json as _json
+        payload = _json.loads(result)
+        assert payload["ok"] is True
+        assert payload["data"]["count"] == 3
+        assert payload["data"]["crashes"][0]["pid"] == 102
+        assert payload["data"]["crashes"][-1]["pid"] == 104
+
+
+class TestConfigServeCrashFields:
+    def test_defaults(self):
+        cfg = config_mod.Config()
+        assert cfg.serve_log_retention_count == 50
+        assert cfg.serve_crashes_file.name == "serve_crashes.jsonl"
+
+    def test_serve_crashes_in_default_state_dir(self):
+        cfg = config_mod.Config()
+        assert cfg.serve_crashes_file.parent == cfg.notifications_file.parent

@@ -601,6 +601,62 @@ transport errors from real stalls: gate on
 errors from external services (github CLI, git, etc.) — those have
 their own retry budgets via `_handle_phase_failure`.
 
+### Serve post-mortem (v0.20.0+)
+
+When `opencode serve` dies (detected by ping failure or by an
+explicit `_runtime.client.last_exit_info()` poll), the orchestrator
+appends a structured row to `Config.serve_crashes_file` (default
+`~/.hermes/plugins/hermes-opencode/serve_crashes.jsonl`).
+
+Row shape includes `ts`, `observed_via` (`ping_failed` |
+`restart_attempt_failed` | `restart_attempt_exception` |
+`restart_spawn_ping_failed`), `restart_attempt_n`, `pid`,
+`exit_code`, `signal_name` (e.g. `SIGKILL`), `exit_kind`,
+`uptime_sec`, `log_path`, `log_tail` (last 20 lines of the dying
+process's stdout+stderr), `sec_since_last_alive`, and
+`agents_active` (non-terminal agent_ids at the moment of crash).
+
+Writers:
+- `_serve_watchdog_loop` on ping failure (single row per detected
+  death window — gated by the existing 10 min notify cooldown)
+- `_try_restart_serve_with_backoff` per FAILED attempt (one row per
+  attempt — `restart_attempt_failed` for ensure_server timeouts,
+  `restart_attempt_exception` for unhandled exceptions,
+  `restart_spawn_ping_failed` when the spawned process bound the
+  port but didn't answer `/`)
+
+The first record per down-episode is cached in
+`_last_serve_crash_info` and embedded into the next `serve_down`
+notification body via `_build_serve_down_notification`, so users
+see the exit reason inline without grepping JSONL.
+
+`_prune_serve_logs()` runs from `_cleanup_loop` and keeps the
+newest `Config.serve_log_retention_count` (default 50) timestamped
+serve logs. Older ones are unlink'd.
+
+`OpencodeClient.last_exit_info()` is the single source of truth for
+the dying process's exit state. It tolerates:
+- `_spawned is None` -> `unknown_already_reaped` (only when a PID
+  was tracked previously) or `None` (never spawned).
+- `poll() is None` -> `still_running`.
+- `rc < 0` (POSIX negative returncode) -> `killed_by_signal` with
+  `signal_name = signal.Signals(-rc).name`.
+- `rc > 128` (shell-style "killed by signal N" code) -> same.
+- `rc == 0` -> `clean_exit`.
+- `rc != 0` (no signal) -> `nonzero_exit`.
+
+### When adding new serve-side failure paths
+
+- Call `_record_serve_crash(observed_via="<your-tag>",
+  restart_attempt_n=...)` so the post-mortem layer captures the
+  failure shape. Use a new `observed_via` value rather than
+  overloading existing ones.
+- If the failure has a clear operator action (e.g. "restart attempt
+  failed with port-in-use"), include it in `extra={"error": "..."}`.
+- DO NOT silently swallow process-management errors. The watchdog
+  is the single point of restart control; bypass it and you lose
+  the audit trail.
+
 ### Phase-stuck watchdog
 
 `_phase_stuck_loop` runs every `STUCK_CHECK_INTERVAL_SEC = 60` s.

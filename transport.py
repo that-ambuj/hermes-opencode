@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import threading
@@ -52,6 +53,8 @@ class OpencodeClient:
         self._spawned: subprocess.Popen[str] | None = None
         self._spawn_lock = threading.Lock()
         self._last_serve_log_path: Path | None = None
+        self._spawn_started_at: float | None = None
+        self._last_spawn_pid: int | None = None
 
     @property
     def endpoint(self) -> str:
@@ -107,6 +110,8 @@ class OpencodeClient:
                 env=env,
                 start_new_session=True,
             )
+            self._spawn_started_at = time.time()
+            self._last_spawn_pid = self._spawned.pid
             if log_handle is not None:
                 try:
                     log_handle.close()
@@ -164,6 +169,65 @@ class OpencodeClient:
         except OSError:
             return ""
         return "\n".join(content.splitlines()[-lines:])
+
+    @staticmethod
+    def _signal_name_from_returncode(rc: int) -> str | None:
+        if rc is None:
+            return None
+        if rc < 0:
+            sig = -rc
+        elif rc > 128:
+            sig = rc - 128
+        else:
+            return None
+        try:
+            return signal.Signals(sig).name
+        except (ValueError, AttributeError):
+            return f"SIG?({sig})"
+
+    def last_exit_info(self) -> dict[str, Any] | None:
+        spawned = self._spawned
+        pid = self._last_spawn_pid
+        started_at = self._spawn_started_at
+        if spawned is None:
+            if pid is None:
+                return None
+            return {
+                "pid": pid,
+                "exit_code": None,
+                "signal_name": None,
+                "exit_kind": "unknown_already_reaped",
+                "uptime_sec": (time.time() - started_at) if started_at else None,
+                "log_path": str(self._last_serve_log_path) if self._last_serve_log_path else None,
+            }
+        rc = spawned.poll()
+        if rc is None:
+            return {
+                "pid": pid,
+                "exit_code": None,
+                "signal_name": None,
+                "exit_kind": "still_running",
+                "uptime_sec": (time.time() - started_at) if started_at else None,
+                "log_path": str(self._last_serve_log_path) if self._last_serve_log_path else None,
+            }
+        signal_name = self._signal_name_from_returncode(rc)
+        if signal_name is not None:
+            kind = "killed_by_signal"
+        elif rc == 0:
+            kind = "clean_exit"
+        else:
+            kind = "nonzero_exit"
+        return {
+            "pid": pid,
+            "exit_code": rc,
+            "signal_name": signal_name,
+            "exit_kind": kind,
+            "uptime_sec": (time.time() - started_at) if started_at else None,
+            "log_path": str(self._last_serve_log_path) if self._last_serve_log_path else None,
+        }
+
+    def last_serve_log_tail(self, lines: int = 20) -> str:
+        return self._tail_log(self._last_serve_log_path, lines)
 
     def _reap_tracked_spawn(self) -> None:
         spawned = self._spawned

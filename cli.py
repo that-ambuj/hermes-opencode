@@ -15,6 +15,7 @@ from . import commands as commands_mod
 from . import event_loop
 from . import reviewer as reviewer_mod
 from . import worktree as wt_mod
+from . import config as config_mod
 from .config import Config, load_entry_config
 from .projects import ProjectRegistry
 from .state import AgentStore
@@ -98,13 +99,20 @@ def setup(subparser: argparse.ArgumentParser) -> None:
     resume_p.add_argument("--skip-review", dest="skip_review", action="store_true",
                           help="Skip the review cycle (trivial follow-ups). Agent goes straight from EXECUTING to COMMITTING.")
 
+    crashes_p = subs.add_parser(
+        "serve-crashes",
+        help="Show recent opencode-serve crash records (exit code, signal, log tail, agents active at crash).",
+    )
+    crashes_p.add_argument("--limit", "-n", type=int, default=10, help="Max records to return (default 10).")
+    crashes_p.add_argument("--json", dest="as_json", action="store_true", help="Emit raw JSON.")
+
     subparser.set_defaults(func=handler)
 
 
 def handler(args: argparse.Namespace) -> int:
     sub = getattr(args, "oco_command", None)
     if not sub:
-        print("usage: hermes oco {list,status,attach,kill,cancel,retry,projects,spawn,resume-pr}", file=sys.stderr)
+        print("usage: hermes oco {list,status,attach,kill,cancel,retry,projects,spawn,resume-pr,serve-crashes}", file=sys.stderr)
         return 2
     dispatch = _DISPATCH.get(sub)
     if dispatch is None:
@@ -477,7 +485,70 @@ _DISPATCH = {
     "projects": cmd_projects,
     "spawn": cmd_spawn,
     "resume-pr": cmd_resume_pr,
+    "serve-crashes": lambda args: cmd_serve_crashes(args),
 }
+
+
+def cmd_serve_crashes(args: argparse.Namespace) -> int:
+    cfg = config_mod.Config.from_plugin_entry(config_mod.load_entry_config())
+    path = cfg.serve_crashes_file
+    limit = int(getattr(args, "limit", 10) or 10)
+    as_json = bool(getattr(args, "as_json", False))
+    if not path.exists():
+        print(f"no crash records yet at {path}")
+        return 0
+    rows: list[dict] = []
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f.readlines()[-max(limit * 2, 200):]:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except (ValueError, TypeError):
+                    continue
+    except OSError as e:
+        print(f"could not read {path}: {e}", file=sys.stderr)
+        return 1
+    rows = rows[-limit:]
+    if as_json:
+        print(json.dumps(rows, default=str, indent=2))
+        return 0
+    if not rows:
+        print(f"no crash records in {path}")
+        return 0
+    print(f"{len(rows)} recent serve-crash record(s) from {path}:")
+    for r in rows:
+        ts = r.get("ts")
+        when = ""
+        if isinstance(ts, (int, float)):
+            try:
+                from datetime import datetime
+                when = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+            except (OSError, ValueError):
+                when = str(ts)
+        observed = r.get("observed_via", "?")
+        kind = r.get("exit_kind", "?")
+        rc = r.get("exit_code")
+        sig = r.get("signal_name")
+        attempt = r.get("restart_attempt_n")
+        attempt_str = f" attempt={attempt}" if attempt is not None else ""
+        head = f"[{when}] observed={observed}{attempt_str}  exit_kind={kind}"
+        if rc is not None:
+            head += f"  rc={rc}"
+        if sig:
+            head += f"  signal={sig}"
+        print(head)
+        agents = r.get("agents_active") or []
+        if agents:
+            print(f"  agents_active: {', '.join(agents)}")
+        tail = (r.get("log_tail") or "").strip()
+        if tail:
+            for ln in tail.splitlines()[-5:]:
+                print(f"  | {ln}")
+        print()
+    return 0
 
 
 if __name__ == "__main__":

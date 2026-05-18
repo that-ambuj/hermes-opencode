@@ -224,6 +224,15 @@ async def history(n: int = 50) -> dict[str, Any]:
     return {"items": records, "count": len(records)}
 
 
+@router.get("/serve-crashes")
+async def serve_crashes(n: int = 20) -> dict[str, Any]:
+    n = max(1, min(200, int(n)))
+    path = _state_dir() / "serve_crashes.jsonl"
+    records = _tail_jsonl(path, n=n)
+    records.sort(key=lambda r: r.get("ts") or 0, reverse=True)
+    return {"items": records, "count": len(records), "file": str(path)}
+
+
 def _check_ws_token(provided: str | None) -> bool:
     expected = os.environ.get("HERMES_DASHBOARD_TOKEN")
     if not expected:

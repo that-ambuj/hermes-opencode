@@ -1212,6 +1212,45 @@ OUTPUT_SCHEMA: dict[str, Any] = {
 }
 
 
+SERVE_CRASHES_SCHEMA: dict[str, Any] = {
+    "name": "oc_serve_crashes",
+    "description": (
+        "WHEN TO USE: The user asks why opencode serve crashed, why "
+        "agents went stale, why notifications said 'serve unreachable', "
+        "or any post-mortem question about server flapping. Also use "
+        "proactively when narrating a `serve_down` event in chat.\n"
+        "\n"
+        "Returns the last N entries from serve_crashes.jsonl. Each entry "
+        "carries the captured exit_code, signal_name (e.g. SIGKILL), "
+        "exit_kind classification, uptime, log_tail (~20 lines of the "
+        "dying process's stdout+stderr), restart_attempt_n, and the "
+        "list of agents active at the moment of crash. Written by the "
+        "serve watchdog every time it detects a dead process or a "
+        "failed restart attempt."
+    ),
+    "parameters": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "limit": {"type": "integer", "default": 10, "description": "Max records to return (default 10)."},
+        },
+    },
+}
+
+
+def make_serve_crashes(rt: Runtime) -> Callable[..., Awaitable[str]]:
+    async def handler(args: dict, **_: Any) -> str:
+        limit = int(args.get("limit", 10) or 10)
+        crashes = event_loop._read_serve_crashes(limit=limit)
+        return _ok({
+            "endpoint": rt.config.endpoint,
+            "count": len(crashes),
+            "file": str(rt.config.serve_crashes_file),
+            "crashes": crashes,
+        })
+    return handler
+
+
 HEARTBEAT_NOW_SCHEMA: dict[str, Any] = {
     "name": "oc_heartbeat_send_now",
     "description": "Send the heartbeat status report immediately to all configured sinks (CLI inject_message / gateway DM / dashboard JSONL). Useful for testing the notify pipeline or for ad-hoc status pings outside the hourly schedule.",
@@ -1512,4 +1551,5 @@ def all_tool_specs(rt: Runtime) -> list[dict[str, Any]]:
         {"name": "oc_project_regenerate_cleanup", "toolset": "hermes_opencode", "schema": REGEN_CLEANUP_SCHEMA, "handler": make_regen_cleanup(rt), "is_async": True, "emoji": "🧹"},
         {"name": "oc_set_notify_target", "toolset": "hermes_opencode", "schema": SET_NOTIFY_TARGET_SCHEMA, "handler": make_set_notify_target(rt), "is_async": True, "emoji": "📡"},
         {"name": "oc_heartbeat_send_now", "toolset": "hermes_opencode", "schema": HEARTBEAT_NOW_SCHEMA, "handler": make_heartbeat_send_now(rt), "is_async": True, "emoji": "💓"},
+        {"name": "oc_serve_crashes", "toolset": "hermes_opencode", "schema": SERVE_CRASHES_SCHEMA, "handler": make_serve_crashes(rt), "is_async": True, "emoji": "💥"},
     ]
