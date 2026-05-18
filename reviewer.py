@@ -113,10 +113,8 @@ def stage_reviewer_worktree(
             )
     sister = reviewer_worktree_path(executor_worktree)
     if sister.exists():
-        try:
-            wt._git(repo_path, "worktree", "remove", "--force", str(sister), check=False)
-        except Exception:
-            shutil.rmtree(sister, ignore_errors=True)
+        wt._git(repo_path, "worktree", "remove", "--force", str(sister), check=False)
+        shutil.rmtree(sister, ignore_errors=True)
     wt._git(repo_path, "worktree", "add", "--detach", str(sister), executor.branch)
     return sister
 

@@ -597,8 +597,7 @@ class TestIdleDebounceHelpers:
         import asyncio
 
         agent_id = "test/busy"
-        with event_loop_mod._sse_buffer_lock:
-            event_loop_mod._sse_session_status[agent_id] = {"type": "busy"}
+        event_loop_mod._session_status_cache.update(agent_id, {"type": "busy"}, source="sse")
         try:
             agent = type("A", (), {"agent_id": agent_id})()
             assert asyncio.run(event_loop_mod._session_status_is_idle(agent)) is False
@@ -4059,6 +4058,141 @@ class TestServeHealingGraceWindow:
         assert after.phase == "FAILED"
         assert after.phase_before_failed == "EXECUTING"
 
+    def test_session_status_cache_empty_get_returns_none(self):
+        cache = event_loop_mod.SessionStatusCache()
+        assert cache.get("anyone") is None
+        assert cache.get_full("anyone") == (None, None, None)
+
+    def test_session_status_cache_update_from_sse(self):
+        cache = event_loop_mod.SessionStatusCache()
+        cache.update("oco/x", {"type": "busy", "model": "claude"}, source="sse")
+        assert cache.get("oco/x") == {"type": "busy", "model": "claude"}
+        status, source, ts = cache.get_full("oco/x")
+        assert status == {"type": "busy", "model": "claude"}
+        assert source == "sse"
+        assert ts is not None and ts > 0
+
+    def test_session_status_cache_update_from_poll(self):
+        cache = event_loop_mod.SessionStatusCache()
+        cache.update("oco/x", {"type": "idle"}, source="poll")
+        status, source, _ts = cache.get_full("oco/x")
+        assert status == {"type": "idle"}
+        assert source == "poll"
+
+    def test_session_status_cache_last_write_wins(self):
+        cache = event_loop_mod.SessionStatusCache()
+        cache.update("oco/x", {"type": "busy"}, source="sse")
+        cache.update("oco/x", {"type": "idle"}, source="poll")
+        assert cache.get("oco/x") == {"type": "idle"}
+        assert cache.get_full("oco/x")[1] == "poll"
+        cache.update("oco/x", {"type": "busy"}, source="sse")
+        assert cache.get("oco/x") == {"type": "busy"}
+        assert cache.get_full("oco/x")[1] == "sse"
+
+    def test_session_status_cache_clear(self):
+        cache = event_loop_mod.SessionStatusCache()
+        cache.update("oco/x", {"type": "idle"}, source="sse")
+        cache.clear("oco/x")
+        assert cache.get("oco/x") is None
+        assert cache.get_full("oco/x") == (None, None, None)
+
+    def test_session_status_cache_independent_per_agent(self):
+        cache = event_loop_mod.SessionStatusCache()
+        cache.update("oco/a", {"type": "busy"}, source="sse")
+        cache.update("oco/b", {"type": "idle"}, source="poll")
+        assert cache.get("oco/a") == {"type": "busy"}
+        assert cache.get("oco/b") == {"type": "idle"}
+        cache.clear("oco/a")
+        assert cache.get("oco/a") is None
+        assert cache.get("oco/b") == {"type": "idle"}
+
+    def test_session_status_cache_update_copies_input(self):
+        cache = event_loop_mod.SessionStatusCache()
+        original = {"type": "idle", "meta": "x"}
+        cache.update("oco/x", original, source="sse")
+        original["type"] = "busy"
+        assert cache.get("oco/x") == {"type": "idle", "meta": "x"}
+
+    def test_wait_idle_through_cache_true_writes_idle(self):
+        import asyncio
+        from pathlib import Path as _Path
+        event_loop_mod._session_status_cache.clear("oco/wic-true")
+        original = event_loop_mod._runtime
+        class _Client:
+            async def wait_idle(self, session_id, directory, timeout=60.0):
+                return True
+        class _RT: ...
+        rt = _RT()
+        rt.client = _Client()
+        event_loop_mod._runtime = rt
+        try:
+            result = asyncio.run(event_loop_mod._wait_idle_through_cache(
+                "oco/wic-true", "ses_x", _Path("/tmp"), timeout=1.0,
+            ))
+        finally:
+            event_loop_mod._runtime = original
+        assert result is True
+        status, source, _ = event_loop_mod._session_status_cache.get_full("oco/wic-true")
+        assert status == {"type": "idle"}
+        assert source == "poll"
+        event_loop_mod._session_status_cache.clear("oco/wic-true")
+
+    def test_wait_idle_through_cache_false_leaves_cache_alone(self):
+        import asyncio
+        from pathlib import Path as _Path
+        agent_id = "oco/wic-false"
+        event_loop_mod._session_status_cache.clear(agent_id)
+        event_loop_mod._session_status_cache.update(agent_id, {"type": "busy"}, source="sse")
+        original = event_loop_mod._runtime
+        class _Client:
+            async def wait_idle(self, session_id, directory, timeout=60.0):
+                return False
+        class _RT: ...
+        rt = _RT()
+        rt.client = _Client()
+        event_loop_mod._runtime = rt
+        try:
+            result = asyncio.run(event_loop_mod._wait_idle_through_cache(
+                agent_id, "ses_x", _Path("/tmp"), timeout=1.0,
+            ))
+        finally:
+            event_loop_mod._runtime = original
+        assert result is False
+        status, source, _ = event_loop_mod._session_status_cache.get_full(agent_id)
+        assert status == {"type": "busy"}
+        assert source == "sse"
+        event_loop_mod._session_status_cache.clear(agent_id)
+
+    def test_wait_idle_write_through_unblocks_stale_busy_cache(self):
+        """End-to-end of the BCK/p-list-tests scenario: SSE cache stuck at
+        'busy' across a serve flap; the next wait_idle that returns True
+        must flip the cache to idle so _session_status_is_idle stops vetoing
+        the transition."""
+        import asyncio
+        from pathlib import Path as _Path
+        agent_id = "oco/stale-recovery"
+        event_loop_mod._session_status_cache.clear(agent_id)
+        event_loop_mod._session_status_cache.update(agent_id, {"type": "busy"}, source="sse")
+        agent = type("A", (), {"agent_id": agent_id})()
+        assert asyncio.run(event_loop_mod._session_status_is_idle(agent)) is False
+        original = event_loop_mod._runtime
+        class _Client:
+            async def wait_idle(self, session_id, directory, timeout=60.0):
+                return True
+        class _RT: ...
+        rt = _RT()
+        rt.client = _Client()
+        event_loop_mod._runtime = rt
+        try:
+            asyncio.run(event_loop_mod._wait_idle_through_cache(
+                agent_id, "ses_x", _Path("/tmp"), timeout=1.0,
+            ))
+        finally:
+            event_loop_mod._runtime = original
+        assert asyncio.run(event_loop_mod._session_status_is_idle(agent)) is True
+        event_loop_mod._session_status_cache.clear(agent_id)
+
+
     def test_clear_tick_failure_discards_from_unhealthy_set(self, tmp_path):
         agent = self._agent()
         rt = self._make_runtime(tmp_path, agent)
@@ -4091,6 +4225,57 @@ class TestServeHealingGraceWindow:
         finally:
             event_loop_mod._fanout_serve_event = prev
         assert before <= event_loop_mod._serve_recovered_at <= after
+
+
+class TestStaleReviewWorktreeCleanup:
+    def test_pre_existing_nonempty_review_dir_gets_cleaned(self, tmp_path):
+        """The BCK/p-list-tests bug: prior reviewer teardown removed the git
+        worktree registration but left gitignored content (target/, etc.)
+        on disk. Next stage_reviewer_worktree must wipe it before git
+        worktree add."""
+        reviewer_mod = sys.modules["_oco_test_pkg.reviewer"]
+        wt_pkg = sys.modules["_oco_test_pkg.worktree"]
+
+        executor_wt = tmp_path / "wt" / "BCK__p-list-tests"
+        executor_wt.mkdir(parents=True)
+        (executor_wt / ".git").write_text("fake")
+        sister = tmp_path / "wt" / "BCK__p-list-tests.review"
+        (sister / "target" / "debug").mkdir(parents=True)
+        (sister / "target" / "debug" / "fingerprint").write_text("rust build artifact")
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+        (repo_path / ".git").mkdir()
+
+        project = type("P", (), {"repo_path": str(repo_path)})()
+        executor = type("E", (), {"agent_id": "BCK/p-list-tests", "branch": "BCK/p-list-tests"})()
+
+        calls: list[tuple[str, ...]] = []
+        class _Result:
+            stdout = ""
+            stderr = ""
+            returncode = 0
+        def fake_git(cwd, *args, check=True):
+            calls.append(tuple(args))
+            return _Result()
+        original_git = wt_pkg._git
+        wt_pkg._git = fake_git
+        try:
+            result_path = reviewer_mod.stage_reviewer_worktree(project, executor, executor_wt)
+        finally:
+            wt_pkg._git = original_git
+
+        assert result_path == sister
+        assert not sister.exists(), (
+            "stale .review/ contents were not cleaned up before git worktree add"
+        )
+        worktree_calls = [c for c in calls if c[:1] == ("worktree",)]
+        assert ("worktree", "remove", "--force", str(sister)) in worktree_calls
+        assert ("worktree", "add", "--detach", str(sister), "BCK/p-list-tests") in worktree_calls
+        remove_idx = next(i for i, c in enumerate(worktree_calls)
+                          if c[:3] == ("worktree", "remove", "--force"))
+        add_idx = next(i for i, c in enumerate(worktree_calls)
+                       if c[:3] == ("worktree", "add", "--detach"))
+        assert remove_idx < add_idx, "remove must run before add"
 
 
 class TestLastExitInfo:

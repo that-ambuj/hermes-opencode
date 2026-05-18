@@ -482,11 +482,64 @@ _sse_part_types: dict[str, dict[str, str]] = {}
 # (their text parts arrive via `message.part.updated`), so without this map
 # user prompts would leak into the assistant-text buffer.
 _sse_message_roles: dict[str, dict[str, str]] = {}
-# Per-agent latest opencode SessionStatus payload from `session.status` events.
-# Authoritative server-side idle/busy/retry signal, preferred over heuristics
-# whenever it is available. Absent when no status event has been observed yet.
-_sse_session_status: dict[str, dict] = {}
 _sse_buffer_lock = threading.Lock()
+
+
+class SessionStatusCache:
+    """Single source of truth for the opencode session.status of each agent.
+
+    Two authoritative writers:
+      - SSE consumer: writes on every `session.status` event from opencode's
+        `/event` stream. Sub-second latency when connected.
+      - HTTP poller: writes `{"type": "idle"}` after every successful
+        `wait_idle` call. Backstop for SSE drops (e.g. after a serve flap:
+        opencode does not re-emit `session.status: idle` for sessions that
+        were already idle before the disconnect, so the only way to refresh
+        the cache after reconnect is to write through from the next
+        authoritative `wait_idle`).
+
+    One reader: `_session_status_is_idle`, which gates the EXECUTING ->
+    IDLE_TASK_COMPLETE transition.
+
+    Last write wins. Permissive on absence (`get` returns None;
+    `_session_status_is_idle` then returns True). Source + timestamp are
+    tracked for diagnostic surfaces (oc_status).
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._statuses: dict[str, dict] = {}
+        self._sources: dict[str, str] = {}
+        self._updated_at: dict[str, float] = {}
+
+    def update(self, agent_id: str, status: dict, *, source: str) -> None:
+        with self._lock:
+            self._statuses[agent_id] = dict(status)
+            self._sources[agent_id] = source
+            self._updated_at[agent_id] = time.time()
+
+    def get(self, agent_id: str) -> dict | None:
+        with self._lock:
+            s = self._statuses.get(agent_id)
+            return dict(s) if s else None
+
+    def get_full(self, agent_id: str) -> tuple[dict | None, str | None, float | None]:
+        with self._lock:
+            s = self._statuses.get(agent_id)
+            return (
+                dict(s) if s else None,
+                self._sources.get(agent_id),
+                self._updated_at.get(agent_id),
+            )
+
+    def clear(self, agent_id: str) -> None:
+        with self._lock:
+            self._statuses.pop(agent_id, None)
+            self._sources.pop(agent_id, None)
+            self._updated_at.pop(agent_id, None)
+
+
+_session_status_cache = SessionStatusCache()
 
 # Per-agent {agent_id: snippet} dedupe map for the progress-narration loop.
 # Snippet is the first N chars of the latest SSE buffer; only fires a
@@ -511,9 +564,12 @@ def get_text_buffer(agent_id: str) -> dict[str, str]:
 
 
 def get_session_status(agent_id: str) -> dict | None:
-    with _sse_buffer_lock:
-        status = _sse_session_status.get(agent_id)
-        return dict(status) if status else None
+    return _session_status_cache.get(agent_id)
+
+
+def get_session_status_full(agent_id: str) -> tuple[dict | None, str | None, float | None]:
+    """Returns (status, source, updated_at) for diagnostic surfaces."""
+    return _session_status_cache.get_full(agent_id)
 
 
 def clear_text_buffer(agent_id: str) -> None:
@@ -521,7 +577,7 @@ def clear_text_buffer(agent_id: str) -> None:
         _sse_text_buffers.pop(agent_id, None)
         _sse_part_types.pop(agent_id, None)
         _sse_message_roles.pop(agent_id, None)
-        _sse_session_status.pop(agent_id, None)
+    _session_status_cache.clear(agent_id)
 
 
 def get_pending_snapshot() -> tuple[dict[str, list[dict]], dict[str, list[dict]]]:
@@ -1554,8 +1610,7 @@ async def _sse_consumer_loop(agent_id: str, stop_event: asyncio.Event) -> None:
                     continue
                 status = props.get("status")
                 if isinstance(status, dict) and isinstance(status.get("type"), str):
-                    with _sse_buffer_lock:
-                        _sse_session_status[agent_id] = dict(status)
+                    _session_status_cache.update(agent_id, status, source="sse")
             elif etype == "message.updated":
                 info = props.get("info") or {}
                 if info.get("sessionID") != session_id:
@@ -2009,7 +2064,9 @@ async def _phase_executing(agent: Agent) -> None:
     worktree = Path(agent.worktree_path)
     became_idle = False
     try:
-        became_idle = await _runtime.client.wait_idle(agent.session_id, worktree, timeout=60.0)
+        became_idle = await _wait_idle_through_cache(
+            agent.agent_id, agent.session_id, worktree, timeout=60.0,
+        )
     except OpencodeError:
         await asyncio.sleep(5.0)
         return
@@ -2055,7 +2112,9 @@ async def _phase_executing(agent: Agent) -> None:
         return
     if not _idle_debounce_elapsed(agent):
         return
-    confirm = await _runtime.client.wait_idle(agent.session_id, worktree, timeout=2.0)
+    confirm = await _wait_idle_through_cache(
+        agent.agent_id, agent.session_id, worktree, timeout=2.0,
+    )
     if not confirm:
         _reset_idle_since(agent)
         return
@@ -2168,7 +2227,9 @@ async def _handle_review_text(agent: Agent, reviewer_text: str) -> None:
 async def _phase_executor_addressing(agent: Agent) -> None:
     assert _runtime is not None
     worktree = Path(agent.worktree_path)
-    became_idle = await _runtime.client.wait_idle(agent.session_id, worktree, timeout=60.0)
+    became_idle = await _wait_idle_through_cache(
+        agent.agent_id, agent.session_id, worktree, timeout=60.0,
+    )
     if not became_idle:
         _reset_idle_since(agent)
         return
@@ -2330,6 +2391,16 @@ def _reset_idle_since(agent: "Agent") -> None:
         _runtime.agents.update(agent.agent_id, idle_since=None)
     except Exception as e:
         logger.debug("could not reset idle_since for %s: %s", agent.agent_id, e)
+
+
+async def _wait_idle_through_cache(
+    agent_id: str, session_id: str, worktree: Path, timeout: float = 60.0,
+) -> bool:
+    assert _runtime is not None
+    became_idle = await _runtime.client.wait_idle(session_id, worktree, timeout=timeout)
+    if became_idle:
+        _session_status_cache.update(agent_id, {"type": "idle"}, source="poll")
+    return became_idle
 
 
 async def _session_status_is_idle(agent: "Agent") -> bool:

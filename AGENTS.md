@@ -307,7 +307,7 @@ idle-debounce + diff + awaiting-input cascade.
 `Agent.ready_for_review_at` is stamped with `time.time()` when the
 sentinel triggers a transition (audit only; the row stays put).
 
-## Session-status SSE tracking (LOAD-BEARING, v0.17.0+)
+## Session-status cache (LOAD-BEARING, v0.17.0+, refactored v0.20.2)
 
 opencode publishes a `session.status` SSE event whose payload is
 `{sessionID, status: {type: "idle" | "busy" | "retry", ...}}`. The
@@ -316,20 +316,84 @@ status reflects the canonical server-side state of the model loop:
 while opencode is retrying after a recoverable failure, `idle`
 otherwise.
 
-The SSE consumer caches the latest payload per agent in
-`_sse_session_status`. `get_session_status(agent_id)` exposes it.
+v0.20.2 unified the per-agent status into a single typed cache
+(`SessionStatusCache` in `event_loop.py`) with two authoritative
+writers:
 
-`_phase_executing` and `_phase_executor_addressing` consult
-`_session_status_is_idle(agent)` before any heuristic. When the
-status is `busy` or `retry`, `agent.idle_since` is reset to None
-and the phase returns early, keeping the agent in EXECUTING. The
-heuristic-based debounce only starts ticking once opencode itself
-reports idle.
+- **SSE consumer** writes via `cache.update(agent_id, status, source="sse")`
+  on every `session.status` event. Sub-second latency when the
+  consumer is connected.
+- **HTTP poller** writes via `cache.update(agent_id, {"type": "idle"}, source="poll")`
+  inside `_wait_idle_through_cache(agent_id, session_id, worktree, timeout)`
+  whenever `client.wait_idle` returns True. This is the backstop
+  for SSE drops (e.g. after a serve flap): opencode does NOT re-emit
+  `session.status: idle` for sessions that were already idle before
+  the SSE consumer disconnected, so without write-through the cache
+  would stay stuck at the pre-flap `busy` / `retry` indefinitely
+  (this was the BCK/p-list-tests bug that motivated v0.20.2).
 
-When the SSE consumer has not yet observed a status event,
-`_session_status_is_idle` returns True (permissive) so the
-existing idle detection still works during the brief window
-between session creation and first event.
+Reader: `_session_status_is_idle(agent)` calls `cache.get(agent_id)`
+and returns:
+- True when no status has been observed (permissive default; lets
+  the existing idle-detection cascade run during the window between
+  session creation and first event)
+- True when cached `{type: "idle"}`
+- False when cached `{type: "busy"}` or `{type: "retry"}`
+
+When False, `_phase_executing` and `_phase_executor_addressing` reset
+`agent.idle_since` to None and return early. The heuristic-based
+120s debounce only starts ticking once SOMEONE has written
+`{type: "idle"}` to the cache (SSE or wait_idle-via-poll, last
+write wins).
+
+`cache.get_full(agent_id)` returns `(status, source, updated_at)` for
+diagnostic surfaces (oc_status, dashboard).
+
+### When extending the state machine
+
+- All `wait_idle` calls against an executor session MUST go through
+  `_wait_idle_through_cache(agent_id, session_id, worktree, timeout)`
+  rather than `_runtime.client.wait_idle(...)` directly. This is what
+  closes the SSE-drop gap. The reviewer-session `wait_idle` (in
+  `_phase_reviewing`) does NOT use the helper because the cache
+  tracks executor sessions only.
+- New status writers (e.g. a future periodic `GET /session/<id>`
+  watchdog) must use a distinct `source=...` tag so diagnostic
+  surfaces can attribute the latest write.
+
+## Reviewer worktree staging (LOAD-BEARING, fixed in v0.20.2)
+
+`reviewer.stage_reviewer_worktree` runs before every REVIEW_SPAWNING
+to materialise the sister `<wt>.review/` worktree from the executor's
+branch. v0.20.2 fixed a latent bug where `shutil.rmtree` was nested
+inside `except Exception` after `wt._git(check=False)`: since
+`check=False` does not raise on non-zero exit, the rmtree was dead
+code. If a previous reviewer left behind gitignored content (cargo's
+`target/`, `node_modules/`, `.env`, ...) when its `git worktree
+remove --force` cleaned up the worktree metadata, the directory
+survived as a non-empty filesystem path. The next staging attempt's
+`git worktree add --detach <path>` then failed with exit 128
+(non-empty target), cascading into 3 consecutive tick failures and
+FAILED escalation.
+
+Current staging contract:
+
+```python
+if sister.exists():
+    wt._git(repo_path, "worktree", "remove", "--force", str(sister), check=False)
+    shutil.rmtree(sister, ignore_errors=True)
+wt._git(repo_path, "worktree", "add", "--detach", str(sister), executor.branch)
+```
+
+Both calls run unconditionally on every entry to `stage_reviewer_worktree`.
+`git worktree remove --force` handles the registered case; the
+unconditional `rmtree` handles every other leftover (untracked /
+gitignored content from prior runs, half-removed worktrees, manual
+artifacts).
+
+When adding new build steps that might leave artifacts in the sister
+worktree, do NOT rely on the worktree teardown to clean them up —
+staging now defensively wipes them on next entry.
 
 ## Rate limits and queue (LOAD-BEARING)
 

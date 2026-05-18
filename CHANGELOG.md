@@ -5,6 +5,84 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.20.2] - 2026-05-19
+
+Two bugfixes that explained the BCK/p-list-tests "stuck in EXECUTING for
+1h 29m, then FAILED at REVIEW_SPAWNING" incident.
+
+### Bug A: stuck-in-EXECUTING-while-idle
+
+The session-status SSE cache lost its event stream across an
+`opencode serve` flap and stayed stuck at `{"type": "busy"}` from
+before the flap. opencode does NOT re-emit `session.status: idle`
+for sessions that were already idle before the SSE consumer
+disconnected, so the cache never recovered. `_session_status_is_idle`
+returned False on every tick, `_reset_idle_since` fired, the 120s
+debounce never accumulated, the agent stayed in EXECUTING.
+
+The polling check (`wait_idle`) was already returning True on every
+tick (executor genuinely idle), but its result was consulted ONCE
+and then discarded — the cache check came AFTER and overrode it.
+Two independent sources of truth with no propagation between them.
+
+Fix: unified `SessionStatusCache` class (`event_loop.py`) replaces
+the free-floating `_sse_session_status` dict. Two authoritative
+writers, one reader:
+
+- **SSE consumer** -> `cache.update(agent_id, status, source="sse")`
+  on every `session.status` event. Sub-second when connected.
+- **HTTP poller** -> `cache.update(agent_id, {"type": "idle"}, source="poll")`
+  inside the new `_wait_idle_through_cache(agent_id, session_id,
+  worktree, timeout)` helper, called whenever `wait_idle` returns
+  True. Closes the SSE-drop gap automatically: the next successful
+  poll refreshes the cache to the authoritative truth.
+- `cache.get(agent_id)` is the only reader, consulted by
+  `_session_status_is_idle`. Last write wins.
+
+All 3 executor-session `wait_idle` call sites (in `_phase_executing`
+and `_phase_executor_addressing`) now route through the helper so
+the cache write cannot be forgotten.
+
+New diagnostic: `cache.get_full(agent_id)` returns
+`(status, source, updated_at)` so operators can see whether the
+current cached status came from SSE or polling and how stale it is.
+
+### Bug B: stale `.review/` directory blocking REVIEW_SPAWNING
+
+`reviewer.stage_reviewer_worktree` had `shutil.rmtree` nested inside
+`except Exception` after `wt._git(check=False)`. Since `check=False`
+does not raise on non-zero exit, the rmtree was dead code. If a
+previous reviewer left behind gitignored content (cargo's `target/`,
+`node_modules/`, `.env`, ...) when its teardown ran `git worktree
+remove --force`, the directory survived as a non-empty filesystem
+path. The next staging attempt failed with `git worktree add`
+exit 128 because the target path was non-empty.
+
+Fix: unconditional `git worktree remove --force` + unconditional
+`shutil.rmtree(sister, ignore_errors=True)` when the path exists,
+before `git worktree add`. Both calls now run on every entry to
+`stage_reviewer_worktree`; the rmtree is no longer gated on an
+exception that never fires.
+
+### Internal surface
+
+- `event_loop.SessionStatusCache` class (single source of truth)
+- `event_loop._session_status_cache` (module-level instance)
+- `event_loop._wait_idle_through_cache(agent_id, session_id, worktree, timeout)`
+- `event_loop.get_session_status_full(agent_id)` (returns
+  `(status, source, updated_at)` for diagnostics)
+- `reviewer.stage_reviewer_worktree` no longer has the dead-code
+  `except Exception` wrap; cleanup is unconditional
+
+### Manual cleanup shipped alongside
+
+Two stale `.review/` directories on the live host
+(`BCK__p-list-tests.review/`, `oco__improve-dashbo-3.review/`) were
+`rm -rf`'d during the v0.20.2 deploy. From v0.20.2 onward, the
+defensive staging cleans these automatically.
+
+459 -> 470 tests (+11 new for v0.20.2).
+
 ## [0.20.1] - 2026-05-19
 
 Bugfix: archived agents no longer appear in the hourly heartbeat.
