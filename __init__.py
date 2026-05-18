@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +21,7 @@ from . import event_loop
 from . import notify
 from .config import Config, load_entry_config
 from .projects import ProjectRegistry
-from .state import AgentStore
+from .state import AgentStore, TERMINAL_PHASES
 from .tools import Runtime, all_tool_specs
 from .transport import OpencodeClient
 
@@ -36,16 +37,66 @@ _AT_AGENT_TERMINAL_PHASES = frozenset({"DONE", "KILLED", "FAILED", "CANCELLED"})
 
 
 _DISPATCHER_DIRECTIVE = (
-    "[hermes-opencode] DISPATCHER MODE. When calling oc_spawn or oc_send, "
-    "the opencode agent has FULL authority over its task: it plans its own "
-    "work, scopes its own files, designs its own approach. You are a "
-    "dispatcher, NOT a planner.\n"
-    "  - Forward the human's words VERBATIM in the `prompt` / `text` arg. "
-    "Do NOT plan, decompose, analyze, paraphrase, add file hints, prepend "
-    "background, or insert your own framing.\n"
-    "  - If the human's request is unclear, ASK THE HUMAN a clarifying "
-    "question first. Never fill in gaps on opencode's behalf."
+    "[hermes-opencode] DISPATCHER MODE - MANDATORY RULES.\n"
+    "\n"
+    "You orchestrate opencode coding agents. When the human asks for "
+    "code work (build, fix, implement, add, create, change, refactor, "
+    "write, migrate, port, ship, debug-and-fix, and similar) your "
+    "FIRST action is a tool call, not prose. Specifically:\n"
+    "  1. New task -> call `oc_spawn` IMMEDIATELY. Forward the human's "
+    "words VERBATIM in `prompt`. Do NOT plan, decompose, paraphrase, "
+    "add file hints, prepend background, or insert your own framing.\n"
+    "  2. Follow-up to a live agent -> `oc_send` (verbatim text). For "
+    "answers to tracked /question entries -> `oc_answer` (the plugin "
+    "tells you which question_id when it applies).\n"
+    "  3. Status / progress questions -> consult the 'Active agents' "
+    "and 'Recent activity' blocks below, then call `oc_status` "
+    "(summary) or `oc_output` (full text) if more detail is needed.\n"
+    "  4. Stuck / failed agent -> `oc_retry`.\n"
+    "\n"
+    "Opencode has FULL authority over its task. It does its own "
+    "planning, file exploration, design, and execution. You are a "
+    "DISPATCHER, not a planner. Never fill in gaps on opencode's "
+    "behalf. If the human's request is unclear, ask THEM, not "
+    "opencode."
 )
+
+
+_TASK_VERBS = (
+    "build", "fix", "implement", "add", "create", "write", "make",
+    "change", "refactor", "migrate", "port", "ship", "rewrite",
+    "wire", "connect", "install", "set up", "setup", "update",
+    "upgrade", "remove", "delete", "rename", "split", "extract",
+    "inline", "patch", "handle", "do", "hook up", "fixup",
+)
+_TASK_PREFIX_RE = re.compile(
+    r"^\s*(?:please\s+|can you\s+|could you\s+|would you\s+|let'?s\s+|"
+    r"go\s+(?:ahead\s+and\s+)?|do me a favor and\s+|hey,?\s+)?"
+    r"(" + "|".join(re.escape(v) for v in _TASK_VERBS) + r")\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_task(user_message: str) -> bool:
+    text = (user_message or "").strip()
+    if not text:
+        return False
+    if text.endswith("?"):
+        return False
+    if len(text) > 4000:
+        return False
+    return bool(_TASK_PREFIX_RE.match(text))
+
+
+def _humanize_short(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    if seconds < 3600:
+        return f"{int(seconds // 60)}m"
+    if seconds < 86400:
+        return f"{int(seconds // 3600)}h"
+    return f"{int(seconds // 86400)}d"
 
 
 def _build_pending_items_block() -> str | None:
@@ -90,18 +141,186 @@ def _build_pending_items_block() -> str | None:
     return "\n".join(lines)
 
 
-def _build_pre_llm_context() -> str | None:
+def _build_active_agents_block() -> str | None:
+    if _runtime is None:
+        return None
+    agents_store = getattr(_runtime, "agents", None)
+    if agents_store is None or not hasattr(agents_store, "list"):
+        return None
+    rows: list[str] = []
+    now = time.time()
+    for a in agents_store.list():
+        if a.phase in TERMINAL_PHASES:
+            continue
+        status = event_loop.get_session_status(a.agent_id) or {}
+        status_kind = status.get("type") or ""
+        status_tag = f"  session={status_kind}" if status_kind else ""
+        age = _humanize_short(now - (a.phase_entered_at or a.created_at))
+        line = f"  • {a.agent_id}  phase={a.phase}{status_tag}  in_phase_for={age}"
+        if a.pr_url:
+            line += f"  pr={a.pr_url}"
+        rows.append(line)
+        buffer = event_loop.get_text_buffer(a.agent_id)
+        if buffer:
+            joined = "\n".join(buffer[k] for k in sorted(buffer.keys()) if isinstance(buffer[k], str)).strip()
+            if joined:
+                snippet = joined if len(joined) <= 220 else joined[-220:].lstrip()
+                snippet = snippet.replace("\n", " ").strip()
+                rows.append(f"      latest: {snippet}")
+    if not rows:
+        return None
+    header = f"[hermes-opencode] Active agents ({len(rows) - sum(1 for r in rows if r.lstrip().startswith('latest:'))}):"
+    footer = "  (Use oc_status for details, oc_output for full text, oc_send to message, oc_answer for pending /question, oc_retry to kick.)"
+    return "\n".join([header, *rows, footer])
+
+
+_session_watermarks: dict[str, float] = {}
+
+
+def _build_recent_events_block(session_id: str | None) -> str | None:
+    if _runtime is None or not session_id:
+        return None
+    if not hasattr(_runtime, "config"):
+        return None
+    now = time.time()
+    watermark = _session_watermarks.get(session_id)
+    if watermark is None:
+        _session_watermarks[session_id] = now
+        return None
+    events = event_loop.tail_recent_events(since_ts=watermark, limit=20)
+    if not events:
+        _session_watermarks[session_id] = max(watermark, now)
+        return None
+    rows: list[str] = []
+    latest_ts = watermark
+    for ev in events:
+        try:
+            ts = float(ev.get("ts") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if ts > latest_ts:
+            latest_ts = ts
+        kind = ev.get("kind") or "event"
+        agent_id = ev.get("agent_id") or "?"
+        body = (ev.get("body") or "").strip()
+        if len(body) > 220:
+            body = body[:220].rstrip() + "..."
+        rows.append(f"  • {_humanize_short(now - ts)} ago  {agent_id} {kind}: {body}")
+    _session_watermarks[session_id] = max(latest_ts, now)
+    if not rows:
+        return None
+    header = f"[hermes-opencode] Since your last message ({len(rows)} event{'s' if len(rows) != 1 else ''}):"
+    return "\n".join([header, *rows])
+
+
+def _build_dispatch_nudge_block(user_message: str) -> str | None:
+    if not _looks_like_task(user_message):
+        return None
+    return (
+        "[hermes-opencode] DISPATCH NUDGE — the user's message reads as a "
+        "task. Your first action MUST be `oc_spawn` (or `oc_send` to an "
+        "existing agent if this is clearly a follow-up to one named "
+        "above). Forward their exact words. Do NOT plan, analyze, or "
+        "ask the agent for a plan — opencode plans for itself. If you "
+        "genuinely cannot tell what they want, ask THEM ONE clarifying "
+        "question before dispatching."
+    )
+
+
+def _normalize_answer_token(text: str) -> str:
+    return " ".join((text or "").strip().lower().split())
+
+
+_YES_NO_TOKENS = frozenset({
+    "yes", "y", "yeah", "yep", "yup", "sure", "ok", "okay", "go",
+    "go ahead", "do it", "proceed", "ship it", "approved",
+    "no", "n", "nope", "nah", "skip", "cancel", "reject", "stop",
+    "abort",
+})
+
+
+def _build_answer_nudge_block(user_message: str) -> str | None:
+    text = _normalize_answer_token(user_message)
+    if not text or len(text) > 200:
+        return None
+    questions, _permissions = event_loop.get_pending_snapshot()
+    if not questions:
+        return None
+    matches: list[tuple[str, str, str]] = []
+    for agent_id, qs in questions.items():
+        for entry in qs:
+            qid = entry.get("id") or ""
+            inner = entry.get("questions") or []
+            for q in inner:
+                opts = q.get("options") or []
+                labels = [
+                    str(o.get("label") or "").strip()
+                    for o in opts if isinstance(o, dict)
+                ]
+                for label in labels:
+                    if not label:
+                        continue
+                    if text == label.lower() or text == label.lower().replace(" ", "-") or text == label.lower().replace("-", " "):
+                        matches.append((agent_id, qid, label))
+                        break
+    if not matches and len(questions) == 1 and text in _YES_NO_TOKENS:
+        first_agent = next(iter(questions))
+        first_entry = questions[first_agent][0]
+        qid = first_entry.get("id") or ""
+        matches.append((first_agent, qid, "(yes/no)"))
+    if not matches:
+        return None
+    if len(matches) > 1:
+        rows = [
+            "[hermes-opencode] ANSWER NUDGE — the user's reply matches "
+            "labels on multiple pending questions. Pick the one they "
+            "most plausibly meant and call oc_answer with that "
+            "question_id; do not answer them yourself:",
+        ]
+        for agent_id, qid, label in matches:
+            rows.append(f"  • agent={agent_id}  question_id={qid}  matched_label={label!r}")
+        return "\n".join(rows)
+    agent_id, qid, label = matches[0]
+    return (
+        f"[hermes-opencode] ANSWER NUDGE — the user's reply ({user_message.strip()!r}) "
+        f"matches option {label!r} of pending question_id={qid} (agent={agent_id}). "
+        f"Call oc_answer(question_id={qid!r}, answer=<verbatim user reply>) and do NOT "
+        f"respond to them yourself."
+    )
+
+
+def _build_pre_llm_context(session_id: str | None = None, user_message: str = "") -> str | None:
     if _runtime is None:
         return None
     blocks: list[str] = [_DISPATCHER_DIRECTIVE]
+    active = _build_active_agents_block()
+    if active:
+        blocks.append(active)
+    recent = _build_recent_events_block(session_id)
+    if recent:
+        blocks.append(recent)
+    dispatch = _build_dispatch_nudge_block(user_message)
+    if dispatch:
+        blocks.append(dispatch)
+    answer = _build_answer_nudge_block(user_message)
+    if answer:
+        blocks.append(answer)
     pending = _build_pending_items_block()
     if pending:
         blocks.append(pending)
     return "\n\n".join(blocks)
 
 
-def _pre_llm_call_hook(**_: Any) -> dict[str, Any] | None:
-    ctx = _build_pre_llm_context()
+def _pre_llm_call_hook(
+    session_id: str = "",
+    user_message: str = "",
+    **_: Any,
+) -> dict[str, Any] | None:
+    if not isinstance(session_id, str):
+        session_id = ""
+    if not isinstance(user_message, str):
+        user_message = ""
+    ctx = _build_pre_llm_context(session_id=session_id or None, user_message=user_message)
     if ctx:
         return {"context": ctx}
     return None

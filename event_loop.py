@@ -114,6 +114,7 @@ _EVENT_GLYPH = {
     "awaiting_human_resumed": "▶",
     "needs_intervention": "🛟",
     "phase_stuck": "🐌",
+    "progress_narration": "💭",
 }
 
 
@@ -198,6 +199,8 @@ def _default_event_body(agent: "Agent", kind: str) -> str:
             f"{agent.last_error or '(no detail)'}. Inspect with `oc_get` or "
             f"kick with `oc_retry {agent.agent_id}`."
         )
+    if kind == "progress_narration":
+        return f"Agent {agent.agent_id} is working in phase={agent.phase}."
     return f"{kind} for {agent.agent_id}"
 
 
@@ -471,6 +474,12 @@ _sse_message_roles: dict[str, dict[str, str]] = {}
 _sse_session_status: dict[str, dict] = {}
 _sse_buffer_lock = threading.Lock()
 
+# Per-agent {agent_id: snippet} dedupe map for the progress-narration loop.
+# Snippet is the first N chars of the latest SSE buffer; only fires a
+# notification when it differs from the last fired snippet, so a slow
+# executor doesn't spam the user with identical "still working" pings.
+_last_narrated_snippets: dict[str, str] = {}
+
 
 def apply_delta(buffers: dict[str, str], part_id: str, delta: str) -> dict[str, str]:
     buffers[part_id] = buffers.get(part_id, "") + delta
@@ -678,6 +687,7 @@ async def _supervisor() -> None:
     watchdog = asyncio.create_task(_serve_watchdog_loop())
     awaiting_reminder = asyncio.create_task(_awaiting_input_reminder_loop())
     stuck_watchdog = asyncio.create_task(_phase_stuck_loop())
+    narration = asyncio.create_task(_progress_narration_loop())
     try:
         while not _stop_flag.is_set():
             if _runtime is not None:
@@ -686,7 +696,7 @@ async def _supervisor() -> None:
                         await _ensure_agent_task_async(agent.agent_id)
             await asyncio.sleep(2.0)
     finally:
-        for t in (pruner, heartbeat, cleanup, watchdog, awaiting_reminder, stuck_watchdog):
+        for t in (pruner, heartbeat, cleanup, watchdog, awaiting_reminder, stuck_watchdog, narration):
             t.cancel()
             try:
                 await t
@@ -1202,6 +1212,83 @@ def _enter_needs_intervention(agent: Agent, reason: str, body: str) -> None:
 
 async def _phase_needs_intervention(agent: Agent) -> None:
     await asyncio.sleep(30.0)
+
+
+def tail_recent_events(since_ts: float, limit: int = 50) -> list[dict]:
+    import json as _json
+    if _runtime is None:
+        return []
+    path = _runtime.config.events_log
+    if not path.exists():
+        return []
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        return []
+    out: list[dict] = []
+    for line in lines[-max(limit * 4, 200):]:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = _json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        try:
+            ts = float(row.get("ts") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if ts <= since_ts:
+            continue
+        out.append(row)
+    return out[-limit:]
+
+
+def _build_narration_snippet(agent_id: str, max_chars: int) -> str:
+    buffer = get_text_buffer(agent_id)
+    if not buffer:
+        return ""
+    text = "\n".join(buffer[k] for k in sorted(buffer.keys()) if isinstance(buffer[k], str))
+    text = text.strip()
+    if not text:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    return text[-max_chars:].lstrip()
+
+
+async def _progress_narration_loop() -> None:
+    while not _stop_flag.is_set():
+        try:
+            if _runtime is None or not _runtime.config.progress_narration_enabled:
+                await asyncio.sleep(_runtime.config.progress_narration_interval_sec if _runtime else 60.0)
+                continue
+            cfg = _runtime.config
+            skip = TERMINAL_PHASES | {
+                "AWAITING_HUMAN", "NEEDS_INTERVENTION", "RATE_LIMITED",
+                "QUEUED", "PR_OPEN", "CREATED",
+            }
+            for a in _runtime.agents.list():
+                if a.phase in skip:
+                    continue
+                snippet = _build_narration_snippet(a.agent_id, cfg.progress_narration_snippet_chars)
+                if not snippet:
+                    continue
+                prev = _last_narrated_snippets.get(a.agent_id, "")
+                if snippet == prev:
+                    continue
+                _last_narrated_snippets[a.agent_id] = snippet
+                body = (
+                    f"phase={a.phase}. Recent text:\n"
+                    f"---\n{snippet}\n---\n"
+                    f"Use `oc_output {a.agent_id}` for the full message."
+                )
+                _notify_event(a, "progress_narration", body)
+        except Exception as e:
+            logger.debug("progress-narration loop iteration failed: %s", e)
+        interval = _runtime.config.progress_narration_interval_sec if _runtime else 300.0
+        await asyncio.sleep(max(30.0, interval))
 
 
 async def _phase_stuck_loop() -> None:

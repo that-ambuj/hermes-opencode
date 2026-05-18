@@ -594,6 +594,91 @@ shape. After strike 3 the agent is escalated to `FAILED` with
 - When escalating to `FAILED` directly (truly unrecoverable, e.g. `project gone`): stamp `phase_before_failed=<agent.phase>` so operators have the option to `oc_retry` if circumstances change.
 - Add new transitional phases to `STUCK_WATCHED_PHASES` so the watchdog catches stalls.
 
+## Pre-LLM context architecture (LOAD-BEARING, v0.19.0+)
+
+The hermes chat LLM receives a five-block context appended to every
+user message via the `pre_llm_call` hook (registered in
+`__init__.py::register`). The context is appended to the USER
+message, never the system prompt, so the system prompt stays
+identical across turns and Anthropic / OpenAI prompt-cache prefixes
+keep hitting. All blocks are suppressed when they have nothing to
+say, so the cost is zero on quiet turns.
+
+Block order matters: directives FIRST so they aren't buried under
+state noise. Per `_build_pre_llm_context(session_id, user_message)`:
+
+1. `_DISPATCHER_DIRECTIVE` (always).
+2. `_build_active_agents_block()` - one line per non-terminal agent
+   with phase, session_status (idle/busy/retry from
+   `_sse_session_status`), `in_phase_for`, optional pr_url, plus a
+   220-char tail of the SSE text buffer when available.
+3. `_build_recent_events_block(session_id)` - tail of `events.log`
+   filtered to entries newer than `_session_watermarks[session_id]`.
+   First call per session seeds the watermark to now (so a fresh
+   chat doesn't get blasted with backlog); subsequent calls advance
+   it past the latest event.
+4. `_build_dispatch_nudge_block(user_message)` - when
+   `_looks_like_task(user_message)` returns True (imperative verb,
+   not ending in `?`, under 4000 chars).
+5. `_build_answer_nudge_block(user_message)` - when the user's
+   reply matches an option label of any pending /question (case-
+   insensitive, plus a yes/no token shortcut when exactly one
+   question is pending).
+6. `_build_pending_items_block()` - the v0.14.3+ pending-question
+   + permission catalog (unchanged from v0.18.0).
+
+### When adding new context blocks
+
+- Keep them OPTIONAL (return None on the no-op case) - silence is
+  the default; cost-on-quiet-turn is the invariant.
+- Add a corresponding `_build_<thing>_block()` helper in
+  `__init__.py`. Do NOT inline new blocks in `_build_pre_llm_context`.
+- Update the block order list above when inserting.
+- Tests live in `tests/test_pure_logic.py` next to the existing
+  block tests (`TestActiveAgentsBlock`, `TestRecentEventsBlock`,
+  `TestAnswerNudge`).
+- Be defensive against test sentinels: helpers must tolerate
+  `_runtime = object()` (the v0.14.3 tests use this pattern). Use
+  `hasattr` / `getattr(..., None)` guards before accessing
+  `_runtime.agents` / `_runtime.config`.
+
+### Watermark mechanics
+
+`_session_watermarks: dict[hermes_session_id, last_ts]` is in-memory
+(not persisted). On hermes restart all sessions start fresh and skip
+backlog. This is intentional: a multi-hour gap shouldn't dump a wall
+of historical events into the next turn.
+
+`event_loop.tail_recent_events(since_ts, limit)` reads the tail of
+`Config.events_log` (the JSONL written by `_notify_event` itself),
+NOT `notifications.jsonl` (the dashboard sink). events_log has
+structured `{ts, kind, agent_id, project, phase, pr_url, title,
+body}` rows so the context builder can filter and format without
+re-parsing.
+
+## Progress narration loop (v0.19.0+)
+
+Optional sibling of the stuck-watchdog. Off by default; enable via
+`plugins.entries.hermes-opencode.progress_narration.enabled: true`.
+
+`_progress_narration_loop` runs every
+`Config.progress_narration_interval_sec` (default 300s) inside the
+supervisor's task group. For each non-terminal agent NOT in
+`{AWAITING_HUMAN, NEEDS_INTERVENTION, RATE_LIMITED, QUEUED, PR_OPEN,
+CREATED}`, computes `_build_narration_snippet(agent_id,
+snippet_chars)` from the SSE text buffer. If the snippet differs
+from `_last_narrated_snippets[agent_id]`, fires the
+`progress_narration` event via `_notify_event`.
+
+Dedupe is intentional: a stalled / paused executor won't spam
+identical "still writing the auth handler" pings every 5 min. Each
+distinct snippet fires exactly once.
+
+When adding new agent phases, decide whether they should be in the
+narration skip-list (long-running blocked / terminal phases) or
+narrated (transitional / working phases). Conservative default: skip
+unless you're sure mid-phase narration adds value.
+
 ## CANCELLED vs KILLED (LOAD-BEARING)
 
 Two terminal phases mean different things:

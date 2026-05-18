@@ -125,7 +125,7 @@ class Config:
     notify_gateway_platform: str | None = None
     notify_gateway_chat_id: str | None = None
     notify_discovery_source: str | None = None
-    notify_events: set[str] = field(default_factory=lambda: {"pr_opened", "done", "failed", "awaiting_human", "awaiting_human_resumed", "review_started", "cancelled", "tick_error", "aborted", "rate_limited", "rate_limit_cleared", "queued", "queue_drained", "needs_intervention", "phase_stuck"})
+    notify_events: set[str] = field(default_factory=lambda: {"pr_opened", "done", "failed", "awaiting_human", "awaiting_human_resumed", "review_started", "cancelled", "tick_error", "aborted", "rate_limited", "rate_limit_cleared", "queued", "queue_drained", "needs_intervention", "phase_stuck", "progress_narration"})
     events_log: Path = field(default_factory=lambda: plugin_state_dir() / "events.log")
     heartbeat_enabled: bool = True
     heartbeat_timezone: str | None = None
@@ -140,6 +140,9 @@ class Config:
     classifier_timeout_sec: float = 8.0
     awaiting_input_stall_timeout_sec: float = 300.0
     awaiting_input_reminder_interval_sec: float = 1800.0
+    progress_narration_enabled: bool = False
+    progress_narration_interval_sec: float = 300.0
+    progress_narration_snippet_chars: int = 280
 
     @classmethod
     def from_plugin_entry(cls, entry: dict | None) -> "Config":
@@ -152,8 +155,9 @@ class Config:
         heartbeat = entry.get("heartbeat") or {}
         classifier = entry.get("classifier") or {}
         awaiting = entry.get("awaiting_input") or {}
+        narration = entry.get("progress_narration") or {}
         day_window = heartbeat.get("unconditional_hours", [9, 23])
-        default_events = {"pr_opened", "done", "failed", "awaiting_human", "awaiting_human_resumed", "review_started", "cancelled", "tick_error", "aborted", "rate_limited", "rate_limit_cleared", "queued", "queue_drained"}
+        default_events = {"pr_opened", "done", "failed", "awaiting_human", "awaiting_human_resumed", "review_started", "cancelled", "tick_error", "aborted", "rate_limited", "rate_limit_cleared", "queued", "queue_drained", "needs_intervention", "phase_stuck", "progress_narration"}
 
         platform = gateway.get("platform")
         explicit_chat_id = gateway.get("chat_id")
@@ -202,6 +206,9 @@ class Config:
             classifier_timeout_sec=float(classifier.get("timeout_sec", 8.0)),
             awaiting_input_stall_timeout_sec=float(awaiting.get("stall_timeout_sec", 300.0)),
             awaiting_input_reminder_interval_sec=float(awaiting.get("reminder_interval_sec", 1800.0)),
+            progress_narration_enabled=bool(narration.get("enabled", False)),
+            progress_narration_interval_sec=float(narration.get("interval_sec", 300.0)),
+            progress_narration_snippet_chars=int(narration.get("snippet_chars", 280)),
         )
 
     @property

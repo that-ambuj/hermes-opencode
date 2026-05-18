@@ -5,6 +5,93 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.0] - 2026-05-19
+
+Hermes chat UX: proactive dispatch + natural progress narration.
+
+Previously the Hermes chat LLM saw a single static "DISPATCHER MODE"
+directive and a list of pending /question entries. It could not see
+which agents existed, what they were doing, what events fired between
+turns, or whether the user's latest message was a task it should
+dispatch. The user had to ask "what's going on?" to surface progress.
+
+v0.19.0 rewrites the `pre_llm_call` context to be reactive to both
+user intent and agent state. The system prompt stays untouched
+(preserves prompt cache); all new context is appended to the user
+message and is ephemeral.
+
+### Tier 1 - Proactive dispatch
+
+- `_DISPATCHER_DIRECTIVE` rewritten with imperative MANDATORY RULES
+  framing, numbered routing rules (new task -> oc_spawn, follow-up ->
+  oc_send, status -> oc_status/oc_output, stuck -> oc_retry), and an
+  explicit "tool call before prose" rule.
+- New `_looks_like_task()` task-verb detector + `DISPATCH NUDGE`
+  block injected when the user's current message starts with an
+  imperative verb (build, fix, implement, add, create, change,
+  refactor, write, migrate, port, ship, ... 30+ verbs). Suppressed
+  when the message ends in `?` or exceeds 4000 chars.
+- Tool descriptions for `oc_spawn`, `oc_send`, `oc_status`,
+  `oc_output`, `oc_answer`, `oc_retry` gained a "WHEN TO USE" lead
+  sentence that maps user-message surface forms to the right tool.
+
+### Tier 2 - Natural progress narration (proactive, no polling)
+
+- New `Active agents` context block: every chat turn lists every
+  non-terminal agent with `phase`, `session_status` (idle/busy/retry
+  from the opencode SSE feed), `in_phase_for`, `pr_url`, and a 220-
+  char tail snippet of the executor's latest assistant text pulled
+  from the live SSE buffer. The LLM now narrates progress without
+  the user asking.
+- New `Since your last message` context block: per-hermes-session
+  watermarks (`_session_watermarks`) track the last-seen event ts;
+  every turn surfaces events that fired between turns via the new
+  `event_loop.tail_recent_events(since_ts, limit)` helper that reads
+  `events.log`. First-call seeds the watermark so a fresh session
+  doesn't dump backlog.
+- `oc_status` detailed response now includes
+  `session_status` (from SSE), `last_assistant_text_snippet` (280
+  chars from the SSE buffer), `last_classifier` (awaiting / source /
+  reason), `phase_entered_at`, and `idle_since`.
+
+### Tier 3 - Optional polish
+
+- New `progress_narration` notification kind (off by default; enable
+  via `plugins.entries.hermes-opencode.progress_narration.enabled`).
+  `_progress_narration_loop` runs every `interval_sec` (default 5
+  min), fires the event for non-terminal non-blocked agents whose
+  SSE buffer changed since the last fire (dedupe via
+  `_last_narrated_snippets`). In gateway mode this becomes
+  unprompted DM-style progress pings.
+- New `ANSWER NUDGE` block: when the user's reply token-matches an
+  option label of any pending /question (or matches a yes/no token
+  when exactly one question is pending), the context now tells the
+  LLM "this is an answer to question_id=Q, call oc_answer" instead
+  of the LLM answering them itself.
+
+### Config additions
+
+- `Config.progress_narration_enabled: bool = False`
+- `Config.progress_narration_interval_sec: float = 300.0`
+- `Config.progress_narration_snippet_chars: int = 280`
+- `Config.notify_events` default now includes `progress_narration`,
+  `needs_intervention`, `phase_stuck` (the v0.18.0 kinds were already
+  in the dataclass default but the `from_plugin_entry` default-set
+  was stale).
+
+### Public surface
+
+- `event_loop.tail_recent_events(since_ts: float, limit: int = 50)`
+- `event_loop._build_narration_snippet(agent_id, max_chars)`
+- `_build_active_agents_block`, `_build_recent_events_block`,
+  `_build_dispatch_nudge_block`, `_build_answer_nudge_block`,
+  `_looks_like_task`, `_session_watermarks` (in `__init__.py`)
+- `_pre_llm_call_hook` signature now accepts `session_id` and
+  `user_message` kwargs (back-compat: defaults preserve old
+  behaviour).
+
+26 new tests; 402 -> 428 total.
+
 ## [0.18.0] - 2026-05-19
 
 Five-tier resilience overhaul. Six of the nine hard `FAILED`

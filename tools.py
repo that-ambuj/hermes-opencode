@@ -160,6 +160,13 @@ PROJECT_SET_REPO_PATH_SCHEMA: dict[str, Any] = {
 SPAWN_SCHEMA: dict[str, Any] = {
     "name": "oc_spawn",
     "description": (
+        "WHEN TO USE: The human said anything that sounds like a coding "
+        "task — build, fix, implement, add, change, refactor, write, "
+        "create, ship, port, migrate, hook up, wire, debug, investigate "
+        "(when followed by a fix request), and similar verbs aimed at "
+        "code. Call this IMMEDIATELY. Do NOT plan, analyze, or 'think "
+        "through' the task first. Opencode does that.\n"
+        "\n"
         "Create a git worktree on a new branch, start an opencode session "
         "bound to it, and forward the human's task to opencode VERBATIM. "
         "Returns the agent_id (format: <abbrev>/<task>, max 20 chars) and "
@@ -270,6 +277,13 @@ RESUME_PR_SCHEMA: dict[str, Any] = {
 SEND_SCHEMA: dict[str, Any] = {
     "name": "oc_send",
     "description": (
+        "WHEN TO USE: The human is sending a follow-up to an existing "
+        "agent — addressing review feedback, course-correcting mid-task, "
+        "answering a clarification the agent asked in prose, or adding "
+        "scope. If the message is an answer to a tracked /question (the "
+        "pre_llm_call context will list its question_id) use oc_answer "
+        "instead.\n"
+        "\n"
         "Send a follow-up message to a live agent's opencode session. Text "
         "is forwarded VERBATIM, queued asynchronously on the agent's session, "
         "and the tool returns immediately. The agent's reply does NOT come "
@@ -306,7 +320,21 @@ SEND_SCHEMA: dict[str, Any] = {
 
 STATUS_SCHEMA: dict[str, Any] = {
     "name": "oc_status",
-    "description": "Show one agent's full status (phase, branch, session_id, pending questions/permissions, pr_url) or a summary table of all tracked agents when agent_id is omitted.",
+    "description": (
+        "WHEN TO USE: The human asks 'what's happening', 'how is it "
+        "going', 'progress', 'status', 'are you done', 'still working', "
+        "or any other check-in on running work — OR you need a quick "
+        "ground-truth read of agent state before deciding the next "
+        "action. Call this proactively when answering open-ended "
+        "questions about ongoing tasks; the pre_llm_call context only "
+        "carries a summary.\n"
+        "\n"
+        "Returns one agent's full status (phase, branch, session_id, "
+        "pending questions/permissions, pr_url, session_status from the "
+        "opencode SSE stream, last_assistant_text_snippet, classifier "
+        "verdict) or a summary table of all tracked agents when "
+        "agent_id is omitted."
+    ),
     "parameters": {
         "type": "object",
         "additionalProperties": False,
@@ -365,6 +393,12 @@ CANCEL_SCHEMA: dict[str, Any] = {
 RETRY_SCHEMA: dict[str, Any] = {
     "name": "oc_retry",
     "description": (
+        "WHEN TO USE: An agent is FAILED, NEEDS_INTERVENTION, or just "
+        "stuck (phase_stuck notification fired, or the human says "
+        "'retry', 'kick it', 'resume', 'try again', 'restart that'). "
+        "Also use after a gateway restart when an agent should be "
+        "force-re-ticked. Refuses on truly terminal phases.\n"
+        "\n"
         "Kick an agent to retry its current phase. Three modes:\n"
         "\n"
         "1. FAILED agent: restores `phase_before_failed`, clears retry counts "
@@ -810,8 +844,25 @@ async def _detailed_status(rt: Runtime, agent: Agent) -> dict[str, Any]:
         "done_at": agent.done_at,
         "created_at": agent.created_at,
         "last_activity_at": agent.last_activity_at,
+        "phase_entered_at": agent.phase_entered_at,
+        "idle_since": agent.idle_since,
         "last_error": agent.last_error,
     }
+    session_status = event_loop.get_session_status(agent.agent_id)
+    if session_status is not None:
+        detail["session_status"] = session_status.get("type")
+    buffer = event_loop.get_text_buffer(agent.agent_id)
+    if buffer:
+        joined = "\n".join(buffer[k] for k in sorted(buffer.keys()) if isinstance(buffer[k], str)).strip()
+        if joined:
+            snippet = joined if len(joined) <= 280 else joined[-280:].lstrip()
+            detail["last_assistant_text_snippet"] = snippet
+    if agent.last_classifier_verdict:
+        detail["last_classifier"] = {
+            "awaiting": agent.last_classifier_verdict.get("awaiting"),
+            "source": agent.last_classifier_verdict.get("source"),
+            "reason": agent.last_classifier_verdict.get("reason"),
+        }
     try:
         questions = await rt.client.list_questions(worktree_path)
         permissions = await rt.client.list_permissions(worktree_path)
@@ -1019,7 +1070,19 @@ def make_retry(rt: Runtime) -> Callable[..., Awaitable[str]]:
 
 ANSWER_SCHEMA: dict[str, Any] = {
     "name": "oc_answer",
-    "description": "Reply to (or reject) a pending opencode question raised by an agent. The user's reply text is forwarded VERBATIM to opencode. Use this when the pre_llm_call context surfaces a pending question_id and the user's message looks like a reply to it.",
+    "description": (
+        "WHEN TO USE: The pre_llm_call context surfaces a pending "
+        "question_id AND the human's current message reads like a reply "
+        "to it (matches a listed option label, says 'yes/no', picks one "
+        "of the choices in prose, or otherwise resolves the question). "
+        "Forward the user's reply via this tool instead of answering them "
+        "yourself. The plugin already nudges you when an answer is "
+        "likely; obey the nudge.\n"
+        "\n"
+        "Replies to (or rejects) a pending opencode question raised by "
+        "an agent. The user's reply text is forwarded VERBATIM. Pass "
+        "`reject=true` to dismiss the question without answering."
+    ),
     "parameters": {
         "type": "object",
         "additionalProperties": False,
@@ -1123,7 +1186,20 @@ SET_NOTIFY_TARGET_SCHEMA: dict[str, Any] = {
 
 OUTPUT_SCHEMA: dict[str, Any] = {
     "name": "oc_output",
-    "description": "Return the latest assistant text for an agent. Prefers the live SSE delta/snapshot buffer (populated by the background consumer) and falls back to a /message pull from opencode when the buffer is empty. Set clear=true to reset the buffer after reading (only meaningful when source=='sse').",
+    "description": (
+        "WHEN TO USE: The human asks 'what did it say', 'show me what "
+        "it wrote', 'what is it thinking', 'paste the last message', or "
+        "you need to inspect the executor's actual assistant text "
+        "(not just its phase). Use after oc_status when the user wants "
+        "more than a one-line status — this returns the full latest "
+        "assistant turn.\n"
+        "\n"
+        "Returns the latest assistant text for an agent. Prefers the "
+        "live SSE delta/snapshot buffer (populated by the background "
+        "consumer) and falls back to a /message pull from opencode when "
+        "the buffer is empty. Set clear=true to reset the buffer after "
+        "reading (only meaningful when source=='sse')."
+    ),
     "parameters": {
         "type": "object",
         "additionalProperties": False,

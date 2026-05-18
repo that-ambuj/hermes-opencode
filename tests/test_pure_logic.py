@@ -982,9 +982,8 @@ class TestPreLlmCallHookDispatcherDirective:
         assert "FULL authority" in ctx
         assert "VERBATIM" in ctx
         assert "Do NOT plan" in ctx
-        assert "ASK THE HUMAN" in ctx
+        assert "ask THEM" in ctx
         assert "pending items" not in ctx
-        # hook wraps context in {"context": ...}
         assert plugin_mod._pre_llm_call_hook() == {"context": ctx}
 
     def test_runtime_set_with_pending_directive_precedes_pending(self):
@@ -3488,3 +3487,375 @@ class TestLoadEntryConfigReadsUserYaml:
         assert keys_arg == ("plugins", "entries", "hermes-opencode"), (
             f"path keys must be POSITIONAL; got: {keys_arg}"
         )
+
+
+class TestLooksLikeTask:
+    def test_imperative_verbs_match(self):
+        for msg in [
+            "build a login page",
+            "Fix the failing test in user.py",
+            "implement JWT auth",
+            "add a dark-mode toggle",
+            "refactor the cart module",
+            "please write a helper for date parsing",
+            "can you create a new endpoint",
+            "could you change the default port",
+            "let's wire up the metrics",
+            "set up the CI pipeline",
+        ]:
+            assert plugin_mod._looks_like_task(msg), msg
+
+    def test_questions_suppress(self):
+        for msg in [
+            "did you build it?",
+            "should I add a cache?",
+            "can you fix the bug?",
+        ]:
+            assert not plugin_mod._looks_like_task(msg), msg
+
+    def test_non_task_chat_does_not_match(self):
+        for msg in [
+            "thanks!",
+            "hello",
+            "what's happening",
+            "tell me about the codebase",
+            "how is it going",
+            "",
+            "   ",
+        ]:
+            assert not plugin_mod._looks_like_task(msg), msg
+
+    def test_oversized_message_suppressed(self):
+        msg = "build a thing\n" + ("x" * 5000)
+        assert not plugin_mod._looks_like_task(msg)
+
+
+class TestDispatchNudge:
+    def test_present_when_task_detected(self):
+        assert plugin_mod._build_dispatch_nudge_block("fix the auth bug") is not None
+
+    def test_absent_for_non_task(self):
+        assert plugin_mod._build_dispatch_nudge_block("how's the weather") is None
+        assert plugin_mod._build_dispatch_nudge_block("") is None
+
+
+class TestActiveAgentsBlock:
+    def setup_method(self):
+        self._saved_runtime = plugin_mod._runtime
+        self._saved_status = event_loop_mod.get_session_status
+        self._saved_buffer = event_loop_mod.get_text_buffer
+
+    def teardown_method(self):
+        plugin_mod._runtime = self._saved_runtime
+        event_loop_mod.get_session_status = self._saved_status
+        event_loop_mod.get_text_buffer = self._saved_buffer
+
+    def _make_runtime(self, agents):
+        class _Store:
+            def list(self_inner):
+                return agents
+        class _RT:
+            pass
+        rt = _RT()
+        rt.agents = _Store()
+        return rt
+
+    def _agent(self, agent_id="a/x", phase="EXECUTING"):
+        return state_mod.Agent(
+            agent_id=agent_id, project_label="p", worktree_path="/tmp/wt",
+            session_id="sess1", branch="br", initial_prompt="hi",
+            phase=phase,
+        )
+
+    def test_none_when_no_active(self):
+        plugin_mod._runtime = self._make_runtime([self._agent(phase="DONE")])
+        event_loop_mod.get_session_status = lambda _a: None
+        event_loop_mod.get_text_buffer = lambda _a: {}
+        assert plugin_mod._build_active_agents_block() is None
+
+    def test_lists_active_with_snippet_and_session_status(self):
+        a = self._agent(agent_id="oco/fix-x", phase="EXECUTING")
+        plugin_mod._runtime = self._make_runtime([a])
+        event_loop_mod.get_session_status = lambda _a: {"type": "busy"}
+        event_loop_mod.get_text_buffer = lambda _a: {"p1": "I'm working on the login flow."}
+        block = plugin_mod._build_active_agents_block()
+        assert block is not None
+        assert "oco/fix-x" in block
+        assert "phase=EXECUTING" in block
+        assert "session=busy" in block
+        assert "I'm working on the login flow." in block
+
+    def test_skips_terminal_phases(self):
+        agents = [
+            self._agent(agent_id="a/done", phase="DONE"),
+            self._agent(agent_id="a/killed", phase="KILLED"),
+            self._agent(agent_id="a/failed", phase="FAILED"),
+            self._agent(agent_id="a/live", phase="REVIEWING"),
+        ]
+        plugin_mod._runtime = self._make_runtime(agents)
+        event_loop_mod.get_session_status = lambda _a: None
+        event_loop_mod.get_text_buffer = lambda _a: {}
+        block = plugin_mod._build_active_agents_block()
+        assert block is not None
+        assert "a/live" in block
+        for skip in ("a/done", "a/killed", "a/failed"):
+            assert skip not in block
+
+    def test_long_snippet_truncated(self):
+        a = self._agent(agent_id="oco/fix-x", phase="EXECUTING")
+        plugin_mod._runtime = self._make_runtime([a])
+        event_loop_mod.get_session_status = lambda _a: None
+        event_loop_mod.get_text_buffer = lambda _a: {"p1": "x" * 1000}
+        block = plugin_mod._build_active_agents_block()
+        assert block is not None
+        snippet_lines = [ln for ln in block.splitlines() if "latest:" in ln]
+        assert snippet_lines
+        assert len(snippet_lines[0]) < 400
+
+
+class TestRecentEventsBlock:
+    def setup_method(self):
+        self._saved_runtime = plugin_mod._runtime
+        self._saved_tail = event_loop_mod.tail_recent_events
+        plugin_mod._session_watermarks.clear()
+
+    def teardown_method(self):
+        plugin_mod._runtime = self._saved_runtime
+        event_loop_mod.tail_recent_events = self._saved_tail
+        plugin_mod._session_watermarks.clear()
+
+    def test_returns_none_without_session_id(self):
+        plugin_mod._runtime = object()
+        assert plugin_mod._build_recent_events_block(None) is None
+        assert plugin_mod._build_recent_events_block("") is None
+
+    def test_first_call_seeds_watermark_no_block(self):
+        class _RT: ...
+        rt = _RT()
+        rt.config = object()
+        plugin_mod._runtime = rt
+        event_loop_mod.tail_recent_events = lambda **kw: []
+        sid = "ses_test_first"
+        assert plugin_mod._build_recent_events_block(sid) is None
+        assert sid in plugin_mod._session_watermarks
+
+    def test_returns_block_after_seeded_with_events(self):
+        class _RT: ...
+        rt = _RT()
+        rt.config = object()
+        plugin_mod._runtime = rt
+        sid = "ses_test_events"
+        plugin_mod._session_watermarks[sid] = time.time() - 60
+        events = [
+            {"ts": time.time() - 30, "kind": "pr_opened", "agent_id": "oco/x",
+             "body": "PR opened for branch `x`: https://github.com/o/r/pull/1"},
+            {"ts": time.time() - 10, "kind": "done", "agent_id": "oco/y",
+             "body": "PR merged. Branch `y`. Worktree cleaned up."},
+        ]
+        event_loop_mod.tail_recent_events = lambda **kw: events
+        block = plugin_mod._build_recent_events_block(sid)
+        assert block is not None
+        assert "Since your last message" in block
+        assert "oco/x pr_opened" in block
+        assert "oco/y done" in block
+        assert plugin_mod._session_watermarks[sid] >= events[-1]["ts"]
+
+
+class TestAnswerNudge:
+    def setup_method(self):
+        self._saved_runtime = plugin_mod._runtime
+        self._saved_snapshot = event_loop_mod.get_pending_snapshot
+
+    def teardown_method(self):
+        plugin_mod._runtime = self._saved_runtime
+        event_loop_mod.get_pending_snapshot = self._saved_snapshot
+
+    def test_no_pending_no_nudge(self):
+        event_loop_mod.get_pending_snapshot = lambda: ({}, {})
+        assert plugin_mod._build_answer_nudge_block("yes") is None
+
+    def test_exact_label_match_fires_nudge(self):
+        event_loop_mod.get_pending_snapshot = lambda: (
+            {"oco/x": [{"id": "q1", "questions": [
+                {"question": "A or B?", "options": [
+                    {"label": "option-a", "description": "first"},
+                    {"label": "option-b", "description": "second"},
+                ]},
+            ]}]},
+            {},
+        )
+        block = plugin_mod._build_answer_nudge_block("option-a")
+        assert block is not None
+        assert "ANSWER NUDGE" in block
+        assert "q1" in block
+        assert "oc_answer" in block
+
+    def test_yes_no_with_single_pending_question(self):
+        event_loop_mod.get_pending_snapshot = lambda: (
+            {"oco/x": [{"id": "q1", "questions": [
+                {"question": "Proceed?", "options": [
+                    {"label": "yes", "description": ""},
+                    {"label": "no", "description": ""},
+                ]},
+            ]}]},
+            {},
+        )
+        block = plugin_mod._build_answer_nudge_block("yeah")
+        assert block is not None
+        assert "q1" in block
+
+    def test_unrelated_chatter_does_not_match(self):
+        event_loop_mod.get_pending_snapshot = lambda: (
+            {"oco/x": [{"id": "q1", "questions": [
+                {"question": "A or B?", "options": [
+                    {"label": "alpha", "description": "first"},
+                    {"label": "beta", "description": "second"},
+                ]},
+            ]}]},
+            {},
+        )
+        assert plugin_mod._build_answer_nudge_block("how's the weather") is None
+
+
+class TestTailRecentEvents:
+    def test_filters_by_since_ts(self, tmp_path):
+        import json as _json
+        cfg = config_mod.Config(
+            host="127.0.0.1", port=4096,
+            worktrees_root=tmp_path / "wt",
+            agents_file=tmp_path / "agents.json",
+            projects_file=tmp_path / "projects.json",
+            logs_dir=tmp_path / "logs",
+            notifications_file=tmp_path / "notifications.jsonl",
+            events_log=tmp_path / "events.log",
+        )
+        class _RT: ...
+        rt = _RT()
+        rt.config = cfg
+        cfg.events_log.parent.mkdir(parents=True, exist_ok=True)
+        rows = [
+            {"ts": 1000.0, "kind": "pr_opened", "agent_id": "a/1", "body": "first"},
+            {"ts": 2000.0, "kind": "done", "agent_id": "a/1", "body": "second"},
+            {"ts": 3000.0, "kind": "failed", "agent_id": "a/2", "body": "third"},
+        ]
+        with cfg.events_log.open("w", encoding="utf-8") as f:
+            for r in rows:
+                f.write(_json.dumps(r) + "\n")
+        prev_rt = event_loop_mod._runtime
+        event_loop_mod._runtime = rt
+        try:
+            out = event_loop_mod.tail_recent_events(since_ts=1500.0)
+            assert [r["kind"] for r in out] == ["done", "failed"]
+            out2 = event_loop_mod.tail_recent_events(since_ts=2999.0)
+            assert [r["kind"] for r in out2] == ["failed"]
+            out3 = event_loop_mod.tail_recent_events(since_ts=9999.0)
+            assert out3 == []
+        finally:
+            event_loop_mod._runtime = prev_rt
+
+    def test_missing_file_returns_empty(self, tmp_path):
+        cfg = config_mod.Config(
+            host="127.0.0.1", port=4096,
+            worktrees_root=tmp_path / "wt",
+            agents_file=tmp_path / "agents.json",
+            projects_file=tmp_path / "projects.json",
+            logs_dir=tmp_path / "logs",
+            notifications_file=tmp_path / "notifications.jsonl",
+            events_log=tmp_path / "does-not-exist.log",
+        )
+        class _RT: ...
+        rt = _RT()
+        rt.config = cfg
+        prev_rt = event_loop_mod._runtime
+        event_loop_mod._runtime = rt
+        try:
+            assert event_loop_mod.tail_recent_events(since_ts=0.0) == []
+        finally:
+            event_loop_mod._runtime = prev_rt
+
+
+class TestProgressNarrationConfig:
+    def test_defaults_off(self):
+        cfg = config_mod.Config()
+        assert cfg.progress_narration_enabled is False
+        assert cfg.progress_narration_interval_sec == 300.0
+        assert cfg.progress_narration_snippet_chars == 280
+
+    def test_enabled_via_yaml_entry(self):
+        cfg = config_mod.Config.from_plugin_entry({
+            "progress_narration": {
+                "enabled": True,
+                "interval_sec": 120,
+                "snippet_chars": 500,
+            }
+        })
+        assert cfg.progress_narration_enabled is True
+        assert cfg.progress_narration_interval_sec == 120.0
+        assert cfg.progress_narration_snippet_chars == 500
+
+    def test_event_kind_in_default_notify_events(self):
+        cfg = config_mod.Config()
+        assert "progress_narration" in cfg.notify_events
+        cfg2 = config_mod.Config.from_plugin_entry({})
+        assert "progress_narration" in cfg2.notify_events
+
+
+class TestNarrationSnippetDedupe:
+    def test_same_buffer_yields_same_snippet(self):
+        event_loop_mod._sse_text_buffers["agent1"] = {"p1": "hello world"}
+        s1 = event_loop_mod._build_narration_snippet("agent1", 280)
+        s2 = event_loop_mod._build_narration_snippet("agent1", 280)
+        assert s1 == s2 == "hello world"
+        event_loop_mod._sse_text_buffers.pop("agent1", None)
+
+    def test_returns_empty_when_no_buffer(self):
+        event_loop_mod._sse_text_buffers.pop("ghost", None)
+        assert event_loop_mod._build_narration_snippet("ghost", 280) == ""
+
+    def test_long_buffer_truncated_to_tail(self):
+        event_loop_mod._sse_text_buffers["agent1"] = {"p1": "x" * 1000}
+        s = event_loop_mod._build_narration_snippet("agent1", 100)
+        assert len(s) <= 100
+        event_loop_mod._sse_text_buffers.pop("agent1", None)
+
+
+class TestStatusToolEnrichment:
+    def setup_method(self):
+        self._saved_status = event_loop_mod.get_session_status
+        self._saved_buffer = event_loop_mod.get_text_buffer
+
+    def teardown_method(self):
+        event_loop_mod.get_session_status = self._saved_status
+        event_loop_mod.get_text_buffer = self._saved_buffer
+
+    def test_detailed_status_includes_snippet_and_session_status(self, tmp_path):
+        import asyncio as _aio
+        import json as _json
+        tools_mod = sys.modules["_oco_test_pkg.tools"]
+        agent = state_mod.Agent(
+            agent_id="oco/x", project_label="p", worktree_path=str(tmp_path),
+            session_id="sess1", branch="br", initial_prompt="hi",
+            phase="EXECUTING",
+            last_classifier_verdict={
+                "awaiting": False, "source": "llm",
+                "reason": "still working", "confidence": "high",
+                "last_assistant_text": "...",
+            },
+        )
+        class _Cli:
+            async def list_questions(self, _wt): return []
+            async def list_permissions(self, _wt): return []
+        class _RT: ...
+        rt = _RT()
+        rt.client = _Cli()
+        event_loop_mod.get_session_status = lambda _aid: {"type": "busy"}
+        event_loop_mod.get_text_buffer = lambda _aid: {"p1": "writing the JWT validator"}
+        loop = _aio.new_event_loop()
+        try:
+            out = loop.run_until_complete(tools_mod._detailed_status(rt, agent))
+        finally:
+            loop.close()
+        assert out["session_status"] == "busy"
+        assert "writing the JWT validator" in out["last_assistant_text_snippet"]
+        assert out["last_classifier"]["awaiting"] is False
+        assert out["last_classifier"]["source"] == "llm"
