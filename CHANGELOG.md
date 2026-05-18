@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.20.1] - 2026-05-19
+
+Bugfix: archived agents no longer appear in the hourly heartbeat.
+
+The pruner sets `archived=True` on both DONE and CANCELLED agents
+12 h after the terminal transition. `heartbeat.build_report` filtered
+out DONE agents past 4 h via `_visible_done`, but `CANCELLED` agents
+had no analogous cutoff, so archived CANCELLED rows kept appearing in
+every hourly heartbeat as noise alongside live agents.
+
+Fix: `build_report` now skips any row with `archived=True` before
+the rest of the visibility filter runs. The change also defends
+against any future case where an archived DONE row slips past
+`_visible_done` (e.g. if `archived` is set before `done_at`).
+
+3 new tests in `TestHeartbeatReport`. 456 -> 459.
+
 ## [0.20.0] - 2026-05-19
 
 Serve post-mortem capability: when `opencode serve` dies, the

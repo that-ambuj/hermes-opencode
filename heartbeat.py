@@ -77,7 +77,12 @@ def _visible_done(agent: Agent, now_ts: float) -> bool:
 def build_report(runtime: "Runtime", now_local: datetime) -> tuple[bool, str]:
     agents = runtime.agents.list()
     now_ts = time.time()
-    visible = [a for a in agents if a.phase not in {"KILLED", "FAILED"} and (a.phase != "DONE" or _visible_done(a, now_ts))]
+    visible = [
+        a for a in agents
+        if not a.archived
+        and a.phase not in {"KILLED", "FAILED"}
+        and (a.phase != "DONE" or _visible_done(a, now_ts))
+    ]
 
     active = [a for a in visible if a.phase not in TERMINAL_PHASES and a.phase != "PR_OPEN"]
     awaiting = [a for a in visible if a.phase in {"IDLE_TASK_COMPLETE", "IDLE_REVIEW_ADDRESSED"}]

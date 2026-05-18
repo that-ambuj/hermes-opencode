@@ -122,6 +122,59 @@ class TestHeartbeatReport:
         assert "ma/a" in body and "ma/b" in body and "ma/c" in body
         assert "example.test/pr/1" in body
 
+    def test_archived_done_hidden_from_heartbeat(self, tmp_path: Path):
+        now = time.time()
+        agents = [
+            state_mod.Agent(
+                agent_id="ma/live", project_label="my-app", worktree_path="/t/live",
+                session_id="s1", branch="ma/live", initial_prompt="x", phase="EXECUTING",
+            ),
+            state_mod.Agent(
+                agent_id="ma/old-done", project_label="my-app", worktree_path="/t/old",
+                session_id="s2", branch="ma/old-done", initial_prompt="x", phase="DONE",
+                done_at=now - 13 * 3600, archived=True, archived_at=now - 1 * 3600,
+            ),
+        ]
+        rt = self._runtime(tmp_path, agents)
+        ok, body = heartbeat_mod.build_report(rt, datetime(2026, 5, 17, 14, 0))
+        assert ok is True
+        assert "ma/live" in body
+        assert "ma/old-done" not in body
+
+    def test_archived_cancelled_hidden_from_heartbeat(self, tmp_path: Path):
+        now = time.time()
+        agents = [
+            state_mod.Agent(
+                agent_id="ma/live", project_label="my-app", worktree_path="/t/live",
+                session_id="s1", branch="ma/live", initial_prompt="x", phase="EXECUTING",
+            ),
+            state_mod.Agent(
+                agent_id="ma/old-cancel", project_label="my-app", worktree_path="/t/oc",
+                session_id="s2", branch="ma/old-cancel", initial_prompt="x", phase="CANCELLED",
+                cancelled_at=now - 13 * 3600, cancellation_reason="abandoned",
+                archived=True, archived_at=now - 1 * 3600,
+            ),
+        ]
+        rt = self._runtime(tmp_path, agents)
+        ok, body = heartbeat_mod.build_report(rt, datetime(2026, 5, 17, 14, 0))
+        assert ok is True
+        assert "ma/live" in body
+        assert "ma/old-cancel" not in body
+        assert "abandoned" not in body
+
+    def test_recent_unarchived_cancelled_still_shown(self, tmp_path: Path):
+        now = time.time()
+        agents = [
+            state_mod.Agent(
+                agent_id="ma/recent-cancel", project_label="my-app", worktree_path="/t/rc",
+                session_id="s1", branch="ma/recent-cancel", initial_prompt="x", phase="CANCELLED",
+                cancelled_at=now - 600, archived=False,
+            ),
+        ]
+        rt = self._runtime(tmp_path, agents)
+        ok, body = heartbeat_mod.build_report(rt, datetime(2026, 5, 17, 14, 0))
+        assert "ma/recent-cancel" in body
+
 
 class TestHeartbeatRetention:
     def test_done_recent_visible(self):
