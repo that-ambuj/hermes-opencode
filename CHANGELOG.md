@@ -5,6 +5,113 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.18.0] - 2026-05-19
+
+Five-tier resilience overhaul. Six of the nine hard `FAILED`
+transitions in the state machine now have a phase-aware retry path,
+the most operator-recoverable failures route to a new
+`NEEDS_INTERVENTION` phase instead of `FAILED`, and a single
+`oc_retry` tool resurrects FAILED / NEEDS_INTERVENTION agents and
+kicks stuck non-terminal agents.
+
+### Tier 1 — Per-phase retry budgets
+
+New `Agent.phase_retry_count` + per-phase ceilings. Replaces "first
+error -> FAILED" with a phase-scoped retry budget. `AgentStore.update`
+auto-resets the counter on every phase change (and auto-stamps
+`phase_entered_at`) so the budget is naturally scoped per-phase
+without per-site bookkeeping. Sites converted:
+
+- QUEUED first-prompt send (ceiling 5)
+- REVIEW_SPAWNING staging + session create (ceiling 5)
+- REVIEW_DELIVERED addressing-prompt dispatch (ceiling 5)
+- REVIEWING "reviewer state lost" recovers by re-staging rather
+  than failing outright
+
+`PHASE_RETRY_CEILING` is a per-phase dict; default is 3.
+
+### Tier 2 — Differentiated abort nudges
+
+`_check_executor_abort` now varies the nudge by attempt:
+
+1. attempt 1: `continue`
+2. attempt 2: `You stopped mid-task. Resume where you left off ...`
+3. attempt 3: `[SYSTEM DIRECTIVE: HERMES-OPENCODE - RESUME] ...`
+
+Same 3-strike escalation; each attempt has a different chance of
+landing instead of three identical `continue` pokes.
+
+### Tier 3 — `NEEDS_INTERVENTION` phase
+
+New non-terminal phase, sibling of `AWAITING_HUMAN`:
+
+- `AWAITING_HUMAN` = executor itself paused for user reply
+- `NEEDS_INTERVENTION` = orchestrator couldn't proceed, needs
+  operator decision
+
+Routes:
+
+- PR-fallback exhausted in `_phase_committing` -> `NEEDS_INTERVENTION`
+  instead of `FAILED`. Operator fixes `gh auth` / network, then runs
+  `oc_retry`.
+- Future failure sites that have a clear operator action can opt into
+  this with `_handle_phase_failure(..., on_exhausted_intervene=True)`.
+
+Fires the new `needs_intervention` notification (default-on).
+
+### Tier 4 — `oc_retry` tool (NEW)
+
+Three modes, all routed through one tool:
+
+- `FAILED` agent: restore `phase_before_failed`, clear retry counts
+  + tick-failure streak.
+- `NEEDS_INTERVENTION` agent: restore `phase_before_intervention`,
+  clear the intervention reason.
+- Any other non-terminal agent: reset `phase_retry_count` and
+  `last_tick_error`, force an immediate re-tick. Useful after a
+  gateway restart, transient network outage, or to kick a stuck
+  agent.
+
+Refuses on `DONE` / `KILLED` / `CANCELLED`, and on `FAILED` agents
+whose `last_error` says `project gone` (truly unrecoverable).
+
+Available via:
+
+- Tool: `oc_retry(agent_id)`
+- Slash command: `/oc retry <agent_id>` (works in CLI + gateway DM)
+- CLI: `hermes oco retry <agent_id>`
+
+### Tier 5 — Phase-stuck watchdog
+
+New `_phase_stuck_loop` runs every 60 s. Flags any agent stuck in a
+transitional / short-lived phase for > `STUCK_WARN_SEC` (10 min).
+Watched phases:
+
+`CREATED, BOOTSTRAPPING, IDLE_TASK_COMPLETE, REVIEW_SPAWNING,
+REVIEW_DELIVERED, IDLE_REVIEW_ADDRESSED, COMMITTING`
+
+Skips intentionally-long phases (EXECUTING, REVIEWING, PR_OPEN), and
+blocked phases (AWAITING_HUMAN, NEEDS_INTERVENTION, RATE_LIMITED,
+QUEUED). Fires `phase_stuck` notification once per stuck-period;
+re-arms when the phase changes.
+
+### State / API additions
+
+- `Agent.phase_retry_count: int = 0`
+- `Agent.phase_entered_at: float` (auto-stamped on phase change)
+- `Agent.phase_before_failed: str | None` (stamped at FAILED transitions)
+- `Agent.phase_before_intervention: str | None` (stamped at NEEDS_INTERVENTION entry)
+- `Agent.intervention_reason: str | None`
+- `Agent.intervention_since: float | None`
+- `Agent.last_stuck_notify_at: float | None`
+- `state.TERMINAL_PHASES` (canonical frozenset; event_loop.py now imports it)
+- `event_loop.PHASE_RETRY_CEILING` + `PHASE_RETRY_CEILING_DEFAULT`
+- `event_loop.STUCK_WARN_SEC = 600.0`, `STUCK_CHECK_INTERVAL_SEC = 60.0`, `STUCK_WATCHED_PHASES`
+- `event_loop.ABORT_NUDGE_PROMPTS` (3 escalating prompts)
+- `tools.RETRY_SCHEMA` + `make_retry`
+- 2 new notification kinds (`needs_intervention`, `phase_stuck`)
+  added to `Config.notify_events` default set.
+
 ## [0.17.0] - 2026-05-18
 
 Hardens the awaiting-input / review-readiness gate against three

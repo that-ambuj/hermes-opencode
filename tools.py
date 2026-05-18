@@ -362,6 +362,37 @@ CANCEL_SCHEMA: dict[str, Any] = {
 }
 
 
+RETRY_SCHEMA: dict[str, Any] = {
+    "name": "oc_retry",
+    "description": (
+        "Kick an agent to retry its current phase. Three modes:\n"
+        "\n"
+        "1. FAILED agent: restores `phase_before_failed`, clears retry counts "
+        "and tick-failure streak, resumes the agent loop.\n"
+        "2. NEEDS_INTERVENTION agent: restores `phase_before_intervention`, "
+        "clears the intervention reason, resumes.\n"
+        "3. Any other non-terminal agent (EXECUTING / REVIEWING / "
+        "COMMITTING / etc.): resets the per-phase retry counter and "
+        "`last_tick_error` so the next tick runs with a clean slate. "
+        "Useful after a gateway restart, transient network outage, or "
+        "to force an immediate re-tick.\n"
+        "\n"
+        "Refuses on terminal phases that are truly unrecoverable: DONE "
+        "(work merged), KILLED (record erased), CANCELLED (deliberate "
+        "abandonment). Refuses on FAILED agents whose `last_error` "
+        "indicates an unrecoverable cause (e.g. `project gone`)."
+    ),
+    "parameters": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "agent_id": {"type": "string"},
+        },
+        "required": ["agent_id"],
+    },
+}
+
+
 def make_project_add(rt: Runtime) -> Callable[..., Awaitable[str]]:
     async def handler(args: dict, **_: Any) -> str:
         try:
@@ -916,6 +947,76 @@ def make_cancel(rt: Runtime) -> Callable[..., Awaitable[str]]:
     return handler
 
 
+def make_retry(rt: Runtime) -> Callable[..., Awaitable[str]]:
+    async def handler(args: dict, **_: Any) -> str:
+        agent_id = args.get("agent_id")
+        if not agent_id:
+            return _err("agent_id required")
+        agent = rt.agents.get(agent_id)
+        if not agent:
+            return _err(f"unknown agent: {agent_id}")
+        if agent.phase in {"DONE", "KILLED", "CANCELLED"}:
+            return _err(f"cannot retry from terminal phase {agent.phase}")
+        last_error = (agent.last_error or "").lower()
+        if agent.phase == "FAILED" and "project gone" in last_error:
+            return _err(
+                f"cannot retry: {agent.last_error}. "
+                f"Re-add the project via oc_project_add and re-spawn."
+            )
+        if agent.phase == "FAILED":
+            target = agent.phase_before_failed or "EXECUTING"
+            updated = rt.agents.update(
+                agent_id,
+                phase=target,
+                phase_before_failed=None,
+                last_error=None,
+                last_tick_error=None,
+                last_tick_error_at=None,
+                consecutive_tick_failures=0,
+                consecutive_aborts=0,
+                last_abort_msg_id=None,
+                idle_since=None,
+            )
+            return _ok({
+                "agent_id": agent_id,
+                "from_phase": "FAILED",
+                "restored_phase": target,
+                "mode": "failed-resume",
+            })
+        if agent.phase == "NEEDS_INTERVENTION":
+            target = agent.phase_before_intervention or "EXECUTING"
+            updated = rt.agents.update(
+                agent_id,
+                phase=target,
+                phase_before_intervention=None,
+                intervention_reason=None,
+                intervention_since=None,
+                last_error=None,
+                idle_since=None,
+            )
+            return _ok({
+                "agent_id": agent_id,
+                "from_phase": "NEEDS_INTERVENTION",
+                "restored_phase": target,
+                "mode": "intervention-resume",
+            })
+        rt.agents.update(
+            agent_id,
+            phase_retry_count=0,
+            last_error=None,
+            last_tick_error=None,
+            last_tick_error_at=None,
+            consecutive_tick_failures=0,
+        )
+        return _ok({
+            "agent_id": agent_id,
+            "phase": agent.phase,
+            "mode": "kick",
+            "note": "retry counters cleared; next tick runs immediately",
+        })
+    return handler
+
+
 ANSWER_SCHEMA: dict[str, Any] = {
     "name": "oc_answer",
     "description": "Reply to (or reject) a pending opencode question raised by an agent. The user's reply text is forwarded VERBATIM to opencode. Use this when the pre_llm_call context surfaces a pending question_id and the user's message looks like a reply to it.",
@@ -1324,6 +1425,7 @@ def all_tool_specs(rt: Runtime) -> list[dict[str, Any]]:
         {"name": "oc_wait", "toolset": "hermes_opencode", "schema": WAIT_SCHEMA, "handler": make_wait(rt), "is_async": True, "emoji": "⏳"},
         {"name": "oc_kill", "toolset": "hermes_opencode", "schema": KILL_SCHEMA, "handler": make_kill(rt), "is_async": True, "emoji": "🛑"},
         {"name": "oc_cancel", "toolset": "hermes_opencode", "schema": CANCEL_SCHEMA, "handler": make_cancel(rt), "is_async": True, "emoji": "🚫"},
+        {"name": "oc_retry", "toolset": "hermes_opencode", "schema": RETRY_SCHEMA, "handler": make_retry(rt), "is_async": True, "emoji": "🔄"},
         {"name": "oc_output", "toolset": "hermes_opencode", "schema": OUTPUT_SCHEMA, "handler": make_output(rt), "is_async": True, "emoji": "📤"},
         {"name": "oc_answer", "toolset": "hermes_opencode", "schema": ANSWER_SCHEMA, "handler": make_answer(rt), "is_async": True, "emoji": "✉️"},
         {"name": "oc_review_now", "toolset": "hermes_opencode", "schema": REVIEW_NOW_SCHEMA, "handler": make_review_now(rt), "is_async": True, "emoji": "🔎"},

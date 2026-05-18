@@ -22,7 +22,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("hermes_opencode.event_loop")
 
-TERMINAL_PHASES = {"DONE", "KILLED", "FAILED", "CANCELLED"}
+from .state import TERMINAL_PHASES
+
 IDLE_DEBOUNCE_SEC = 120.0
 PR_POLL_SEC = 300.0
 PRUNE_INTERVAL_SEC = 60.0
@@ -42,9 +43,39 @@ SERVE_DOWN_NOTIFY_SINKS = ("cli", "dashboard", "gateway")
 TICK_FAILURE_ESCALATION_THRESHOLD = 3
 ABORT_ESCALATION_THRESHOLD = 3
 ABORT_AUTO_CONTINUE_MESSAGE = "continue"
+ABORT_NUDGE_PROMPTS = (
+    "continue",
+    "You stopped mid-task. Resume where you left off and finish the work.",
+    "[SYSTEM DIRECTIVE: HERMES-OPENCODE - RESUME]\n"
+    "Your previous turn aborted. The orchestrator is one strike away from "
+    "escalating this agent to FAILED. Resume the task from where you left "
+    "off and drive it to a clean stopping point (READY_FOR_REVIEW or a "
+    "/question).\n"
+    "[END SYSTEM DIRECTIVE]",
+)
 RATE_LIMIT_MIN_WAIT_SEC = 30.0
 RATE_LIMIT_MAX_TICK_WAIT_SEC = 15.0
 QUEUE_POLL_SEC = 5.0
+PHASE_RETRY_CEILING = {
+    "QUEUED": 5,
+    "BOOTSTRAPPING": 3,
+    "REVIEW_SPAWNING": 5,
+    "REVIEWING": 3,
+    "REVIEW_DELIVERED": 5,
+    "COMMITTING": 3,
+}
+PHASE_RETRY_CEILING_DEFAULT = 3
+STUCK_WARN_SEC = 600.0
+STUCK_CHECK_INTERVAL_SEC = 60.0
+STUCK_WATCHED_PHASES = frozenset({
+    "CREATED",
+    "BOOTSTRAPPING",
+    "IDLE_TASK_COMPLETE",
+    "REVIEW_SPAWNING",
+    "REVIEW_DELIVERED",
+    "IDLE_REVIEW_ADDRESSED",
+    "COMMITTING",
+})
 
 _state_lock = threading.Lock()
 _thread: threading.Thread | None = None
@@ -81,6 +112,8 @@ _EVENT_GLYPH = {
     "queued": "⏳",
     "queue_drained": "▶",
     "awaiting_human_resumed": "▶",
+    "needs_intervention": "🛟",
+    "phase_stuck": "🐌",
 }
 
 
@@ -153,6 +186,18 @@ def _default_event_body(agent: "Agent", kind: str) -> str:
         return f"Queue drained: agent started."
     if kind == "awaiting_human_resumed":
         return f"Human reply received; agent resumed."
+    if kind == "needs_intervention":
+        return (
+            f"Agent needs operator intervention. Reason: {agent.intervention_reason or 'unknown'}. "
+            f"Last error: {agent.last_error or '(no detail)'}. "
+            f"Run `oc_retry {agent.agent_id}` once the underlying issue is resolved."
+        )
+    if kind == "phase_stuck":
+        return (
+            f"Agent stuck in phase={agent.phase}. Last error: "
+            f"{agent.last_error or '(no detail)'}. Inspect with `oc_get` or "
+            f"kick with `oc_retry {agent.agent_id}`."
+        )
     return f"{kind} for {agent.agent_id}"
 
 
@@ -632,6 +677,7 @@ async def _supervisor() -> None:
     cleanup = asyncio.create_task(_cleanup_loop())
     watchdog = asyncio.create_task(_serve_watchdog_loop())
     awaiting_reminder = asyncio.create_task(_awaiting_input_reminder_loop())
+    stuck_watchdog = asyncio.create_task(_phase_stuck_loop())
     try:
         while not _stop_flag.is_set():
             if _runtime is not None:
@@ -640,7 +686,7 @@ async def _supervisor() -> None:
                         await _ensure_agent_task_async(agent.agent_id)
             await asyncio.sleep(2.0)
     finally:
-        for t in (pruner, heartbeat, cleanup, watchdog, awaiting_reminder):
+        for t in (pruner, heartbeat, cleanup, watchdog, awaiting_reminder, stuck_watchdog):
             t.cancel()
             try:
                 await t
@@ -1062,6 +1108,7 @@ def _record_tick_failure(agent: Agent, exc: BaseException) -> None:
             escalated = _runtime.agents.update(
                 agent.agent_id,
                 phase="FAILED",
+                phase_before_failed=updated.phase,
                 last_error=f"stalled after {consecutive} consecutive tick failures: {summary}",
             )
             _maybe_notify_phase(escalated, "failed")
@@ -1084,6 +1131,108 @@ def _clear_tick_failure(agent: Agent) -> None:
             )
     except Exception as e:
         logger.debug("could not clear tick failure for %s: %s", agent.agent_id, e)
+
+
+def _phase_retry_ceiling(phase: str) -> int:
+    return PHASE_RETRY_CEILING.get(phase, PHASE_RETRY_CEILING_DEFAULT)
+
+
+def _handle_phase_failure(
+    agent: Agent, phase: str, summary: str,
+    *, on_exhausted_intervene: bool = False,
+) -> bool:
+    if _runtime is None:
+        return True
+    ceiling = _phase_retry_ceiling(phase)
+    current = _runtime.agents.get(agent.agent_id)
+    if current is None:
+        return True
+    attempts = (current.phase_retry_count or 0) + 1
+    logger.warning(
+        "agent %s phase=%s attempt %d/%d failed: %s",
+        agent.agent_id, phase, attempts, ceiling, summary,
+    )
+    if attempts < ceiling:
+        _runtime.agents.update(
+            agent.agent_id,
+            phase_retry_count=attempts,
+            last_error=f"{phase} attempt {attempts}/{ceiling}: {summary}",
+        )
+        return False
+    if on_exhausted_intervene:
+        _enter_needs_intervention(
+            current,
+            reason=f"{phase}_exhausted",
+            body=(
+                f"Phase {phase} exhausted retry budget ({ceiling}). "
+                f"Last error: {summary}\n\n"
+                f"Resolve the underlying issue and run `oc_retry {agent.agent_id}`."
+            ),
+        )
+        return True
+    escalated = _runtime.agents.update(
+        agent.agent_id,
+        phase="FAILED",
+        phase_before_failed=phase,
+        last_error=f"{phase} exhausted retry budget ({ceiling}): {summary}",
+    )
+    _maybe_notify_phase(escalated, "failed")
+    _cancel_agent_tasks(agent.agent_id)
+    return True
+
+
+def _enter_needs_intervention(agent: Agent, reason: str, body: str) -> None:
+    if _runtime is None:
+        return
+    current = _runtime.agents.get(agent.agent_id)
+    if current is None or current.phase in TERMINAL_PHASES:
+        return
+    if current.phase == "NEEDS_INTERVENTION":
+        return
+    updated = _runtime.agents.update(
+        agent.agent_id,
+        phase="NEEDS_INTERVENTION",
+        phase_before_intervention=current.phase,
+        intervention_reason=reason,
+        intervention_since=time.time(),
+        last_error=body[:500],
+    )
+    _notify_event(updated, "needs_intervention", body)
+
+
+async def _phase_needs_intervention(agent: Agent) -> None:
+    await asyncio.sleep(30.0)
+
+
+async def _phase_stuck_loop() -> None:
+    while not _stop_flag.is_set():
+        try:
+            if _runtime is not None:
+                now = time.time()
+                for a in _runtime.agents.list():
+                    if a.phase not in STUCK_WATCHED_PHASES:
+                        continue
+                    entered = a.phase_entered_at or 0.0
+                    age = now - entered
+                    if age < STUCK_WARN_SEC:
+                        continue
+                    last = a.last_stuck_notify_at or 0.0
+                    if last >= entered:
+                        continue
+                    refreshed = _runtime.agents.update(
+                        a.agent_id, last_stuck_notify_at=now,
+                    )
+                    _notify_event(
+                        refreshed, "phase_stuck",
+                        f"Agent {a.agent_id} has been in phase={a.phase} for "
+                        f"{_humanize_seconds(age)} with no transition. Last "
+                        f"error: {a.last_error or '(none)'}. Inspect with "
+                        f"`oc_get {a.agent_id}` or kick with "
+                        f"`oc_retry {a.agent_id}`.",
+                    )
+        except Exception as e:
+            logger.debug("phase-stuck loop iteration failed: %s", e)
+        await asyncio.sleep(STUCK_CHECK_INTERVAL_SEC)
 
 
 async def _sse_consumer_loop(agent_id: str, stop_event: asyncio.Event) -> None:
@@ -1365,26 +1514,30 @@ async def _check_executor_abort(agent: Agent) -> bool:
         escalated = _runtime.agents.update(
             agent.agent_id,
             phase="FAILED",
+            phase_before_failed=updated.phase,
             last_error=f"executor aborted {consecutive} consecutive times: {name}: {err_msg}",
         )
         _maybe_notify_phase(escalated, "failed")
         _cancel_agent_tasks(agent.agent_id)
         return True
+    nudge_idx = min(consecutive - 1, len(ABORT_NUDGE_PROMPTS) - 1)
+    nudge = ABORT_NUDGE_PROMPTS[nudge_idx]
+    nudge_preview = nudge.splitlines()[0][:60]
     body_text = (
         f"Executor turn aborted (attempt {consecutive}/{ABORT_ESCALATION_THRESHOLD}): "
         f"{name}"
         + (f": {err_msg}" if err_msg else "")
-        + f". Auto-sending '{ABORT_AUTO_CONTINUE_MESSAGE}' to the executor."
+        + f". Auto-sending nudge: {nudge_preview!r}"
     )
     _notify_event(updated, "aborted", body_text)
     try:
         await _runtime.client.send_message_async(
-            agent.session_id, worktree, ABORT_AUTO_CONTINUE_MESSAGE,
+            agent.session_id, worktree, nudge,
         )
     except OpencodeError as e:
         logger.warning(
-            "aborted: send '%s' to %s failed: %s",
-            ABORT_AUTO_CONTINUE_MESSAGE, agent.agent_id, e,
+            "aborted: send nudge to %s failed: %s",
+            agent.agent_id, e,
         )
     return True
 
@@ -1429,10 +1582,8 @@ async def _phase_queued(agent: Agent) -> None:
     try:
         await _runtime.client.send_message_async(agent.session_id, worktree, prompt)
     except OpencodeError as e:
-        _maybe_notify_phase(
-            _runtime.agents.update(agent.agent_id, phase="FAILED", last_error=f"queued send: {e}"),
-            "failed",
-        )
+        if not _handle_phase_failure(agent, "QUEUED", str(e)):
+            return
         return
     refreshed = _runtime.agents.update(agent.agent_id, phase="EXECUTING", queued_blocked_by=[])
     _notify_event(
@@ -1630,7 +1781,8 @@ async def _phase_review_spawning(agent: Agent) -> None:
     try:
         sister = reviewer_mod.stage_reviewer_worktree(project, agent, executor_worktree)
     except wt_mod.GitError as e:
-        _maybe_notify_phase(_runtime.agents.update(agent.agent_id, phase="FAILED", last_error=f"reviewer staging: {e}"), "failed")
+        if not _handle_phase_failure(agent, "REVIEW_SPAWNING", f"staging: {e}"):
+            return
         return
     try:
         session_id, reviewer_text = await reviewer_mod.spawn_reviewer_session(
@@ -1638,7 +1790,8 @@ async def _phase_review_spawning(agent: Agent) -> None:
         )
     except OpencodeError as e:
         reviewer_mod.teardown_reviewer_worktree(project, executor_worktree)
-        _maybe_notify_phase(_runtime.agents.update(agent.agent_id, phase="FAILED", last_error=f"reviewer session: {e}"), "failed")
+        if not _handle_phase_failure(agent, "REVIEW_SPAWNING", f"session: {e}"):
+            return
         return
     refreshed_for_event = _runtime.agents.update(
         agent.agent_id, phase="REVIEWING",
@@ -1654,7 +1807,11 @@ async def _phase_review_spawning(agent: Agent) -> None:
 async def _phase_reviewing(agent: Agent) -> None:
     assert _runtime is not None
     if not agent.reviewer_session_id or not agent.reviewer_worktree_path:
-        _maybe_notify_phase(_runtime.agents.update(agent.agent_id, phase="FAILED", last_error="reviewer state lost"), "failed")
+        _runtime.agents.update(
+            agent.agent_id, phase="REVIEW_SPAWNING",
+            reviewer_session_id=None, reviewer_worktree_path=None,
+            last_error="reviewer state lost; re-staging",
+        )
         return
     sister = Path(agent.reviewer_worktree_path)
     became_idle = await _runtime.client.wait_idle(agent.reviewer_session_id, sister, timeout=60.0)
@@ -1697,7 +1854,8 @@ async def _handle_review_text(agent: Agent, reviewer_text: str) -> None:
         try:
             await reviewer_mod.send_addressing_to_executor(_runtime.client, agent, verdict.body)
         except OpencodeError as e:
-            _maybe_notify_phase(_runtime.agents.update(agent.agent_id, phase="FAILED", last_error=f"address dispatch: {e}"), "failed")
+            if not _handle_phase_failure(agent, "REVIEW_DELIVERED", f"address dispatch: {e}"):
+                return
             return
         _runtime.agents.update(
             agent.agent_id,
@@ -1776,10 +1934,17 @@ async def _phase_committing(agent: Agent) -> None:
         )
         if info is None:
             attempts_str = "; ".join(attempts) if attempts else "(no attempts)"
-            _maybe_notify_phase(_runtime.agents.update(
-                agent.agent_id, phase="FAILED",
-                last_error=f"all PR-fallback models exhausted: {attempts_str}",
-            ), "failed")
+            _enter_needs_intervention(
+                agent,
+                reason="pr_fallback_exhausted",
+                body=(
+                    f"All PR-fallback models exhausted. Attempts: {attempts_str}\n\n"
+                    f"Check `gh auth status` and network connectivity, then run "
+                    f"`oc_retry {agent.agent_id}` to retry the COMMITTING phase. "
+                    f"Use `oc_resume_pr {agent.agent_id}` to manually open the PR "
+                    f"if you already pushed it."
+                ),
+            )
             return
     refreshed = _runtime.agents.update(
         agent.agent_id, phase="PR_OPEN",
@@ -1846,6 +2011,7 @@ _PHASE_HANDLERS = {
     "QUEUED": _phase_queued,
     "EXECUTING": _phase_executing,
     "AWAITING_HUMAN": _phase_awaiting_human,
+    "NEEDS_INTERVENTION": _phase_needs_intervention,
     "IDLE_TASK_COMPLETE": _phase_idle_task_complete,
     "REVIEW_SPAWNING": _phase_review_spawning,
     "REVIEWING": _phase_reviewing,

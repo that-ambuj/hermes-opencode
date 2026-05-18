@@ -345,6 +345,193 @@ class TestSseSessionStatus:
         assert event_loop_mod.get_session_status(agent_id) is None
 
 
+class TestPhaseEnteredAtAutoStamp:
+    def _make(self, tmp_path: Path, phase="EXECUTING", agent_id="ph/test"):
+        store = state_mod.AgentStore(tmp_path / "agents.json")
+        a = state_mod.Agent(
+            agent_id=agent_id, project_label="p", worktree_path=str(tmp_path),
+            session_id="ses", branch="b", initial_prompt="x", phase=phase,
+        )
+        store.add(a)
+        return store, a
+
+    def test_phase_change_stamps_phase_entered_at(self, tmp_path: Path):
+        store, a = self._make(tmp_path)
+        first_entered = store.get(a.agent_id).phase_entered_at
+        time.sleep(0.05)
+        store.update(a.agent_id, phase="IDLE_TASK_COMPLETE")
+        second = store.get(a.agent_id)
+        assert second.phase == "IDLE_TASK_COMPLETE"
+        assert second.phase_entered_at > first_entered
+        assert second.phase_retry_count == 0
+        assert second.last_stuck_notify_at is None
+
+    def test_phase_change_resets_retry_count(self, tmp_path: Path):
+        store, a = self._make(tmp_path, phase="QUEUED", agent_id="ph/retry")
+        store.update(a.agent_id, phase_retry_count=4)
+        assert store.get(a.agent_id).phase_retry_count == 4
+        store.update(a.agent_id, phase="EXECUTING")
+        assert store.get(a.agent_id).phase_retry_count == 0
+
+    def test_non_phase_update_does_not_reset_retry(self, tmp_path: Path):
+        store, a = self._make(tmp_path, agent_id="ph/np")
+        store.update(a.agent_id, phase_retry_count=2)
+        store.update(a.agent_id, last_error="some error")
+        assert store.get(a.agent_id).phase_retry_count == 2
+
+    def test_explicit_phase_retry_count_overrides_auto_reset(self, tmp_path: Path):
+        store, a = self._make(tmp_path, agent_id="ph/exp")
+        store.update(a.agent_id, phase="QUEUED", phase_retry_count=3)
+        assert store.get(a.agent_id).phase_retry_count == 3
+
+
+class TestAbortNudgeProgression:
+    def test_three_distinct_nudges_defined(self):
+        assert len(event_loop_mod.ABORT_NUDGE_PROMPTS) == event_loop_mod.ABORT_ESCALATION_THRESHOLD
+
+    def test_first_nudge_is_simple_continue(self):
+        assert event_loop_mod.ABORT_NUDGE_PROMPTS[0] == "continue"
+
+    def test_last_nudge_uses_hermes_directive_envelope(self):
+        last = event_loop_mod.ABORT_NUDGE_PROMPTS[-1]
+        assert "[SYSTEM DIRECTIVE: HERMES-OPENCODE - RESUME]" in last
+        assert "[END SYSTEM DIRECTIVE]" in last
+
+
+class TestPhaseRetryCeiling:
+    def test_known_phases_have_ceilings(self):
+        for p in ("QUEUED", "REVIEW_SPAWNING", "REVIEW_DELIVERED", "COMMITTING"):
+            assert event_loop_mod._phase_retry_ceiling(p) >= 1
+
+    def test_unknown_phase_uses_default(self):
+        assert event_loop_mod._phase_retry_ceiling("SOMETHING_ELSE") == event_loop_mod.PHASE_RETRY_CEILING_DEFAULT
+
+
+class TestStuckWatchedPhases:
+    def test_watches_transitional_phases(self):
+        for p in ("REVIEW_SPAWNING", "REVIEW_DELIVERED", "IDLE_TASK_COMPLETE", "COMMITTING"):
+            assert p in event_loop_mod.STUCK_WATCHED_PHASES
+
+    def test_does_not_watch_long_running_or_blocked(self):
+        for p in (
+            "EXECUTING", "EXECUTOR_ADDRESSING", "REVIEWING",
+            "AWAITING_HUMAN", "NEEDS_INTERVENTION", "RATE_LIMITED",
+            "QUEUED", "PR_OPEN", "DONE", "FAILED", "KILLED", "CANCELLED",
+        ):
+            assert p not in event_loop_mod.STUCK_WATCHED_PHASES
+
+
+class TestOcRetryHandler:
+    def _runtime(self, tmp_path: Path, agent_phase: str, **agent_overrides):
+        tools_mod = sys.modules["_oco_test_pkg.tools"]
+        cfg = config_mod.Config(
+            host="127.0.0.1", port=4096,
+            worktrees_root=tmp_path / "wt",
+            agents_file=tmp_path / "agents.json",
+            projects_file=tmp_path / "projects.json",
+            logs_dir=tmp_path / "logs",
+            notifications_file=tmp_path / "notifications.jsonl",
+            events_log=tmp_path / "events.log",
+        )
+        cfg.ensure_dirs()
+        agents = state_mod.AgentStore(tmp_path / "agents.json")
+        agent = state_mod.Agent(
+            agent_id="bck/r", project_label="bck",
+            worktree_path=str(tmp_path / "wt-r"), session_id="sess",
+            branch="bck/r", initial_prompt="x", phase=agent_phase,
+            **agent_overrides,
+        )
+        agents.add(agent)
+        return tools_mod.Runtime(config=cfg, client=None, projects=None, agents=agents), tools_mod, agents
+
+    def test_resumes_failed_to_phase_before_failed(self, tmp_path: Path):
+        import asyncio, json
+        rt, tools_mod, agents = self._runtime(
+            tmp_path, "FAILED",
+            phase_before_failed="REVIEW_SPAWNING",
+            last_error="reviewer staging: transient git lock",
+            consecutive_tick_failures=3,
+        )
+        result = json.loads(asyncio.run(tools_mod.make_retry(rt)({"agent_id": "bck/r"})))
+        assert result["ok"] is True
+        assert result["data"]["mode"] == "failed-resume"
+        assert result["data"]["restored_phase"] == "REVIEW_SPAWNING"
+        refreshed = agents.get("bck/r")
+        assert refreshed.phase == "REVIEW_SPAWNING"
+        assert refreshed.last_error is None
+        assert refreshed.consecutive_tick_failures == 0
+        assert refreshed.phase_before_failed is None
+
+    def test_resumes_needs_intervention_to_phase_before_intervention(self, tmp_path: Path):
+        import asyncio, json
+        rt, tools_mod, agents = self._runtime(
+            tmp_path, "NEEDS_INTERVENTION",
+            phase_before_intervention="COMMITTING",
+            intervention_reason="pr_fallback_exhausted",
+            intervention_since=time.time(),
+            last_error="all PR-fallback models exhausted",
+        )
+        result = json.loads(asyncio.run(tools_mod.make_retry(rt)({"agent_id": "bck/r"})))
+        assert result["ok"] is True
+        assert result["data"]["mode"] == "intervention-resume"
+        assert result["data"]["restored_phase"] == "COMMITTING"
+        refreshed = agents.get("bck/r")
+        assert refreshed.phase == "COMMITTING"
+        assert refreshed.intervention_reason is None
+        assert refreshed.intervention_since is None
+
+    def test_kicks_non_terminal_agent_clearing_retry_counts(self, tmp_path: Path):
+        import asyncio, json
+        rt, tools_mod, agents = self._runtime(
+            tmp_path, "EXECUTING",
+            consecutive_tick_failures=2,
+            last_tick_error="boom",
+            phase_retry_count=3,
+        )
+        result = json.loads(asyncio.run(tools_mod.make_retry(rt)({"agent_id": "bck/r"})))
+        assert result["ok"] is True
+        assert result["data"]["mode"] == "kick"
+        refreshed = agents.get("bck/r")
+        assert refreshed.phase == "EXECUTING"
+        assert refreshed.consecutive_tick_failures == 0
+        assert refreshed.last_tick_error is None
+        assert refreshed.phase_retry_count == 0
+
+    def test_refuses_terminal_phases(self, tmp_path: Path):
+        import asyncio, json
+        for terminal in ("DONE", "KILLED", "CANCELLED"):
+            rt, tools_mod, _ = self._runtime(tmp_path / terminal, terminal)
+            result = json.loads(asyncio.run(tools_mod.make_retry(rt)({"agent_id": "bck/r"})))
+            assert result["ok"] is False
+            assert terminal in result["error"]
+
+    def test_refuses_unrecoverable_failed_project_gone(self, tmp_path: Path):
+        import asyncio, json
+        rt, tools_mod, _ = self._runtime(
+            tmp_path, "FAILED",
+            phase_before_failed="COMMITTING",
+            last_error="project gone",
+        )
+        result = json.loads(asyncio.run(tools_mod.make_retry(rt)({"agent_id": "bck/r"})))
+        assert result["ok"] is False
+        assert "project gone" in result["error"]
+
+    def test_unknown_agent(self, tmp_path: Path):
+        import asyncio, json
+        rt, tools_mod, _ = self._runtime(tmp_path, "EXECUTING")
+        result = json.loads(asyncio.run(tools_mod.make_retry(rt)({"agent_id": "nope/x"})))
+        assert result["ok"] is False
+        assert "unknown" in result["error"].lower()
+
+
+class TestRetrySchemaShape:
+    def test_schema_required_field(self):
+        tools_mod = sys.modules["_oco_test_pkg.tools"]
+        assert tools_mod.RETRY_SCHEMA["name"] == "oc_retry"
+        assert tools_mod.RETRY_SCHEMA["parameters"]["required"] == ["agent_id"]
+        assert tools_mod.RETRY_SCHEMA["parameters"]["additionalProperties"] is False
+
+
 class TestIdleDebounceHelpers:
     def test_session_status_idle_returns_true_when_no_status_observed(self):
         import asyncio

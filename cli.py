@@ -71,6 +71,12 @@ def setup(subparser: argparse.ArgumentParser) -> None:
     cancel_p.add_argument("--reason", default=None, help="Free-form reason recorded on the agent.")
     cancel_p.add_argument("--force", action="store_true", help="Skip the interactive confirmation.")
 
+    retry_p = subs.add_parser(
+        "retry",
+        help="Kick an agent to retry: FAILED -> phase_before_failed, NEEDS_INTERVENTION -> phase_before_intervention, otherwise reset retry counters.",
+    )
+    retry_p.add_argument("agent_id")
+
     subs.add_parser("projects", help="List registered projects.")
 
     spawn_p = subs.add_parser("spawn", help="Spawn a new opencode agent (worktree + session + first turn).")
@@ -98,7 +104,7 @@ def setup(subparser: argparse.ArgumentParser) -> None:
 def handler(args: argparse.Namespace) -> int:
     sub = getattr(args, "oco_command", None)
     if not sub:
-        print("usage: hermes oco {list,status,attach,kill,cancel,projects,spawn,resume-pr}", file=sys.stderr)
+        print("usage: hermes oco {list,status,attach,kill,cancel,retry,projects,spawn,resume-pr}", file=sys.stderr)
         return 2
     dispatch = _DISPATCH.get(sub)
     if dispatch is None:
@@ -217,6 +223,41 @@ def cmd_cancel(args: argparse.Namespace) -> int:
         for line in errors:
             print(f"warn: {line}", file=sys.stderr)
     print(f"cancelled {agent_id} (reason={args.reason or 'manually cancelled'})")
+    return 0
+
+
+def cmd_retry(args: argparse.Namespace) -> int:
+    ctx = build_context()
+    agent_id = args.agent_id
+    agent = ctx.agents.get(agent_id)
+    if agent is None:
+        print(f"unknown agent: {agent_id}", file=sys.stderr)
+        return 1
+    from . import tools as tools_mod
+    retry_fn = tools_mod.make_retry(ctx_to_runtime(ctx))
+    try:
+        result = asyncio.run(retry_fn({"agent_id": agent_id}))
+    except OpencodeError as e:
+        print(f"retry failed: {e}", file=sys.stderr)
+        return 1
+    try:
+        payload = json.loads(result)
+    except (ValueError, TypeError):
+        print(result)
+        return 0
+    if not payload.get("ok"):
+        print(f"retry failed: {payload.get('error', 'unknown')}", file=sys.stderr)
+        return 1
+    d = payload.get("data") or {}
+    mode = d.get("mode", "unknown")
+    if mode == "failed-resume":
+        print(f"resumed {agent_id} from FAILED -> {d.get('restored_phase')}")
+    elif mode == "intervention-resume":
+        print(f"resumed {agent_id} from NEEDS_INTERVENTION -> {d.get('restored_phase')}")
+    elif mode == "kick":
+        print(f"kicked {agent_id} in phase={d.get('phase')}; {d.get('note')}")
+    else:
+        print(f"retried {agent_id}: {d}")
     return 0
 
 
@@ -432,6 +473,7 @@ _DISPATCH = {
     "attach": cmd_attach,
     "kill": cmd_kill,
     "cancel": cmd_cancel,
+    "retry": cmd_retry,
     "projects": cmd_projects,
     "spawn": cmd_spawn,
     "resume-pr": cmd_resume_pr,

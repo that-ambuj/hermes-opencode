@@ -41,6 +41,8 @@ def _phase_glyph(phase: str) -> str:
     return {
         "EXECUTING": "▶",
         "EXECUTOR_ADDRESSING": "▶",
+        "AWAITING_HUMAN": "✋",
+        "NEEDS_INTERVENTION": "🛟",
         "IDLE_TASK_COMPLETE": "⏸",
         "IDLE_REVIEW_ADDRESSED": "⏸",
         "REVIEW_SPAWNING": "🔎",

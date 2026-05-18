@@ -489,6 +489,111 @@ When adding new orchestrator-emitted directives:
 - Pick a `<TYPE>` that is unique within hermes-opencode (so future
   grep / parser work can target specific directives).
 
+## Failure-recovery architecture (LOAD-BEARING, v0.18.0+)
+
+The state machine has three tiers of failure recovery, in order of
+preference:
+
+### 1. Phase-scoped retry budget
+
+Every recoverable error path now calls
+`_handle_phase_failure(agent, phase, summary)` instead of escalating
+to `FAILED` on first error. `PHASE_RETRY_CEILING` (per-phase) and
+`PHASE_RETRY_CEILING_DEFAULT = 3` govern the budget. The counter
+lives on `Agent.phase_retry_count` and is auto-reset by
+`AgentStore.update` whenever the agent's phase actually changes,
+so the budget is naturally scoped per-phase without per-site
+bookkeeping.
+
+Converted sites:
+
+- `_phase_queued` first-prompt send (ceiling 5)
+- `_phase_review_spawning` worktree staging + session create (ceiling 5)
+- `_handle_review_text` addressing-prompt dispatch (ceiling 5 via REVIEW_DELIVERED key)
+- `_phase_reviewing` "reviewer state lost" re-stages instead of failing
+
+The tick-failure escalation (`_record_tick_failure`, 3 consecutive
+exceptions) and abort escalation (`_check_executor_abort`, 3 distinct
+aborts) remain in place. Both stamp `phase_before_failed` so
+`oc_retry` can resume.
+
+### 2. NEEDS_INTERVENTION phase
+
+When `_handle_phase_failure(..., on_exhausted_intervene=True)` is
+called, exhausting the retry budget routes the agent to the new
+non-terminal `NEEDS_INTERVENTION` phase instead of `FAILED`. The
+phase carries `intervention_reason` + `intervention_since`. The
+dedicated `_phase_needs_intervention` handler does nothing
+autonomous: the agent waits for an operator to run `oc_retry`
+(or fix whatever the reason field describes and then `oc_retry`).
+
+The PR-fallback exhaustion in `_phase_committing` is the canonical
+example: all configured `pr_fallback_models` returned no
+`PR_OPENED:` sentinel, which usually means `gh auth status` is
+broken or github is unreachable. That's recoverable by an operator;
+no point burying the agent in `FAILED`.
+
+`NEEDS_INTERVENTION` is in `PHASES` but NOT in `TERMINAL_PHASES`.
+The supervisor still spawns its `_agent_loop`; the handler just
+sleeps until external action moves it out.
+
+### 3. `oc_retry` (`/oc retry`, `hermes oco retry`)
+
+Single tool that handles three cases:
+
+- `FAILED` agent: restores `phase_before_failed` (stamped at every
+  FAILED transition), clears `last_error`, `last_tick_error`,
+  `consecutive_tick_failures`, `consecutive_aborts`.
+- `NEEDS_INTERVENTION` agent: restores `phase_before_intervention`,
+  clears the intervention fields.
+- Any other non-terminal agent: resets `phase_retry_count` and
+  `last_tick_error` so the next tick runs clean. Useful for stuck
+  agents after a gateway restart or transient network outage.
+
+Refuses on `DONE` / `KILLED` / `CANCELLED`, and on `FAILED` with
+`last_error` containing `project gone` (truly unrecoverable;
+project must be re-added first).
+
+Auto-stamping: when `_runtime.agents.update(..., phase="FAILED")`
+fires, also pass `phase_before_failed=<current phase>`. The
+ergonomic helper is to set it explicitly at the call site since
+not every FAILED-bound transition is resumable.
+
+### Phase-stuck watchdog
+
+`_phase_stuck_loop` runs every `STUCK_CHECK_INTERVAL_SEC = 60` s.
+For each agent in `STUCK_WATCHED_PHASES` (transitional / short
+phases only — see the constant) whose `phase_entered_at` is more
+than `STUCK_WARN_SEC = 600` s ago, fires a one-shot `phase_stuck`
+notification. Re-arms when the phase changes
+(`last_stuck_notify_at` is cleared by `AgentStore.update`'s
+phase-change branch).
+
+Watched: `CREATED, BOOTSTRAPPING, IDLE_TASK_COMPLETE,
+REVIEW_SPAWNING, REVIEW_DELIVERED, IDLE_REVIEW_ADDRESSED,
+COMMITTING`.
+Skipped (long-running): `EXECUTING, EXECUTOR_ADDRESSING, REVIEWING, PR_OPEN`.
+Skipped (blocked): `AWAITING_HUMAN, NEEDS_INTERVENTION, RATE_LIMITED, QUEUED`.
+
+### Differentiated abort nudges
+
+`_check_executor_abort` (3-strike `MessageAbortedError` detector)
+varies the nudge by attempt via `ABORT_NUDGE_PROMPTS`:
+
+1. `continue`
+2. `You stopped mid-task. Resume where you left off and finish the work.`
+3. `[SYSTEM DIRECTIVE: HERMES-OPENCODE - RESUME] ...`
+
+Same 3-strike escalation, but each attempt gets a different prompt
+shape. After strike 3 the agent is escalated to `FAILED` with
+`phase_before_failed` set so `oc_retry` works.
+
+### When adding new failure paths
+
+- For recoverable transport/IO failures: call `_handle_phase_failure(agent, phase_name, summary)` instead of `_runtime.agents.update(phase="FAILED")` directly. If the failure has a clear operator action, add `on_exhausted_intervene=True`.
+- When escalating to `FAILED` directly (truly unrecoverable, e.g. `project gone`): stamp `phase_before_failed=<agent.phase>` so operators have the option to `oc_retry` if circumstances change.
+- Add new transitional phases to `STUCK_WATCHED_PHASES` so the watchdog catches stalls.
+
 ## CANCELLED vs KILLED (LOAD-BEARING)
 
 Two terminal phases mean different things:

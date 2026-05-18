@@ -34,6 +34,7 @@ _PHASE_GLYPH = {
     "QUEUED": "⏳",
     "EXECUTING": "▶",
     "AWAITING_HUMAN": "✋",
+    "NEEDS_INTERVENTION": "🛟",
     "EXECUTOR_ADDRESSING": "▶",
     "IDLE_TASK_COMPLETE": "⏸",
     "IDLE_REVIEW_ADDRESSED": "⏸",
@@ -360,6 +361,52 @@ def make_oc_cancel(runtime: "Runtime") -> Callable[[str], str]:
     return handler
 
 
+def make_oc_retry(runtime: "Runtime") -> Callable[[str], str]:
+    def handler(raw_args: str) -> str:
+        text = (raw_args or "").strip()
+        if not text or text in {"help", "-h", "--help"}:
+            return (
+                "usage: /oc retry <agent_id>\n"
+                "\n"
+                "Kick an agent to retry. Works on:\n"
+                "  - FAILED agents: restore phase_before_failed, clear retry counts\n"
+                "  - NEEDS_INTERVENTION agents: restore phase_before_intervention\n"
+                "  - Any other non-terminal agent: clear retry counters + last_tick_error\n"
+                "\n"
+                "Refuses on DONE / KILLED / CANCELLED, and on FAILED agents whose\n"
+                "last_error is genuinely unrecoverable (e.g. 'project gone')."
+            )
+        agent_id = text.split(None, 1)[0]
+        agent = runtime.agents.get(agent_id)
+        if agent is None:
+            return f"unknown agent: {agent_id}"
+        try:
+            from . import tools as tools_mod
+            retry_fn = tools_mod.make_retry(runtime)
+            result = event_loop.run_blocking(
+                lambda: retry_fn({"agent_id": agent_id})
+            )
+        except RuntimeError as e:
+            return f"retry failed: {e}"
+        import json
+        try:
+            payload = json.loads(result)
+        except (ValueError, TypeError):
+            return result
+        if not payload.get("ok"):
+            return f"retry failed: {payload.get('error', 'unknown')}"
+        data = payload.get("data") or {}
+        mode = data.get("mode", "unknown")
+        if mode == "failed-resume":
+            return f"resumed {agent_id} from FAILED -> {data.get('restored_phase')}"
+        if mode == "intervention-resume":
+            return f"resumed {agent_id} from NEEDS_INTERVENTION -> {data.get('restored_phase')}"
+        if mode == "kick":
+            return f"kicked {agent_id} in phase={data.get('phase')}; {data.get('note')}"
+        return f"retried {agent_id}: {data}"
+    return handler
+
+
 def make_oc_spawn(runtime: "Runtime") -> Callable[[str], str]:
     def handler(raw_args: str) -> str:
         text = (raw_args or "").strip()
@@ -540,6 +587,7 @@ _OC_HELP_TEXT = (
     "  /oc attach <agent_id> [--lines N]     print the last N (default 80) lines of an agent's transcript\n"
     "  /oc questions                         list pending opencode questions awaiting a human answer\n"
     "  /oc cancel <agent_id> [reason ...]    wind down an agent without merging; keeps record as CANCELLED\n"
+    "  /oc retry <agent_id>                  kick an agent to retry: FAILED -> phase_before_failed, NEEDS_INTERVENTION -> phase_before_intervention, otherwise reset retry counters\n"
     "  /oc doctor                            plugin health report (versions, bg loop alive, deps, state files)\n"
     "  /oc test-notify [message ...]         force a notify fanout (gateway DM + dashboard + cli); reports per-sink ok/FAIL with detail\n"
     "  /oc help                              show this help\n"
@@ -557,6 +605,7 @@ def make_oc_dispatcher(runtime: "Runtime") -> Callable[[str], str]:
     questions_fn = make_oc_questions(runtime)
     doctor_fn = make_oc_doctor(runtime)
     cancel_fn = make_oc_cancel(runtime)
+    retry_fn = make_oc_retry(runtime)
     test_notify_fn = make_oc_test_notify(runtime)
     spawn_fn = make_oc_spawn(runtime)
     resume_pr_fn = make_oc_resume_pr(runtime)
@@ -566,6 +615,7 @@ def make_oc_dispatcher(runtime: "Runtime") -> Callable[[str], str]:
         "questions": questions_fn,
         "doctor": doctor_fn,
         "cancel": cancel_fn,
+        "retry": retry_fn,
         "test-notify": test_notify_fn,
         "spawn": spawn_fn,
         "resume-pr": resume_pr_fn,

@@ -13,6 +13,7 @@ PHASES = {
     "BOOTSTRAPPING",
     "EXECUTING",
     "AWAITING_HUMAN",
+    "NEEDS_INTERVENTION",
     "IDLE_TASK_COMPLETE",
     "REVIEW_SPAWNING",
     "REVIEWING",
@@ -27,6 +28,8 @@ PHASES = {
     "KILLED",
     "CANCELLED",
 }
+
+TERMINAL_PHASES = frozenset({"DONE", "FAILED", "KILLED", "CANCELLED"})
 
 
 @dataclass
@@ -71,6 +74,13 @@ class Agent:
     awaiting_entry_had_pending_qp: bool = False
     idle_since: float | None = None
     ready_for_review_at: float | None = None
+    phase_retry_count: int = 0
+    phase_entered_at: float = field(default_factory=time.time)
+    phase_before_failed: str | None = None
+    phase_before_intervention: str | None = None
+    intervention_reason: str | None = None
+    intervention_since: float | None = None
+    last_stuck_notify_at: float | None = None
 
 
 class AgentExists(ValueError):
@@ -142,8 +152,17 @@ class AgentStore:
             phase = fields_to_set.get("phase")
             if isinstance(phase, str) and phase not in PHASES:
                 raise ValueError(f"invalid phase: {phase}")
+            prev_phase = d[agent_id].get("phase")
             for k, v in fields_to_set.items():
                 d[agent_id][k] = v
-            d[agent_id]["last_activity_at"] = time.time()
+            now = time.time()
+            d[agent_id]["last_activity_at"] = now
+            if isinstance(phase, str) and phase != prev_phase:
+                if "phase_entered_at" not in fields_to_set:
+                    d[agent_id]["phase_entered_at"] = now
+                if "phase_retry_count" not in fields_to_set:
+                    d[agent_id]["phase_retry_count"] = 0
+                if "last_stuck_notify_at" not in fields_to_set:
+                    d[agent_id]["last_stuck_notify_at"] = None
             self._write(d)
             return Agent(**d[agent_id])
