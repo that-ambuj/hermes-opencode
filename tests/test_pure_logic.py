@@ -3859,3 +3859,182 @@ class TestStatusToolEnrichment:
         assert "writing the JWT validator" in out["last_assistant_text_snippet"]
         assert out["last_classifier"]["awaiting"] is False
         assert out["last_classifier"]["source"] == "llm"
+
+
+class TestServeHealingGraceWindow:
+    def setup_method(self):
+        self._saved_runtime = event_loop_mod._runtime
+        self._saved_down_at = event_loop_mod._serve_down_notified_at
+        self._saved_recovered_at = event_loop_mod._serve_recovered_at
+        self._saved_TICK_THRESHOLD = event_loop_mod.TICK_FAILURE_ESCALATION_THRESHOLD
+        event_loop_mod._unhealthy_tick_notified_agents.clear()
+
+    def teardown_method(self):
+        event_loop_mod._runtime = self._saved_runtime
+        event_loop_mod._serve_down_notified_at = self._saved_down_at
+        event_loop_mod._serve_recovered_at = self._saved_recovered_at
+        event_loop_mod.TICK_FAILURE_ESCALATION_THRESHOLD = self._saved_TICK_THRESHOLD
+        event_loop_mod._unhealthy_tick_notified_agents.clear()
+
+    def _make_runtime(self, tmp_path, agent):
+        cfg = config_mod.Config(
+            host="127.0.0.1", port=4096,
+            worktrees_root=tmp_path / "wt",
+            agents_file=tmp_path / "agents.json",
+            projects_file=tmp_path / "projects.json",
+            logs_dir=tmp_path / "logs",
+            notifications_file=tmp_path / "notifications.jsonl",
+            events_log=tmp_path / "events.log",
+        )
+        cfg.ensure_dirs()
+        store = state_mod.AgentStore(cfg.agents_file)
+        store.add(agent)
+        class _RT: ...
+        rt = _RT()
+        rt.config = cfg
+        rt.agents = store
+        return rt
+
+    def _agent(self, agent_id="oco/x"):
+        return state_mod.Agent(
+            agent_id=agent_id, project_label="p", worktree_path="/tmp/wt",
+            session_id="sess1", branch="br", initial_prompt="hi",
+            phase="EXECUTING",
+        )
+
+    def _capture_notifications(self):
+        captured: list[tuple] = []
+        def _spy(agent, kind, body=""):
+            captured.append((kind, getattr(agent, "agent_id", None), body))
+        prev = event_loop_mod._notify_event
+        event_loop_mod._notify_event = _spy
+        return captured, prev
+
+    def test_helper_healthy_returns_false(self):
+        event_loop_mod._serve_down_notified_at = 0.0
+        event_loop_mod._serve_recovered_at = 0.0
+        assert event_loop_mod._serve_is_unhealthy_or_healing() is False
+
+    def test_helper_down_returns_true(self):
+        event_loop_mod._serve_down_notified_at = time.time()
+        event_loop_mod._serve_recovered_at = 0.0
+        assert event_loop_mod._serve_is_unhealthy_or_healing() is True
+
+    def test_helper_recently_recovered_returns_true(self):
+        event_loop_mod._serve_down_notified_at = 0.0
+        event_loop_mod._serve_recovered_at = time.time() - 5.0
+        assert event_loop_mod._serve_is_unhealthy_or_healing() is True
+
+    def test_helper_long_after_recovery_returns_false(self):
+        event_loop_mod._serve_down_notified_at = 0.0
+        event_loop_mod._serve_recovered_at = time.time() - (event_loop_mod.SERVE_HEALING_GRACE_SEC + 5.0)
+        assert event_loop_mod._serve_is_unhealthy_or_healing() is False
+
+    def test_unhealthy_skips_increment_but_still_notifies(self, tmp_path):
+        agent = self._agent()
+        rt = self._make_runtime(tmp_path, agent)
+        event_loop_mod._runtime = rt
+        event_loop_mod._serve_down_notified_at = time.time()
+        event_loop_mod._serve_recovered_at = 0.0
+        captured, prev = self._capture_notifications()
+        try:
+            event_loop_mod._record_tick_failure(agent, ConnectionError("boom"))
+            event_loop_mod._record_tick_failure(agent, ConnectionError("boom"))
+            event_loop_mod._record_tick_failure(agent, ConnectionError("boom"))
+            event_loop_mod._record_tick_failure(agent, ConnectionError("boom"))
+        finally:
+            event_loop_mod._notify_event = prev
+        after = rt.agents.get(agent.agent_id)
+        assert after.consecutive_tick_failures == 0
+        assert after.phase == "EXECUTING"
+        assert after.last_tick_error is not None and "boom" in after.last_tick_error
+        kinds = [c[0] for c in captured]
+        assert kinds.count("tick_error") == 1
+        assert "failed" not in kinds
+        assert "not counted toward escalation" in captured[0][2]
+
+    def test_healing_grace_skips_increment(self, tmp_path):
+        agent = self._agent()
+        rt = self._make_runtime(tmp_path, agent)
+        event_loop_mod._runtime = rt
+        event_loop_mod._serve_down_notified_at = 0.0
+        event_loop_mod._serve_recovered_at = time.time() - 5.0
+        captured, prev = self._capture_notifications()
+        try:
+            for _ in range(5):
+                event_loop_mod._record_tick_failure(agent, ConnectionError("transient"))
+        finally:
+            event_loop_mod._notify_event = prev
+        after = rt.agents.get(agent.agent_id)
+        assert after.consecutive_tick_failures == 0
+        assert after.phase == "EXECUTING"
+
+    def test_healthy_still_escalates_at_threshold(self, tmp_path):
+        agent = self._agent()
+        rt = self._make_runtime(tmp_path, agent)
+        event_loop_mod._runtime = rt
+        event_loop_mod._serve_down_notified_at = 0.0
+        event_loop_mod._serve_recovered_at = 0.0
+        captured, prev = self._capture_notifications()
+        try:
+            for _ in range(event_loop_mod.TICK_FAILURE_ESCALATION_THRESHOLD):
+                event_loop_mod._record_tick_failure(agent, RuntimeError("real stall"))
+        finally:
+            event_loop_mod._notify_event = prev
+        after = rt.agents.get(agent.agent_id)
+        assert after.phase == "FAILED"
+        assert after.phase_before_failed == "EXECUTING"
+        assert after.consecutive_tick_failures >= event_loop_mod.TICK_FAILURE_ESCALATION_THRESHOLD
+        assert "real stall" in (after.last_error or "")
+
+    def test_grace_expiration_resumes_counting(self, tmp_path):
+        agent = self._agent()
+        rt = self._make_runtime(tmp_path, agent)
+        event_loop_mod._runtime = rt
+        event_loop_mod._serve_down_notified_at = 0.0
+        event_loop_mod._serve_recovered_at = time.time() - 5.0
+        captured, prev = self._capture_notifications()
+        try:
+            for _ in range(3):
+                event_loop_mod._record_tick_failure(agent, ConnectionError("boom"))
+            event_loop_mod._serve_recovered_at = time.time() - (event_loop_mod.SERVE_HEALING_GRACE_SEC + 5.0)
+            for _ in range(event_loop_mod.TICK_FAILURE_ESCALATION_THRESHOLD):
+                event_loop_mod._record_tick_failure(agent, RuntimeError("real stall"))
+        finally:
+            event_loop_mod._notify_event = prev
+        after = rt.agents.get(agent.agent_id)
+        assert after.phase == "FAILED"
+        assert after.phase_before_failed == "EXECUTING"
+
+    def test_clear_tick_failure_discards_from_unhealthy_set(self, tmp_path):
+        agent = self._agent()
+        rt = self._make_runtime(tmp_path, agent)
+        event_loop_mod._runtime = rt
+        event_loop_mod._serve_down_notified_at = time.time()
+        event_loop_mod._serve_recovered_at = 0.0
+        captured, prev = self._capture_notifications()
+        try:
+            event_loop_mod._record_tick_failure(agent, ConnectionError("boom"))
+            assert agent.agent_id in event_loop_mod._unhealthy_tick_notified_agents
+            event_loop_mod._clear_tick_failure(agent)
+            assert agent.agent_id not in event_loop_mod._unhealthy_tick_notified_agents
+            event_loop_mod._record_tick_failure(agent, ConnectionError("boom2"))
+        finally:
+            event_loop_mod._notify_event = prev
+        kinds = [c[0] for c in captured]
+        assert kinds.count("tick_error") == 2
+
+    def test_notify_serve_recovered_stamps_recovered_at(self, tmp_path):
+        agent = self._agent()
+        rt = self._make_runtime(tmp_path, agent)
+        event_loop_mod._runtime = rt
+        event_loop_mod._serve_recovered_at = 0.0
+        prev = event_loop_mod._fanout_serve_event
+        event_loop_mod._fanout_serve_event = lambda *a, **k: None
+        try:
+            before = time.time()
+            event_loop_mod._notify_serve_recovered()
+            after = time.time()
+        finally:
+            event_loop_mod._fanout_serve_event = prev
+        assert before <= event_loop_mod._serve_recovered_at <= after

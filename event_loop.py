@@ -40,6 +40,7 @@ SERVE_RESTART_MAX_ATTEMPTS = 5
 SERVE_RESTART_BACKOFF_BASE_SEC = 1.0
 SERVE_DOWN_NOTIFY_COOLDOWN_SEC = 600.0
 SERVE_DOWN_NOTIFY_SINKS = ("cli", "dashboard", "gateway")
+SERVE_HEALING_GRACE_SEC = 30.0
 TICK_FAILURE_ESCALATION_THRESHOLD = 3
 ABORT_ESCALATION_THRESHOLD = 3
 ABORT_AUTO_CONTINUE_MESSAGE = "continue"
@@ -96,6 +97,17 @@ AWAITING_INPUT_REMINDER_TICK_SEC = 60.0
 
 _serve_seen_alive: bool = False
 _serve_down_notified_at: float = 0.0
+_serve_recovered_at: float = 0.0
+_unhealthy_tick_notified_agents: set[str] = set()
+
+
+def _serve_is_unhealthy_or_healing() -> bool:
+    if _serve_down_notified_at != 0.0:
+        return True
+    if _serve_recovered_at != 0.0:
+        if time.time() - _serve_recovered_at < SERVE_HEALING_GRACE_SEC:
+            return True
+    return False
 
 
 _EVENT_GLYPH = {
@@ -981,6 +993,8 @@ def _build_serve_recovered_notification() -> tuple[str, str, dict]:
 
 
 def _notify_serve_recovered() -> None:
+    global _serve_recovered_at
+    _serve_recovered_at = time.time()
     _fanout_serve_event("serve_recovered", *_build_serve_recovered_notification())
 
 
@@ -1105,6 +1119,21 @@ def _record_tick_failure(agent: Agent, exc: BaseException) -> None:
     try:
         current = _runtime.agents.get(agent.agent_id)
         previous = current.consecutive_tick_failures if current else 0
+        serve_unhealthy = _serve_is_unhealthy_or_healing()
+        if serve_unhealthy:
+            updated = _runtime.agents.update(
+                agent.agent_id,
+                last_tick_error=summary,
+                last_tick_error_at=time.time(),
+            )
+            if agent.agent_id not in _unhealthy_tick_notified_agents:
+                _unhealthy_tick_notified_agents.add(agent.agent_id)
+                _notify_event(
+                    updated, "tick_error",
+                    f"Tick failed (opencode serve unhealthy, not counted toward "
+                    f"escalation): {summary}",
+                )
+            return
         consecutive = previous + 1
         updated = _runtime.agents.update(
             agent.agent_id,
@@ -1130,6 +1159,7 @@ def _record_tick_failure(agent: Agent, exc: BaseException) -> None:
 def _clear_tick_failure(agent: Agent) -> None:
     if _runtime is None:
         return
+    _unhealthy_tick_notified_agents.discard(agent.agent_id)
     try:
         current = _runtime.agents.get(agent.agent_id)
         if current and current.consecutive_tick_failures > 0:

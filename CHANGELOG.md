@@ -5,6 +5,48 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.1] - 2026-05-19
+
+Bugfix: serve-down false escalations.
+
+Observed during a `hermes gateway restart` on a worktree with 5
+active agents: `opencode serve` flapped (down -> restart attempts ->
+recovered) within a few seconds. In that window every active agent
+hit 3 consecutive transport-level tick errors (ConnectError on
+`wait_idle` / ReadError on `list_questions`) and the v0.18.0 3-strike
+escalation correctly counted them and escalated 3 agents to FAILED.
+The escalation was correct per its own contract but the underlying
+cause was the supervisor's own serve-restart cycle, not real stalls.
+
+Fix: tick failures that occur while the watchdog reports `serve_down`
+(or within `SERVE_HEALING_GRACE_SEC = 30 s` after `serve_recovered`)
+no longer increment `consecutive_tick_failures` and never escalate
+to FAILED. They still:
+
+- write `last_tick_error` / `last_tick_error_at` (so dashboards see
+  the error)
+- fire ONE `tick_error` notification per agent per unhealthy episode
+  with body annotated `(opencode serve unhealthy, not counted toward
+  escalation)`. Dedupe via `_unhealthy_tick_notified_agents`; the
+  set entry is dropped by `_clear_tick_failure` when the agent ticks
+  successfully again, so a subsequent unhealthy episode notifies
+  fresh.
+
+Healthy stalls (serve responsive but agent unresponsive) still
+escalate at the 3-strike threshold exactly as in v0.18.0+.
+
+### Internal surface
+
+- `event_loop.SERVE_HEALING_GRACE_SEC = 30.0`
+- `event_loop._serve_recovered_at: float` (stamped in `_notify_serve_recovered`)
+- `event_loop._serve_is_unhealthy_or_healing() -> bool`
+- `event_loop._unhealthy_tick_notified_agents: set[str]` (per-episode dedupe)
+- `_clear_tick_failure(agent)` now also discards the agent_id from
+  the unhealthy set unconditionally (so a successful tick resets
+  the dedupe for the next episode)
+
+10 new tests; 428 -> 438 total.
+
 ## [0.19.0] - 2026-05-19
 
 Hermes chat UX: proactive dispatch + natural progress narration.

@@ -559,6 +559,48 @@ fires, also pass `phase_before_failed=<current phase>`. The
 ergonomic helper is to set it explicitly at the call site since
 not every FAILED-bound transition is resumable.
 
+### Serve-down grace window (v0.19.1+)
+
+The supervisor's `_serve_watchdog_loop` fires `serve_down` /
+`serve_recovered` notifications and attempts exponential restarts of
+`opencode serve` when it goes unreachable. During those windows
+every active agent is hitting transport-level errors on its next
+tick (`ConnectError` on `wait_idle`, `ReadError` on
+`list_questions`, etc.) and the 3-strike tick-failure escalation
+would otherwise FAIL all active agents for the supervisor's own
+restart cycle.
+
+v0.19.1 gates `_record_tick_failure`'s counter increment + escalation
+on `_serve_is_unhealthy_or_healing()`, which returns True when:
+
+- `_serve_down_notified_at != 0.0` (currently down per the watchdog), OR
+- `_serve_recovered_at` is within `SERVE_HEALING_GRACE_SEC = 30 s`
+  of now (just recovered, agents have not yet gotten one clean tick)
+
+When True, the tick error is recorded (`last_tick_error`,
+`last_tick_error_at`) and ONE `tick_error` notification fires per
+agent per unhealthy episode (deduped via
+`_unhealthy_tick_notified_agents`), but:
+
+- `consecutive_tick_failures` is NOT incremented
+- escalation to FAILED is skipped
+
+`_clear_tick_failure(agent)` (called on every successful tick)
+unconditionally drops the agent_id from
+`_unhealthy_tick_notified_agents` so the next unhealthy episode
+notifies fresh.
+
+Healthy stalls (serve responsive but agent unresponsive) still
+escalate at the 3-strike threshold. Only transport-during-flap
+errors are gated.
+
+When adding new agent failure paths that distinguish transient
+transport errors from real stalls: gate on
+`_serve_is_unhealthy_or_healing()` whenever the failure mode is
+"transport to opencode serve" specifically. Do NOT gate on it for
+errors from external services (github CLI, git, etc.) — those have
+their own retry budgets via `_handle_phase_failure`.
+
 ### Phase-stuck watchdog
 
 `_phase_stuck_loop` runs every `STUCK_CHECK_INTERVAL_SEC = 60` s.
