@@ -21,12 +21,25 @@ This plugin depends on these Python packages (installed alongside hermes-agent):
 - `httpx`
 - `httpx-sse`
 - `PyYAML`
+- `opencode-api` (typed Python SDK for opencode, pinned to the opencode server version)
 
 If any are missing in your hermes Python environment, install them:
 
 ```bash
-pip install httpx httpx-sse PyYAML
+pip3 install httpx httpx-sse PyYAML
+pip3 install "git+https://github.com/that-ambuj/opencode-python-sdk.git@v1.15.5"
 ```
+
+Or with `uv`:
+
+```bash
+uv pip install httpx httpx-sse PyYAML
+uv pip install "git+https://github.com/that-ambuj/opencode-python-sdk.git@v1.15.5"
+```
+
+The opencode-api version pin tracks the opencode server version exactly.
+If you upgrade your opencode server, bump the tag in
+`requirements.txt` to match.
 
 You also need the `opencode` binary on `PATH`. The plugin will auto-spawn
 `opencode serve` at first use if no server is reachable.

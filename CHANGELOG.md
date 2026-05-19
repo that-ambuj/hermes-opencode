@@ -5,6 +5,85 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.21.0] - 2026-05-19
+
+Replace the hand-written `httpx` transport with the typed
+[`opencode-api`](https://github.com/that-ambuj/opencode-python-sdk) SDK
+(liblab-generated from opencode's OpenAPI spec, version-pinned to the
+opencode server release). Drop-in migration: every public
+`OpencodeClient` method keeps its existing signature and return type;
+internal bodies now call SDK service methods underneath.
+
+### Why
+
+Each opencode-server bump used to require hand-translating new endpoints
+into raw `httpx` calls. The SDK is generated from the spec, so endpoint
+coverage tracks the server exactly when the tag is bumped. v0.21.0 is
+the foundation for v0.21.x deadlock + narration fixes that need the new
+`/session/status`, `/session/:id/todo`, `/session/:id/diff` endpoints
+plus richer bus events.
+
+### What changed
+
+- `transport.py` rewritten — every API method now calls
+  `OpencodeAsync.<service>.<method>()` instead of `httpx.AsyncClient(...)`.
+  Two lazy SDK clients per `OpencodeClient` (`_sdk_default` 60s,
+  `_sdk_long` 600s) so timeout sensitivity is preserved.
+- `OpencodeClient.ping()` and `OpencodeClient.stream_events()` STAY on
+  raw `httpx` / `httpx-sse`: ping needs a 2s timeout independent of the
+  SDK client, and the SDK doesn't surface `/event` as a streaming
+  iterator. Documented as intentional in AGENTS.md.
+- New transport methods enabled by the SDK:
+  - `list_session_status(directory)` — `GET /session/status` (the
+    canonical "all idle" indicator: empty dict = every session idle).
+  - `list_todos(session_id, directory)` — `GET /session/:id/todo`.
+  - `session_diff(session_id, directory, message_id?)` — `GET
+    /session/:id/diff`.
+- Tests updated where they monkey-patched the old `_client` factory:
+  `test_resilience.test_wait_idle_wraps_connect_error` now patches
+  `client._sdk` to return a stub SDK whose `v2.v2_session_wait` raises
+  `ConnectError`, verifying the same `OpencodeError` wrapping contract.
+- `requirements.txt` adds `opencode-api @ git+https://github.com/that-ambuj/opencode-python-sdk.git@v1.15.5`.
+- `wait_idle()` no longer silently swallows arbitrary `RequestError` —
+  only `httpx.ReadTimeout` was swallowed in the pre-migration code, and
+  the v2 wait endpoint is a server-side no-op anyway. Any transport
+  failure now propagates as `OpencodeError`, restoring the original
+  `_phase_executing` backoff path on transport-down.
+
+### Wire shape preserved
+
+Every method returns plain Python dicts/lists/bools — not the SDK's
+typed pydantic-like models. Internally each helper extracts
+`OpencodeResponse.raw.json()` so callers see the original camelCase
+field names (`id`, `sessionID`, `projectID`) instead of the SDK's
+snake_case attribute names (`id_`, `project_id`). Zero changes needed
+in `event_loop`, `tools`, `bootstrap`, `commands`, `cli`, `reviewer`.
+
+### Two upstream SDK bugs patched in the v1.15.5 tag
+
+The SDK is liblab-generated and ships two bugs surfaced during this
+migration. Both are patched in the fork and folded into the v1.15.5
+tag in-place (the SDK version stays linked to the opencode server
+version):
+
+1. `OpencodeAsync.__init__` calls `super().__init__()` which sets
+   access_token + timeout on the SYNC services, then overwrites every
+   `self.<service>` with the async equivalent — losing both. The patch
+   re-applies them at the end of `__init__`. Without it, every async
+   call raises `KeyError: 'access_token_auth'`.
+2. `cast_models._get_instanced_type` unconditionally coerces values to
+   their declared type, including the `SENTINEL` default object that
+   signals "argument not passed". For Enum-typed optional params this
+   raises `ValueError: <SENTINEL> is not a valid <EnumType>`. The patch
+   short-circuits when `data is SENTINEL`.
+
+Both patches carry `# patch: ...` markers so a future regen surfaces
+them in code review.
+
+### Test count
+
+487 → 487 (no count change; one test updated for new mock path).
+
 ## [0.20.3] - 2026-05-19
 
 Three fixes for the human-input surface, all motivated by one live

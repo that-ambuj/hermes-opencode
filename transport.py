@@ -13,7 +13,22 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable, TypeVar
+
 import httpx
+from opencode_api import OpencodeAsync
+from opencode_api.models import (
+    QuestionReplyRequest,
+    SessionCreateRequest,
+    SessionCreateRequestModel,
+    SessionPromptAsyncRequest,
+    SessionPromptRequest,
+)
+from opencode_api.models.permission_respond_request import (
+    PermissionRespondRequest,
+    Response as PermissionRespondResponseEnum,
+)
+from opencode_api.net.transport.api_error import ApiError
+from opencode_api.net.transport.request_error import RequestError
 
 logger = logging.getLogger("hermes_opencode.transport")
 
@@ -25,6 +40,10 @@ class OpencodeError(RuntimeError):
 _T = TypeVar("_T")
 
 
+_SDK_DEFAULT_TIMEOUT_MS = 60_000
+_SDK_LONG_TIMEOUT_MS = 600_000
+
+
 def _wrap_transport_errors(coro: Callable[..., Awaitable[_T]]) -> Callable[..., Awaitable[_T]]:
     @functools.wraps(coro)
     async def wrapper(*args: Any, **kwargs: Any) -> _T:
@@ -32,9 +51,38 @@ def _wrap_transport_errors(coro: Callable[..., Awaitable[_T]]) -> Callable[..., 
             return await coro(*args, **kwargs)
         except OpencodeError:
             raise
-        except httpx.HTTPError as e:
+        except (httpx.HTTPError, ApiError, RequestError) as e:
             raise OpencodeError(f"transport error in {coro.__name__}: {type(e).__name__}: {e}") from e
     return wrapper
+
+
+def _response_dict(resp: Any) -> dict[str, Any]:
+    raw = getattr(resp, "raw", None)
+    if raw is None:
+        return {}
+    try:
+        body = raw.json()
+    except (ValueError, AttributeError):
+        return {}
+    return body if isinstance(body, dict) else {}
+
+
+def _response_list(resp: Any) -> list[dict[str, Any]]:
+    raw = getattr(resp, "raw", None)
+    if raw is None:
+        return []
+    try:
+        body = raw.json()
+    except (ValueError, AttributeError):
+        return []
+    return [item for item in body if isinstance(item, dict)] if isinstance(body, list) else []
+
+
+def _response_status_ok(resp: Any) -> bool:
+    raw = getattr(resp, "raw", None)
+    if raw is None:
+        return True
+    return getattr(raw, "status_code", 0) in (200, 204)
 
 
 class OpencodeClient:
@@ -55,16 +103,27 @@ class OpencodeClient:
         self._last_serve_log_path: Path | None = None
         self._spawn_started_at: float | None = None
         self._last_spawn_pid: int | None = None
+        self._sdk_default: OpencodeAsync | None = None
+        self._sdk_long: OpencodeAsync | None = None
+        self._sdk_lock = threading.Lock()
 
     @property
     def endpoint(self) -> str:
         return f"{self._host}:{self._port}"
 
-    def _client(self, directory: Path | None = None, timeout: float = 60.0) -> httpx.AsyncClient:
-        headers = dict(self._headers)
-        if directory is not None:
-            headers["x-opencode-directory"] = str(directory)
-        return httpx.AsyncClient(base_url=self.base_url, headers=headers, timeout=timeout)
+    def _sdk(self, *, long_timeout: bool = False) -> OpencodeAsync:
+        slot_attr = "_sdk_long" if long_timeout else "_sdk_default"
+        existing = getattr(self, slot_attr)
+        if existing is not None:
+            return existing
+        with self._sdk_lock:
+            existing = getattr(self, slot_attr)
+            if existing is not None:
+                return existing
+            timeout_ms = _SDK_LONG_TIMEOUT_MS if long_timeout else _SDK_DEFAULT_TIMEOUT_MS
+            client = OpencodeAsync(base_url=self.base_url, timeout=timeout_ms)
+            setattr(self, slot_attr, client)
+            return client
 
     @staticmethod
     def _port_open(host: str, port: int, timeout: float = 0.3) -> bool:
@@ -76,7 +135,7 @@ class OpencodeClient:
 
     async def ping(self) -> bool:
         try:
-            async with self._client(timeout=2.0) as c:
+            async with httpx.AsyncClient(base_url=self.base_url, headers=dict(self._headers), timeout=2.0) as c:
                 r = await c.get("/")
                 return r.status_code == 200
         except Exception:
@@ -256,100 +315,92 @@ class OpencodeClient:
         agent: str = "build",
         model: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        body: dict[str, Any] = {"agent": agent}
+        kwargs: dict[str, Any] = {"agent": agent}
         if model:
-            body["model"] = model
-        async with self._client(directory) as c:
-            r = await c.post("/session", json=body)
-            if r.status_code >= 400:
-                raise OpencodeError(f"POST /session failed: {r.status_code} {r.text[:200]}")
-            return r.json()
+            kwargs["model"] = SessionCreateRequestModel(
+                id_=model["id"],
+                provider_id=model["providerID"],
+                **({"variant": model["variant"]} if model.get("variant") else {}),
+            )
+        body = SessionCreateRequest(**kwargs)
+        resp = await self._sdk().session.session_create(request_body=body, directory=str(directory))
+        return _response_dict(resp)
 
     @_wrap_transport_errors
     async def send_message(self, session_id: str, directory: Path, text: str, timeout: float = 600.0) -> dict[str, Any]:
-        async with self._client(directory, timeout=timeout) as c:
-            r = await c.post(
-                f"/session/{session_id}/message",
-                json={"parts": [{"type": "text", "text": text}]},
-            )
-            if r.status_code >= 400:
-                raise OpencodeError(f"POST message failed: {r.status_code} {r.text[:200]}")
-            try:
-                return r.json()
-            except Exception:
-                return {"raw": r.text}
+        body = SessionPromptRequest(parts=[{"type": "text", "text": text}])
+        resp = await self._sdk(long_timeout=True).session.session_prompt(
+            session_id=session_id, request_body=body, directory=str(directory),
+        )
+        return _response_dict(resp)
 
     @_wrap_transport_errors
     async def send_message_async(self, session_id: str, directory: Path, text: str, timeout: float = 30.0) -> dict[str, Any]:
-        """Fire-and-forget: queue a prompt on the session and return immediately.
-
-        Use from synchronous-host code paths (hermes tool handlers, CLI subcommands)
-        where blocking the caller for the full assistant turn is unacceptable.
-        The plugin's bg event-loop is responsible for picking up completion via
-        the polling / SSE channels.
-        """
-        async with self._client(directory, timeout=timeout) as c:
-            r = await c.post(
-                f"/session/{session_id}/prompt_async",
-                json={"parts": [{"type": "text", "text": text}]},
-            )
-            if r.status_code >= 400:
-                raise OpencodeError(f"POST prompt_async failed: {r.status_code} {r.text[:200]}")
-            try:
-                return r.json() if r.text else {"queued": True}
-            except Exception:
-                return {"raw": r.text, "queued": True}
+        body = SessionPromptAsyncRequest(parts=[{"type": "text", "text": text}])
+        await self._sdk().session.session_prompt_async(
+            session_id=session_id, request_body=body, directory=str(directory),
+        )
+        return {"queued": True}
 
     @_wrap_transport_errors
     async def wait_idle(self, session_id: str, directory: Path, timeout: float = 600.0) -> bool:
-        async with self._client(directory, timeout=timeout) as c:
-            try:
-                r = await c.post(f"/api/session/{session_id}/wait")
-                return r.status_code in (200, 204)
-            except httpx.ReadTimeout:
-                return False
+        await self._sdk(long_timeout=True).v2.v2_session_wait(
+            session_id=session_id, directory=str(directory),
+        )
+        return True
 
     @_wrap_transport_errors
     async def get_messages(self, session_id: str, directory: Path, cursor: str | None = None) -> dict[str, Any]:
-        async with self._client(directory) as c:
-            params: dict[str, str] = {}
-            if cursor:
-                params["cursor"] = cursor
-            r = await c.get(f"/api/session/{session_id}/message", params=params)
-            if r.status_code >= 400:
-                raise OpencodeError(f"GET messages failed: {r.status_code} {r.text[:200]}")
-            return r.json()
+        kwargs: dict[str, Any] = {"session_id": session_id, "directory": str(directory)}
+        if cursor:
+            kwargs["cursor"] = cursor
+        resp = await self._sdk().v2_messages.v2_session_messages(**kwargs)
+        return _response_dict(resp)
 
     @_wrap_transport_errors
     async def list_questions(self, directory: Path) -> list[dict[str, Any]]:
-        async with self._client(directory) as c:
-            r = await c.get("/question")
-            if r.status_code >= 400:
-                raise OpencodeError(f"GET /question failed: {r.status_code}")
-            data = r.json() if r.text else []
-            return data if isinstance(data, list) else []
+        resp = await self._sdk().question.question_list(directory=str(directory))
+        return _response_list(resp)
 
     @_wrap_transport_errors
     async def list_permissions(self, directory: Path) -> list[dict[str, Any]]:
-        async with self._client(directory) as c:
-            r = await c.get("/permission")
-            if r.status_code >= 400:
-                raise OpencodeError(f"GET /permission failed: {r.status_code}")
-            data = r.json() if r.text else []
-            return data if isinstance(data, list) else []
+        resp = await self._sdk().permission.permission_list(directory=str(directory))
+        return _response_list(resp)
+
+    @_wrap_transport_errors
+    async def list_session_status(self, directory: Path) -> dict[str, dict[str, Any]]:
+        resp = await self._sdk().session.session_status(directory=str(directory))
+        body = _response_dict(resp)
+        return {sid: status for sid, status in body.items() if isinstance(status, dict)}
+
+    @_wrap_transport_errors
+    async def list_todos(self, session_id: str, directory: Path) -> list[dict[str, Any]]:
+        resp = await self._sdk().session.session_todo(session_id=session_id, directory=str(directory))
+        return _response_list(resp)
+
+    @_wrap_transport_errors
+    async def session_diff(self, session_id: str, directory: Path, message_id: str | None = None) -> list[dict[str, Any]]:
+        kwargs: dict[str, Any] = {"session_id": session_id, "directory": str(directory)}
+        if message_id:
+            kwargs["message_id"] = message_id
+        resp = await self._sdk().session.session_diff(**kwargs)
+        return _response_list(resp)
 
     @_wrap_transport_errors
     async def reply_question(self, question_id: str, directory: Path, answers: list[list[str]]) -> bool:
         """Outer list = one inner array per sub-question (in order); inner list = selected option labels or [free_text]. Missing/short outer surfaces "Unanswered" on the executor side."""
-        async with self._client(directory) as c:
-            r = await c.post(f"/question/{question_id}/reply", json={"answers": answers})
-            return r.status_code in (200, 204)
+        body = QuestionReplyRequest(answers=answers)
+        resp = await self._sdk().question.question_reply(
+            request_id=question_id, request_body=body, directory=str(directory),
+        )
+        return _response_status_ok(resp)
 
     @_wrap_transport_errors
     async def reject_question(self, question_id: str, directory: Path) -> bool:
-        async with self._client(directory) as c:
-            r = await c.post(f"/question/{question_id}/reject")
-            return r.status_code in (200, 204)
+        resp = await self._sdk().question.question_reject(
+            request_id=question_id, directory=str(directory),
+        )
+        return _response_status_ok(resp)
 
     @_wrap_transport_errors
     async def reply_permission(
@@ -358,18 +409,19 @@ class OpencodeClient:
     ) -> bool:
         if reply not in {"once", "always", "reject"}:
             raise ValueError(f"reply must be one of once|always|reject, got {reply!r}")
-        body: dict[str, Any] = {"reply": reply}
-        if message:
-            body["message"] = message
-        async with self._client(directory) as c:
-            r = await c.post(f"/session/{session_id}/permissions/{permission_id}", json=body)
-            return r.status_code in (200, 204)
+        body = PermissionRespondRequest(response=PermissionRespondResponseEnum(reply))
+        resp = await self._sdk().session.permission_respond(
+            session_id=session_id, permission_id=permission_id,
+            request_body=body, directory=str(directory),
+        )
+        return _response_status_ok(resp)
 
     @_wrap_transport_errors
     async def delete_session(self, session_id: str, directory: Path) -> bool:
-        async with self._client(directory) as c:
-            r = await c.delete(f"/session/{session_id}")
-            return r.status_code in (200, 204)
+        resp = await self._sdk().session.session_delete(
+            session_id=session_id, directory=str(directory),
+        )
+        return _response_status_ok(resp)
 
     async def stream_events(
         self, directory: Path, stop_event: asyncio.Event,

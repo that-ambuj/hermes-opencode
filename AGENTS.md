@@ -28,6 +28,114 @@ venv at runtime. Dependencies (`httpx`, `httpx-sse`, `PyYAML`) must be
 present in the host hermes venv; document additions in `requirements.txt`
 and `after-install.md`.
 
+## Transport (LOAD-BEARING, v0.21.0+)
+
+`transport.OpencodeClient` is the SINGLE entrypoint to the opencode HTTP
+API. Every other module reaches opencode through this class — there are
+no stray `httpx.AsyncClient(...)` calls in `event_loop`, `tools`,
+`bootstrap`, `commands`, `cli`, or `reviewer`.
+
+The API surface methods (everything except `ping` + `stream_events`) call
+the typed [opencode-api](https://github.com/that-ambuj/opencode-python-sdk)
+SDK underneath, pinned to the opencode server version in
+`requirements.txt`:
+
+```
+opencode-api @ git+https://github.com/that-ambuj/opencode-python-sdk.git@v1.15.5
+```
+
+The SDK is liblab-generated against the live OpenAPI spec, so every
+endpoint stays in lock-step with opencode. The SDK version pin tracks
+the opencode server version exactly (SDK-only patches force-move the
+tag in place; they do NOT bump the version number). When the opencode
+server is upgraded, bump the tag here in lock-step.
+
+### Two exceptions kept on raw httpx (intentional)
+
+- `OpencodeClient.ping()` — health probe, 2-second timeout, no need
+  to spin up the full SDK client. Stays on `httpx.AsyncClient`.
+- `OpencodeClient.stream_events()` — SSE consumer for `/event`. The
+  SDK's `event.event_list()` is a one-shot blocking call (returns the
+  full stream as a list of dicts), not a streaming iterator, so it
+  cannot replace the `httpx-sse` consumer that powers the
+  `_sse_consumer_loop` background task.
+
+### Public method surface (DO NOT change without updating every caller)
+
+| Method | Returns | SDK call |
+|---|---|---|
+| `create_session(directory, agent, model?)` | `dict` | `session.session_create` |
+| `send_message(sid, dir, text, timeout?)` | `dict` (assistant message + parts) | `session.session_prompt` |
+| `send_message_async(sid, dir, text, timeout?)` | `{"queued": True}` | `session.session_prompt_async` |
+| `wait_idle(sid, dir, timeout?)` | `bool` | `v2.v2_session_wait` |
+| `get_messages(sid, dir, cursor?)` | `dict` (`items`, `cursor`) | `v2_messages.v2_session_messages` |
+| `list_questions(dir)` | `list[dict]` | `question.question_list` |
+| `list_permissions(dir)` | `list[dict]` | `permission.permission_list` |
+| `list_session_status(dir)` | `dict[str, dict]` (sessionID → `{type: idle/busy/retry}`) | `session.session_status` |
+| `list_todos(sid, dir)` | `list[dict]` | `session.session_todo` |
+| `session_diff(sid, dir, message_id?)` | `list[dict]` | `session.session_diff` |
+| `reply_question(qid, dir, answers: list[list[str]])` | `bool` | `question.question_reply` |
+| `reject_question(qid, dir)` | `bool` | `question.question_reject` |
+| `reply_permission(sid, pid, dir, reply, message?)` | `bool` | `session.permission_respond` |
+| `delete_session(sid, dir)` | `bool` | `session.session_delete` |
+
+All API methods are decorated with `_wrap_transport_errors` which maps
+`httpx.HTTPError`, the SDK's `ApiError`, and the SDK's `RequestError`
+to our `OpencodeError`.
+
+### Response shape
+
+All API methods return plain Python dicts/lists/bools (NOT the SDK's
+typed `Session` / `Todo` / `SnapshotFileDiff` etc. pydantic-like
+models). Internally each helper uses `_response_dict(resp)` /
+`_response_list(resp)` to extract the JSON-shape dict from
+`OpencodeResponse.raw.json()`, preserving the original camelCase field
+names callers expect (`id`, `sessionID`, `projectID`, etc.) instead of
+the SDK's snake_case Python attribute names (`id_`, `project_id`).
+This is why the migration to the SDK in v0.21.0 was drop-in for every
+caller in `event_loop` / `tools` / `bootstrap` / `commands`.
+
+When adding new API surface:
+
+- Wrap the SDK call with `@_wrap_transport_errors`.
+- Use `_response_dict` / `_response_list` / `_response_status_ok` to
+  flatten the SDK's `OpencodeResponse` wrapper. Do NOT return the
+  wrapper itself — callers expect bare dicts/lists/bools.
+- Pass `directory=str(path)` as a kwarg (the SDK accepts directory as
+  a query param, not the `x-opencode-directory` header the raw httpx
+  path used).
+- Use the `self._sdk(long_timeout=True)` variant when the call may
+  legitimately block for >60s (`send_message`, `wait_idle`). All
+  other calls use the default 60s client.
+
+### Two-client timeout split
+
+`OpencodeClient` lazily holds two `OpencodeAsync` instances:
+
+- `_sdk_default` — 60s timeout, used by every quick read/write.
+- `_sdk_long` — 600s timeout, used by `send_message` and `wait_idle`.
+
+Both share the same `base_url`. We need two clients because the SDK's
+`OpencodeAsync.set_timeout` mutates the underlying `requests.Session`
+which is not safe across concurrent coroutines.
+
+### Two upstream SDK patches folded into the v1.15.5 tag
+
+The SDK is liblab-generated and ships two bugs we patched in our fork
+and folded into the v1.15.5 tag in-place. Both patches are marked with
+`# patch: ...` comments so a future regen surfaces them in review:
+
+1. `OpencodeAsync.__init__` re-applies `set_access_token` and
+   `set_timeout` after overwriting the sync services with async ones.
+   Without it, every async call raises `KeyError: 'access_token_auth'`.
+2. `cast_models._get_instanced_type` short-circuits when `data is
+   SENTINEL` so optional Enum/oneOf params don't blow up. Without it,
+   `v2_session_messages` (and any other call with an Enum default)
+   raises `ValueError: <SENTINEL> is not a valid <EnumType>`.
+
+When upgrading the SDK tag (opencode server bump): regenerate, re-apply
+the two patches, re-run the plugin's pytest, force-move the tag.
+
 ## Tool schema convention (LOAD-BEARING)
 
 Every tool schema in `tools.py` MUST follow this exact shape:

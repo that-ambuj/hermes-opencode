@@ -88,17 +88,15 @@ def test_wrap_transport_errors_returns_normal_values():
 def test_wait_idle_wraps_connect_error(monkeypatch):
     client = transport_mod.OpencodeClient("127.0.0.1", 0)
 
-    class _FailingClient:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_):
-            return None
-
-        async def post(self, *_args, **_kwargs):
+    class _StubV2:
+        async def v2_session_wait(self, **_kwargs):
             raise httpx.ConnectError("refused")
 
-    monkeypatch.setattr(client, "_client", lambda *a, **kw: _FailingClient())
+    class _StubSDK:
+        def __init__(self):
+            self.v2 = _StubV2()
+
+    monkeypatch.setattr(client, "_sdk", lambda *a, **kw: _StubSDK())
 
     with pytest.raises(transport_mod.OpencodeError) as exc_info:
         asyncio.run(client.wait_idle("ses_id", Path("/tmp")))
