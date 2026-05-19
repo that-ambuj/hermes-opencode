@@ -5197,3 +5197,442 @@ class TestEnterNoDiffIntervention:
         assert self._notified == []
         after = rt.agents.get("bck/no-diff")
         assert after.phase == "DONE"
+
+    def test_body_lists_oc_promote_to_investigation_as_fourth_resolution(self, tmp_path):
+        rt, agent = self._build_rt(tmp_path)
+        event_loop_mod._enter_no_diff_intervention(
+            agent, "Investigation done", source="idle-debounce",
+        )
+        body = self._notified[0][1]
+        assert "oc_promote_to_investigation bck/no-diff" in body
+        assert "investigation_done" in body or "investigation_done" in body.lower()
+
+
+class TestAgentModeField:
+    def test_default_mode_is_task(self):
+        a = state_mod.Agent(
+            agent_id="x/y", project_label="x", worktree_path="/tmp/x",
+            session_id="ses_x", branch="x/y", initial_prompt="p", phase="EXECUTING",
+        )
+        assert a.mode == "task"
+
+    def test_explicit_investigation_mode(self):
+        a = state_mod.Agent(
+            agent_id="x/y", project_label="x", worktree_path="/tmp/x",
+            session_id="ses_x", branch="x/y", initial_prompt="p", phase="EXECUTING",
+            mode="investigation",
+        )
+        assert a.mode == "investigation"
+
+    def test_agent_modes_constant_values(self):
+        assert state_mod.AGENT_MODES == frozenset({"task", "investigation"})
+
+    def test_investigation_done_is_in_phases(self):
+        assert "INVESTIGATION_DONE" in state_mod.PHASES
+
+    def test_investigation_done_is_terminal(self):
+        assert "INVESTIGATION_DONE" in state_mod.TERMINAL_PHASES
+
+
+class TestEnterInvestigationDone:
+    def setup_method(self):
+        self._orig_runtime = event_loop_mod._runtime
+        self._notified: list[tuple[str, str]] = []
+        self._orig_notify = event_loop_mod._notify_event
+        event_loop_mod._notify_event = lambda agent, kind, body=None, **kw: self._notified.append((kind, body or ""))
+
+        async def _noop_cleanup(agent, worktree):
+            return None
+        self._orig_cleanup = event_loop_mod._cleanup_worktrees
+        event_loop_mod._cleanup_worktrees = _noop_cleanup
+
+    def teardown_method(self):
+        event_loop_mod._runtime = self._orig_runtime
+        event_loop_mod._notify_event = self._orig_notify
+        event_loop_mod._cleanup_worktrees = self._orig_cleanup
+
+    def _build_rt(self, tmp_path, *, phase="EXECUTING", mode="investigation"):
+        cfg = config_mod.Config(
+            projects_file=tmp_path / "projects.json",
+            agents_file=tmp_path / "agents.json",
+            worktrees_root=tmp_path / "wt",
+            logs_dir=tmp_path / "logs",
+            notifications_file=tmp_path / "notifications.jsonl",
+        )
+        cfg.ensure_dirs()
+        agents = state_mod.AgentStore(cfg.agents_file)
+        agents.add(state_mod.Agent(
+            agent_id="bck/inv", project_label="bck",
+            worktree_path=str(tmp_path / "wt" / "bck__inv"),
+            session_id="ses_inv", branch="bck/inv",
+            initial_prompt="explain the auth flow",
+            phase=phase, mode=mode,
+        ))
+        tools_mod = sys.modules["_oco_test_pkg.tools"]
+        rt = tools_mod.Runtime(config=cfg, client=None, projects=None, agents=agents)
+        event_loop_mod._runtime = rt
+        return rt, agents.get("bck/inv")
+
+    def test_idle_debounce_source_transitions_and_notifies(self, tmp_path):
+        import asyncio
+        rt, agent = self._build_rt(tmp_path)
+        asyncio.run(event_loop_mod._enter_investigation_done(
+            agent, "Auth uses JWT via tower middleware.", source="idle-debounce",
+        ))
+        after = rt.agents.get("bck/inv")
+        assert after.phase == "INVESTIGATION_DONE"
+        assert after.investigation_done_at is not None
+        assert after.investigation_deliverable == "Auth uses JWT via tower middleware."
+        kinds = [k for k, _ in self._notified]
+        assert kinds == ["investigation_done"]
+        body = self._notified[0][1]
+        assert "idle for 120s" in body
+        assert "No PR will be opened" in body
+
+    def test_ready_for_review_source_body_marker(self, tmp_path):
+        import asyncio
+        rt, agent = self._build_rt(tmp_path)
+        asyncio.run(event_loop_mod._enter_investigation_done(
+            agent, "done", source="READY_FOR_REVIEW",
+        ))
+        body = self._notified[0][1]
+        assert "READY_FOR_REVIEW" in body
+
+    def test_promote_source_body_marker(self, tmp_path):
+        import asyncio
+        rt, agent = self._build_rt(tmp_path, phase="NEEDS_INTERVENTION")
+        asyncio.run(event_loop_mod._enter_investigation_done(
+            agent, "done", source="promote",
+        ))
+        body = self._notified[0][1]
+        assert "Promoted from NEEDS_INTERVENTION" in body
+
+    def test_skips_terminal_agent(self, tmp_path):
+        import asyncio
+        rt, agent = self._build_rt(tmp_path, phase="DONE")
+        asyncio.run(event_loop_mod._enter_investigation_done(agent, "x", source="idle-debounce"))
+        assert self._notified == []
+        after = rt.agents.get("bck/inv")
+        assert after.phase == "DONE"
+
+    def test_deliverable_truncated_at_8000_chars(self, tmp_path):
+        import asyncio
+        rt, agent = self._build_rt(tmp_path)
+        big = "x" * 12000
+        asyncio.run(event_loop_mod._enter_investigation_done(agent, big, source="idle-debounce"))
+        after = rt.agents.get("bck/inv")
+        assert after.investigation_deliverable is not None
+        assert len(after.investigation_deliverable) == 8000
+
+
+class TestOcPromoteToInvestigation:
+    def setup_method(self):
+        self._orig_runtime = event_loop_mod._runtime
+        self._notified: list[tuple[str, str]] = []
+        self._orig_notify = event_loop_mod._notify_event
+        event_loop_mod._notify_event = lambda agent, kind, body=None, **kw: self._notified.append((kind, body or ""))
+
+        async def _noop_cleanup(agent, worktree):
+            return None
+        self._orig_cleanup = event_loop_mod._cleanup_worktrees
+        event_loop_mod._cleanup_worktrees = _noop_cleanup
+
+        async def _fake_fetch(agent):
+            return "Investigation complete: 408 caused by upstream timeout."
+        self._orig_fetch = event_loop_mod._fetch_last_assistant_text
+        event_loop_mod._fetch_last_assistant_text = _fake_fetch
+
+    def teardown_method(self):
+        event_loop_mod._runtime = self._orig_runtime
+        event_loop_mod._notify_event = self._orig_notify
+        event_loop_mod._cleanup_worktrees = self._orig_cleanup
+        event_loop_mod._fetch_last_assistant_text = self._orig_fetch
+
+    def _build_rt(self, tmp_path, *, phase="NEEDS_INTERVENTION"):
+        cfg = config_mod.Config(
+            projects_file=tmp_path / "projects.json",
+            agents_file=tmp_path / "agents.json",
+            worktrees_root=tmp_path / "wt",
+            logs_dir=tmp_path / "logs",
+            notifications_file=tmp_path / "notifications.jsonl",
+        )
+        cfg.ensure_dirs()
+        agents = state_mod.AgentStore(cfg.agents_file)
+        agents.add(state_mod.Agent(
+            agent_id="bck/promote", project_label="bck",
+            worktree_path=str(tmp_path / "wt" / "bck__promote"),
+            session_id="ses_promote", branch="bck/promote",
+            initial_prompt="rca the bug", phase=phase,
+        ))
+        tools_mod = sys.modules["_oco_test_pkg.tools"]
+        rt = tools_mod.Runtime(config=cfg, client=None, projects=None, agents=agents)
+        event_loop_mod._runtime = rt
+        return rt, agents.get("bck/promote")
+
+    def test_promotes_needs_intervention_to_investigation_done(self, tmp_path):
+        import asyncio
+        rt, agent = self._build_rt(tmp_path)
+        tools_mod = sys.modules["_oco_test_pkg.tools"]
+        handler = tools_mod.make_promote_to_investigation(rt)
+        result = asyncio.run(handler({"agent_id": "bck/promote"}))
+        import json as _json
+        payload = _json.loads(result)
+        assert payload["ok"] is True
+        after = rt.agents.get("bck/promote")
+        assert after.phase == "INVESTIGATION_DONE"
+        assert "408 caused by upstream timeout" in (after.investigation_deliverable or "")
+        kinds = [k for k, _ in self._notified]
+        assert "investigation_done" in kinds
+
+    def test_refuses_on_executing_phase(self, tmp_path):
+        import asyncio
+        rt, agent = self._build_rt(tmp_path, phase="EXECUTING")
+        tools_mod = sys.modules["_oco_test_pkg.tools"]
+        handler = tools_mod.make_promote_to_investigation(rt)
+        result = asyncio.run(handler({"agent_id": "bck/promote"}))
+        import json as _json
+        payload = _json.loads(result)
+        assert payload["ok"] is False
+        assert "NEEDS_INTERVENTION" in payload["error"]
+        after = rt.agents.get("bck/promote")
+        assert after.phase == "EXECUTING"
+
+    def test_refuses_on_done_phase(self, tmp_path):
+        import asyncio
+        rt, agent = self._build_rt(tmp_path, phase="DONE")
+        tools_mod = sys.modules["_oco_test_pkg.tools"]
+        handler = tools_mod.make_promote_to_investigation(rt)
+        result = asyncio.run(handler({"agent_id": "bck/promote"}))
+        import json as _json
+        payload = _json.loads(result)
+        assert payload["ok"] is False
+
+    def test_refuses_on_unknown_agent(self, tmp_path):
+        import asyncio
+        cfg = config_mod.Config(
+            projects_file=tmp_path / "projects.json",
+            agents_file=tmp_path / "agents.json",
+            worktrees_root=tmp_path / "wt",
+            logs_dir=tmp_path / "logs",
+            notifications_file=tmp_path / "notifications.jsonl",
+        )
+        cfg.ensure_dirs()
+        agents = state_mod.AgentStore(cfg.agents_file)
+        tools_mod = sys.modules["_oco_test_pkg.tools"]
+        rt = tools_mod.Runtime(config=cfg, client=None, projects=None, agents=agents)
+        event_loop_mod._runtime = rt
+        handler = tools_mod.make_promote_to_investigation(rt)
+        result = asyncio.run(handler({"agent_id": "nope/nope"}))
+        import json as _json
+        payload = _json.loads(result)
+        assert payload["ok"] is False
+        assert "unknown agent" in payload["error"].lower()
+
+    def test_refuses_on_missing_agent_id(self, tmp_path):
+        import asyncio
+        rt, _agent = self._build_rt(tmp_path)
+        tools_mod = sys.modules["_oco_test_pkg.tools"]
+        handler = tools_mod.make_promote_to_investigation(rt)
+        result = asyncio.run(handler({}))
+        import json as _json
+        payload = _json.loads(result)
+        assert payload["ok"] is False
+        assert "agent_id required" in payload["error"]
+
+
+class TestOcProjectInit:
+    def _make_rt(self, tmp_path):
+        cfg = config_mod.Config(
+            projects_file=tmp_path / "projects.json",
+            agents_file=tmp_path / "agents.json",
+            worktrees_root=tmp_path / "wt",
+            logs_dir=tmp_path / "logs",
+            notifications_file=tmp_path / "notifications.jsonl",
+        )
+        cfg.ensure_dirs()
+        agents = state_mod.AgentStore(cfg.agents_file)
+        projects = sys.modules["_oco_test_pkg.projects"].ProjectRegistry(cfg.projects_file)
+        tools_mod = sys.modules["_oco_test_pkg.tools"]
+        return tools_mod.Runtime(config=cfg, client=None, projects=projects, agents=agents)
+
+    def test_local_only_init_creates_repo_and_registers(self, tmp_path):
+        import asyncio
+        rt = self._make_rt(tmp_path)
+        tools_mod = sys.modules["_oco_test_pkg.tools"]
+        handler = tools_mod.make_project_init(rt)
+        repo_path = tmp_path / "new-proj"
+        result = asyncio.run(handler({
+            "label": "test-proj",
+            "path": str(repo_path),
+            "base_branch": "main",
+        }))
+        import json as _json
+        payload = _json.loads(result)
+        assert payload["ok"] is True, payload
+        assert payload["data"]["label"] == "test-proj"
+        assert payload["data"]["github_url"] is None
+        assert (repo_path / ".git").is_dir()
+        assert (repo_path / "README.md").exists()
+        assert (repo_path / ".gitignore").exists()
+        proj = rt.projects.get("test-proj")
+        assert proj is not None
+        assert proj.base_branch == "main"
+
+    def test_refuses_on_duplicate_label(self, tmp_path):
+        import asyncio
+        rt = self._make_rt(tmp_path)
+        existing = tmp_path / "existing"
+        existing.mkdir()
+        (existing / ".git").mkdir()
+        rt.projects.add(label="dup", repo_path=existing)
+        tools_mod = sys.modules["_oco_test_pkg.tools"]
+        handler = tools_mod.make_project_init(rt)
+        result = asyncio.run(handler({
+            "label": "dup",
+            "path": str(tmp_path / "new"),
+        }))
+        import json as _json
+        payload = _json.loads(result)
+        assert payload["ok"] is False
+        assert "already registered" in payload["error"]
+
+    def test_refuses_on_non_empty_non_git_path(self, tmp_path):
+        import asyncio
+        rt = self._make_rt(tmp_path)
+        non_empty = tmp_path / "non-empty"
+        non_empty.mkdir()
+        (non_empty / "existing_file.txt").write_text("not a git repo")
+        tools_mod = sys.modules["_oco_test_pkg.tools"]
+        handler = tools_mod.make_project_init(rt)
+        result = asyncio.run(handler({
+            "label": "x",
+            "path": str(non_empty),
+        }))
+        import json as _json
+        payload = _json.loads(result)
+        assert payload["ok"] is False
+        assert "non-empty and not a git repo" in payload["error"]
+
+    def test_refuses_on_invalid_visibility(self, tmp_path):
+        import asyncio
+        rt = self._make_rt(tmp_path)
+        tools_mod = sys.modules["_oco_test_pkg.tools"]
+        handler = tools_mod.make_project_init(rt)
+        result = asyncio.run(handler({
+            "label": "x",
+            "path": str(tmp_path / "x"),
+            "visibility": "internal",
+        }))
+        import json as _json
+        payload = _json.loads(result)
+        assert payload["ok"] is False
+        assert "visibility" in payload["error"]
+
+    def test_seeds_readme_with_description(self, tmp_path):
+        import asyncio
+        rt = self._make_rt(tmp_path)
+        repo_path = tmp_path / "with-desc"
+        tools_mod = sys.modules["_oco_test_pkg.tools"]
+        handler = tools_mod.make_project_init(rt)
+        asyncio.run(handler({
+            "label": "with-desc",
+            "path": str(repo_path),
+            "description": "A todo app with REST and React",
+        }))
+        readme = (repo_path / "README.md").read_text()
+        assert "with-desc" in readme
+        assert "A todo app with REST and React" in readme
+
+
+class TestOcAskValidation:
+    def _make_rt(self, tmp_path):
+        cfg = config_mod.Config(
+            projects_file=tmp_path / "projects.json",
+            agents_file=tmp_path / "agents.json",
+            worktrees_root=tmp_path / "wt",
+            logs_dir=tmp_path / "logs",
+            notifications_file=tmp_path / "notifications.jsonl",
+        )
+        cfg.ensure_dirs()
+        agents = state_mod.AgentStore(cfg.agents_file)
+        projects = sys.modules["_oco_test_pkg.projects"].ProjectRegistry(cfg.projects_file)
+        tools_mod = sys.modules["_oco_test_pkg.tools"]
+        return tools_mod.Runtime(config=cfg, client=None, projects=projects, agents=agents)
+
+    def test_refuses_on_missing_project_arg(self, tmp_path):
+        import asyncio
+        rt = self._make_rt(tmp_path)
+        tools_mod = sys.modules["_oco_test_pkg.tools"]
+        handler = tools_mod.make_ask(rt)
+        result = asyncio.run(handler({"prompt": "what is this"}))
+        import json as _json
+        payload = _json.loads(result)
+        assert payload["ok"] is False
+        assert "project" in payload["error"]
+
+    def test_refuses_on_missing_prompt_arg(self, tmp_path):
+        import asyncio
+        rt = self._make_rt(tmp_path)
+        tools_mod = sys.modules["_oco_test_pkg.tools"]
+        handler = tools_mod.make_ask(rt)
+        result = asyncio.run(handler({"project": "x"}))
+        import json as _json
+        payload = _json.loads(result)
+        assert payload["ok"] is False
+        assert "prompt" in payload["error"]
+
+    def test_refuses_on_unknown_project(self, tmp_path):
+        import asyncio
+        rt = self._make_rt(tmp_path)
+        tools_mod = sys.modules["_oco_test_pkg.tools"]
+        handler = tools_mod.make_ask(rt)
+        result = asyncio.run(handler({"project": "nope", "prompt": "hello"}))
+        import json as _json
+        payload = _json.loads(result)
+        assert payload["ok"] is False
+        assert "unknown project" in payload["error"]
+        assert "oc_project_init" in payload["error"] or "oc_project_add" in payload["error"] or "nope" in payload["error"]
+
+    def test_refuses_on_zero_timeout(self, tmp_path):
+        import asyncio
+        rt = self._make_rt(tmp_path)
+        p_dir = tmp_path / "p"
+        p_dir.mkdir()
+        (p_dir / ".git").mkdir()
+        rt.projects.add(label="p", repo_path=p_dir)
+        tools_mod = sys.modules["_oco_test_pkg.tools"]
+        handler = tools_mod.make_ask(rt)
+        result = asyncio.run(handler({"project": "p", "prompt": "x", "timeout": 0}))
+        import json as _json
+        payload = _json.loads(result)
+        assert payload["ok"] is False
+        assert "timeout" in payload["error"]
+
+
+class TestOcSpawnModeValidation:
+    def _make_rt(self, tmp_path):
+        cfg = config_mod.Config(
+            projects_file=tmp_path / "projects.json",
+            agents_file=tmp_path / "agents.json",
+            worktrees_root=tmp_path / "wt",
+            logs_dir=tmp_path / "logs",
+            notifications_file=tmp_path / "notifications.jsonl",
+        )
+        cfg.ensure_dirs()
+        agents = state_mod.AgentStore(cfg.agents_file)
+        projects = sys.modules["_oco_test_pkg.projects"].ProjectRegistry(cfg.projects_file)
+        tools_mod = sys.modules["_oco_test_pkg.tools"]
+        return tools_mod.Runtime(config=cfg, client=None, projects=projects, agents=agents)
+
+    def test_unknown_project_error_points_at_init_and_add(self, tmp_path):
+        import asyncio
+        rt = self._make_rt(tmp_path)
+        tools_mod = sys.modules["_oco_test_pkg.tools"]
+        handler = tools_mod.make_spawn(rt)
+        result = asyncio.run(handler({"project": "nope", "task": "do-x", "prompt": "go"}))
+        import json as _json
+        payload = _json.loads(result)
+        assert payload["ok"] is False
+        assert "oc_project_init" in payload["error"]
+        assert "oc_project_add" in payload["error"]
+        assert "nope" in payload["error"]

@@ -5,6 +5,119 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.22.0] - 2026-05-19
+
+Multi-use plugin shape. Until v0.21.x every `oc_spawn` was treated as a
+PR-bound coding task; investigation prompts (RCA, benchmark, "explain
+X") had no first-class workflow and either landed in
+`NEEDS_INTERVENTION` (post-v0.21.1) or stuck forever in `EXECUTING`
+(pre-v0.21.1). v0.22.0 elevates investigation to a first-class mode,
+adds a read-only quick-lookup tool, and bootstraps brand-new projects
+from scratch.
+
+### New tools
+
+- **`oc_ask <project> <prompt>`** - read-only one-shot. Opens an
+  opencode session DIRECTLY in `project.repo_path` (no worktree, no
+  agent record) with `agent="plan"` (opencode's read-only built-in
+  agent). Hybrid blocking: returns the answer inline if it arrives
+  within `timeout` (default 60s); else returns `in_flight=true` with
+  an `ask_id` and fires an `ask_complete` notification when the
+  answer eventually arrives (up to 600s). Opencode session is
+  deleted in both success branches.
+- **`oc_spawn ... mode="investigation"`** - new `mode` parameter on
+  the existing `oc_spawn` tool. Investigation-mode agents skip
+  REVIEW_SPAWNING / COMMITTING / PR_OPEN entirely; on idle they
+  transition directly to the new terminal phase `INVESTIGATION_DONE`
+  with the executor's final assistant text as the deliverable.
+- **`oc_promote_to_investigation <agent_id>`** - operator escape
+  hatch. For `mode="task"` spawns that finished with no diff and
+  landed in NEEDS_INTERVENTION, this transitions them to
+  INVESTIGATION_DONE while preserving the executor's report. Listed
+  as the 4th resolution path in the no-diff intervention notification
+  body, alongside `@<id> <follow-up>`, `oc_cancel`, `oc_retry`.
+- **`oc_project_init <label> <path> [github_org]`** - greenfield
+  bootstrap. mkdir + `git init -b <base_branch>` + seed `.gitignore`
+  + `README.md` + initial commit (under user's git identity, no
+  overrides) + optional `gh repo create --<visibility> --source .
+  --remote origin --push` + `oc_project_add` internally. Fails fast
+  if `gh` not authenticated when `github_org` is supplied. Refuses
+  on duplicate project labels and on non-empty paths that aren't
+  already git repos. Omit `github_org` for local-only projects.
+
+### State machine
+
+- New terminal phase `INVESTIGATION_DONE` (added to `state.PHASES`
+  AND `state.TERMINAL_PHASES`). Pruner archives via the same 12h
+  policy as DONE / CANCELLED using a new `Agent.investigation_done_at`
+  timestamp.
+- New `Agent.mode: str = "task"` field. Validated against
+  `state.AGENT_MODES = frozenset({"task", "investigation"})`. Set at
+  spawn time via `oc_spawn` `mode` param; immutable thereafter.
+- New `Agent.investigation_deliverable: str | None` field stores the
+  executor's final assistant text (truncated at 8000 chars).
+- New `_phase_investigation_done` handler (terminal, sleep-only;
+  mirrors `_phase_done`).
+- New `_enter_investigation_done(agent, deliverable, source=...)`
+  helper. Sources: `READY_FOR_REVIEW`, `idle-debounce`, `promote`.
+  Runs `_cleanup_worktrees` before the phase transition and fires
+  the `investigation_done` event.
+- `_phase_executing` routes investigation-mode agents to
+  `_enter_investigation_done` AFTER the upfront cascade (rate-limit,
+  abort, pending Q/P, status-poll, awaiting-input). The
+  awaiting-input cascade still wins: prose questions route to
+  AWAITING_HUMAN exactly like task mode.
+
+### `oc_spawn` validation
+
+Unknown-project errors now point at BOTH `oc_project_init` (for
+greenfield) and `oc_project_add` (for existing local repos). Same
+error message in `oc_resume_pr` and `oc_send`.
+
+### Notifications
+
+- New default events: `investigation_done`, `ask_complete`. Both
+  added to `Config.notify_events` default set. `investigation_done`
+  body shows the trigger source and the last 2000 chars of the
+  deliverable; `ask_complete` body pairs the original question with
+  the answer.
+- The no-diff intervention body now lists
+  `oc_promote_to_investigation <agent_id>` as the 4th resolution
+  path.
+
+### AGENTS.md
+
+New `## Agent modes (LOAD-BEARING, v0.22.0+)` section pins:
+- The `task` vs `investigation` mode contract
+- The `_enter_investigation_done` helper signature and contract
+- The `oc_promote_to_investigation` operator escape hatch
+- The `oc_ask` no-worktree read-only flow
+- The `oc_project_init` greenfield bootstrap flow
+- "When extending agent modes" checklist for future authors
+
+### Tests
+
+524 passing (was 498; +26 new across 6 classes):
+
+- `TestAgentModeField` (5): default mode, explicit mode,
+  `AGENT_MODES` constant, `INVESTIGATION_DONE` in PHASES, in
+  TERMINAL_PHASES.
+- `TestEnterInvestigationDone` (5): idle-debounce transitions +
+  notifies, READY_FOR_REVIEW body marker, promote body marker, skips
+  terminal agents, deliverable truncation at 8000 chars.
+- `TestOcPromoteToInvestigation` (5): success path, refuses
+  EXECUTING, refuses DONE, refuses unknown agent, refuses missing
+  agent_id.
+- `TestOcProjectInit` (5): local-only init creates + registers,
+  refuses duplicate label, refuses non-empty non-git path, refuses
+  invalid visibility, seeds README with description.
+- `TestOcAskValidation` (4): refuses missing project/prompt/unknown
+  project/zero timeout.
+- `TestOcSpawnModeValidation` (1): unknown-project error points at
+  both new and existing tools.
+
+Plus updated `TestEnterNoDiffIntervention.test_body_lists_oc_promote_to_investigation_as_fourth_resolution`.
+
 ## [0.21.1] - 2026-05-19
 
 Fix the EXECUTING-no-diff deadlock that left investigation-only agents

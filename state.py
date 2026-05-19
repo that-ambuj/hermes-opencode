@@ -23,13 +23,16 @@ PHASES = {
     "COMMITTING",
     "PR_OPEN",
     "RATE_LIMITED",
+    "INVESTIGATION_DONE",
     "DONE",
     "FAILED",
     "KILLED",
     "CANCELLED",
 }
 
-TERMINAL_PHASES = frozenset({"DONE", "FAILED", "KILLED", "CANCELLED"})
+TERMINAL_PHASES = frozenset({"DONE", "FAILED", "KILLED", "CANCELLED", "INVESTIGATION_DONE"})
+
+AGENT_MODES = frozenset({"task", "investigation"})
 
 
 @dataclass
@@ -81,6 +84,9 @@ class Agent:
     intervention_reason: str | None = None
     intervention_since: float | None = None
     last_stuck_notify_at: float | None = None
+    mode: str = "task"
+    investigation_done_at: float | None = None
+    investigation_deliverable: str | None = None
 
 
 class AgentExists(ValueError):

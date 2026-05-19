@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import shutil
 import tempfile
 import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Awaitable, Callable
+
+logger = logging.getLogger("hermes_opencode.tools")
 
 from . import bootstrap as bootstrap_mod
 from . import event_loop
@@ -17,7 +21,7 @@ from . import reviewer as reviewer_mod
 from . import worktree as wt
 from .config import Config
 from .projects import ProjectNotFound, ProjectRegistry
-from .state import Agent, AgentNotFound, AgentStore
+from .state import AGENT_MODES, Agent, AgentNotFound, AgentStore
 from .transport import OpencodeClient, OpencodeError
 
 
@@ -95,7 +99,7 @@ def _ensure_server(rt: Runtime) -> None:
 
 PROJECT_ADD_SCHEMA: dict[str, Any] = {
     "name": "oc_project_add",
-    "description": "Register a project. Reads the git remote URL to derive a stable project_key; auto-derives a 2-5 char abbrev from the label unless overridden. Required before oc_spawn can be used.",
+    "description": "Register an EXISTING local git repo as a project. Reads the git remote URL to derive a stable project_key; auto-derives a 2-5 char abbrev from the label unless overridden. Required before oc_spawn can be used. For brand-new projects (no local repo, no GitHub repo yet) use oc_project_init instead.",
     "parameters": {
         "type": "object",
         "additionalProperties": False,
@@ -107,6 +111,54 @@ PROJECT_ADD_SCHEMA: dict[str, Any] = {
             "bootstrap_skill": {"type": "string", "description": "Qualified hermes skill name to run during worktree bootstrap (e.g. 'hermes-opencode:dp-bootstrap')."},
         },
         "required": ["label", "repo_path"],
+    },
+}
+
+
+PROJECT_INIT_SCHEMA: dict[str, Any] = {
+    "name": "oc_project_init",
+    "description": (
+        "WHEN TO USE: The human wants to start a brand-new project from "
+        "scratch — 'create a new project called X', 'init a repo for X', "
+        "'set up a fresh todo-app project'. Use this BEFORE oc_spawn for "
+        "greenfield work.\n"
+        "\n"
+        "One-shot bootstrap for a brand-new project:\n"
+        "  1. mkdir <path> if it doesn't exist (refuses if non-empty and "
+        "     not already a git repo)\n"
+        "  2. git init -b <base_branch>\n"
+        "  3. write a minimal .gitignore + README.md (skipped if files "
+        "     already exist)\n"
+        "  4. initial commit under the user's git identity (no overrides)\n"
+        "  5. gh repo create <github_org>/<label> --<visibility> "
+        "     --source . --remote origin --push (creates the remote AND "
+        "     pushes the initial commit so the base branch exists)\n"
+        "  6. register as a project via oc_project_add internally\n"
+        "\n"
+        "After this, the user can immediately oc_spawn against the label.\n"
+        "\n"
+        "Requires `gh` CLI to be installed and authenticated (fails fast "
+        "if `gh auth status` returns non-zero). Refuses on duplicate "
+        "project label and on non-empty paths that aren't existing git "
+        "repos (use oc_project_add if you already have a repo).\n"
+        "\n"
+        "For local-only projects without a GitHub remote, omit "
+        "`github_org` — steps 5 is skipped and step 6 registers the "
+        "local-only project (project_key derived from resolved path)."
+    ),
+    "parameters": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "label": {"type": "string", "description": "Human-readable project label (kebab-case)."},
+            "path": {"type": "string", "description": "Absolute path where the repo lives (created if missing)."},
+            "base_branch": {"type": "string", "default": "main", "description": "Initial branch name."},
+            "github_org": {"type": "string", "description": "GitHub org or user that owns the new repo (e.g. 'that-ambuj'). Omit for local-only."},
+            "visibility": {"type": "string", "enum": ["private", "public"], "default": "private", "description": "GitHub repo visibility (ignored if github_org omitted)."},
+            "description": {"type": "string", "description": "Repo description (seeds README.md and gh repo create --description)."},
+            "abbrev": {"type": "string", "description": "2-5 char abbreviation prefix for agent ids (auto-derived if omitted)."},
+        },
+        "required": ["label", "path"],
     },
 }
 
@@ -214,6 +266,24 @@ SPAWN_SCHEMA: dict[str, Any] = {
             "branch": {"type": "string", "description": "Branch name (default: agent_id)."},
             "base_branch": {"type": "string", "description": "Branch to fork from (default: project's base_branch)."},
             "agent": {"type": "string", "description": "Opencode agent type to request (default: 'build'; opencode may resolve to a different agent if oh-my-openagent overrides are active).", "default": "build"},
+            "mode": {
+                "type": "string",
+                "enum": ["task", "investigation"],
+                "default": "task",
+                "description": (
+                    "task (default): full executor -> reviewer -> commit -> PR cycle; "
+                    "executor is expected to produce a diff and ship a PR.\n"
+                    "investigation: skip reviewer + commit + PR entirely. Executor "
+                    "investigates and emits its findings as the final assistant "
+                    "message; agent transitions directly to INVESTIGATION_DONE "
+                    "(terminal) when idle, with the assistant text as the "
+                    "deliverable. Use for prompts like 'RCA the X bug', "
+                    "'benchmark Y branch', 'explain how Z works' where no code "
+                    "change is expected. If the executor unexpectedly produces a "
+                    "diff in investigation mode, it is discarded on cleanup; "
+                    "promote via oc_promote_to_pr (TODO) if needed."
+                ),
+            },
         },
         "required": ["project", "task", "prompt"],
     },
@@ -427,6 +497,89 @@ RETRY_SCHEMA: dict[str, Any] = {
 }
 
 
+ASK_SCHEMA: dict[str, Any] = {
+    "name": "oc_ask",
+    "description": (
+        "WHEN TO USE: The human asked a question about a registered "
+        "project's code that you cannot answer from chat context alone — "
+        "'how does the auth middleware work?', 'what test framework does "
+        "this repo use?', 'is there a rate-limit on the search endpoint?', "
+        "'does this repo have a CI config?'. Quick, read-only lookups. "
+        "No code change expected. No PR.\n"
+        "\n"
+        "Spawns a one-shot opencode session in the project's repo (NOT a "
+        "worktree) with `agent='plan'` (opencode's read-only built-in "
+        "agent), forwards the question VERBATIM, and waits up to "
+        "`timeout` seconds for the answer.\n"
+        "\n"
+        "Hybrid blocking:\n"
+        "  - If the answer arrives within `timeout` seconds: returns the "
+        "    assistant text inline; the session is deleted.\n"
+        "  - If `timeout` elapses: returns immediately with "
+        "    `in_flight=true` and an `ask_id`. The plugin keeps polling "
+        "    in the background and fires an `ask_complete` notification "
+        "    with the answer when the executor finishes. The session is "
+        "    deleted then.\n"
+        "\n"
+        "For deeper investigation that needs a worktree (the executor "
+        "needs to run scripts, check git history, etc.) use "
+        "`oc_spawn` with `mode='investigation'` instead. For coding "
+        "tasks that should ship as a PR, use plain `oc_spawn`."
+    ),
+    "parameters": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "project": {"type": "string", "description": "Registered project label."},
+            "prompt": {
+                "type": "string",
+                "description": (
+                    "The human's question, forwarded to opencode VERBATIM. "
+                    "Pass the human's literal words. No planning, no "
+                    "rephrasing, no added context."
+                ),
+            },
+            "timeout": {
+                "type": "number",
+                "default": 60.0,
+                "description": "Seconds to block inline before flipping to async. Default 60.",
+            },
+        },
+        "required": ["project", "prompt"],
+    },
+}
+
+
+PROMOTE_TO_INVESTIGATION_SCHEMA: dict[str, Any] = {
+    "name": "oc_promote_to_investigation",
+    "description": (
+        "WHEN TO USE: An agent is in NEEDS_INTERVENTION with reason "
+        "`executor_idle_no_diff` and the operator confirms the work was "
+        "investigation-only after all (e.g. an RCA, benchmark, or "
+        "explanation that didn't need a code change). Use to reclassify "
+        "the agent as a completed investigation instead of cancelling.\n"
+        "\n"
+        "Transitions the agent from NEEDS_INTERVENTION to the new "
+        "terminal phase INVESTIGATION_DONE, preserving the executor's "
+        "final assistant text as the investigation deliverable. Fires an "
+        "`investigation_done` notification. Worktrees are cleaned up. "
+        "No PR is opened.\n"
+        "\n"
+        "Refuses on any phase other than NEEDS_INTERVENTION. For "
+        "EXECUTING agents that should be in investigation mode from the "
+        "start, use `oc_spawn` with `mode='investigation'`."
+    ),
+    "parameters": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "agent_id": {"type": "string"},
+        },
+        "required": ["agent_id"],
+    },
+}
+
+
 def make_project_add(rt: Runtime) -> Callable[..., Awaitable[str]]:
     async def handler(args: dict, **_: Any) -> str:
         try:
@@ -440,6 +593,152 @@ def make_project_add(rt: Runtime) -> Callable[..., Awaitable[str]]:
             return _ok(asdict(project))
         except (KeyError, ValueError) as e:
             return _err(str(e))
+    return handler
+
+
+_DEFAULT_GITIGNORE = """\
+.opencode/
+.env
+.env.*
+*.pyc
+__pycache__/
+node_modules/
+dist/
+build/
+target/
+.DS_Store
+*.log
+"""
+
+
+def _run_subprocess(cmd: list[str], *, cwd: Path | None = None, timeout: float = 120.0) -> tuple[int, str, str]:
+    import subprocess
+    proc = subprocess.run(
+        cmd, cwd=str(cwd) if cwd else None,
+        capture_output=True, text=True, timeout=timeout, check=False,
+    )
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def make_project_init(rt: Runtime) -> Callable[..., Awaitable[str]]:
+    async def handler(args: dict, **_: Any) -> str:
+        try:
+            label = args["label"]
+            path_str = args["path"]
+        except KeyError as e:
+            return _err(f"missing required arg: {e.args[0]}")
+        base_branch = args.get("base_branch") or rt.config.default_base_branch
+        github_org = args.get("github_org") or None
+        visibility = args.get("visibility", "private")
+        description = args.get("description") or ""
+        abbrev = args.get("abbrev")
+        if visibility not in {"private", "public"}:
+            return _err(f"invalid visibility: {visibility!r}; must be 'private' or 'public'")
+        try:
+            existing = rt.projects.get(label)
+        except Exception:
+            existing = None
+        if existing:
+            return _err(f"project label {label!r} already registered; use oc_project_remove first or pick a different label")
+        repo_path = Path(path_str).expanduser().resolve()
+        git_bin = shutil.which("git")
+        if not git_bin:
+            return _err("git not found on PATH")
+        if github_org:
+            gh_bin = shutil.which("gh")
+            if not gh_bin:
+                return _err("gh CLI not found on PATH; install gh or omit github_org for local-only init")
+            rc, _so, se = _run_subprocess([gh_bin, "auth", "status"], timeout=15.0)
+            if rc != 0:
+                return _err(f"gh CLI not authenticated (`gh auth status` rc={rc}): {(se or '').strip()[:300]}")
+        already_repo = (repo_path / ".git").is_dir()
+        if repo_path.exists() and not already_repo:
+            non_git_entries = [p for p in repo_path.iterdir() if p.name != ".git"]
+            if non_git_entries:
+                return _err(
+                    f"path {repo_path} is non-empty and not a git repo; refusing to clobber. "
+                    f"Use oc_project_add to register an existing repo, or pick an empty path."
+                )
+        try:
+            repo_path.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            return _err(f"could not create {repo_path}: {e}")
+        if not already_repo:
+            rc, _so, se = _run_subprocess([git_bin, "init", "-b", base_branch], cwd=repo_path)
+            if rc != 0:
+                return _err(f"git init failed (rc={rc}): {(se or '').strip()[:300]}")
+        gi_path = repo_path / ".gitignore"
+        if not gi_path.exists():
+            gi_path.write_text(_DEFAULT_GITIGNORE, encoding="utf-8")
+        readme_path = repo_path / "README.md"
+        if not readme_path.exists():
+            readme_body = f"# {label}\n"
+            if description:
+                readme_body += f"\n{description}\n"
+            readme_path.write_text(readme_body, encoding="utf-8")
+        rc, so, se = _run_subprocess([git_bin, "status", "--porcelain"], cwd=repo_path)
+        if rc != 0:
+            return _err(f"git status failed (rc={rc}): {(se or '').strip()[:300]}")
+        has_changes = bool((so or "").strip())
+        if has_changes:
+            rc, _so, se = _run_subprocess([git_bin, "add", "-A"], cwd=repo_path)
+            if rc != 0:
+                return _err(f"git add failed (rc={rc}): {(se or '').strip()[:300]}")
+            rc, _so, se = _run_subprocess(
+                [git_bin, "commit", "-m", f"Initialize {label}"], cwd=repo_path,
+            )
+            if rc != 0:
+                return _err(
+                    f"git commit failed (rc={rc}): {(se or '').strip()[:300]}. "
+                    f"Check `git config user.email` and `git config user.name`."
+                )
+        github_url: str | None = None
+        if github_org:
+            gh_args = [
+                shutil.which("gh") or "gh", "repo", "create",
+                f"{github_org}/{label}",
+                f"--{visibility}",
+                "--source", str(repo_path),
+                "--remote", "origin",
+                "--push",
+            ]
+            if description:
+                gh_args.extend(["--description", description])
+            rc, so, se = _run_subprocess(gh_args, timeout=60.0)
+            if rc != 0:
+                msg = (se or so or "").strip()[:500]
+                return _err(
+                    f"gh repo create failed (rc={rc}): {msg}. "
+                    f"Local repo at {repo_path} is initialized but not registered; "
+                    f"re-run after fixing or register manually via oc_project_add."
+                )
+            github_url = f"https://github.com/{github_org}/{label}"
+        try:
+            project = rt.projects.add(
+                label=label,
+                repo_path=repo_path,
+                base_branch=base_branch,
+                abbrev=abbrev,
+            )
+        except (KeyError, ValueError) as e:
+            return _err(
+                f"project registration failed: {e}. "
+                f"Local repo and (optionally) GitHub repo are set up; "
+                f"call oc_project_add manually to recover."
+            )
+        return _ok({
+            "label": label,
+            "repo_path": str(repo_path),
+            "base_branch": base_branch,
+            "abbrev": project.abbrev,
+            "github_url": github_url,
+            "github_visibility": visibility if github_org else None,
+            "project_key": project.project_key,
+            "note": (
+                f"project initialized; you can now `oc_spawn {label} ...`"
+                + (f". GitHub repo: {github_url}" if github_url else " (local-only).")
+            ),
+        })
     return handler
 
 
@@ -512,7 +811,11 @@ def make_spawn(rt: Runtime) -> Callable[..., Awaitable[str]]:
 
         project = rt.projects.get(project_label)
         if not project:
-            return _err(f"unknown project: {project_label}. Run oc_project_add first.")
+            return _err(
+                f"unknown project: {project_label!r}. "
+                f"For a brand-new project: oc_project_init label={project_label} path=<path> github_org=<org>. "
+                f"For an existing local repo: oc_project_add label={project_label} repo_path=<path>."
+            )
         repo_path = Path(project.repo_path)
         if not (repo_path / ".git").exists():
             return _err(f"project repo missing: {repo_path}")
@@ -556,6 +859,9 @@ def make_spawn(rt: Runtime) -> Callable[..., Awaitable[str]]:
         branch = args.get("branch") or agent_id
         base_branch = args.get("base_branch") or project.base_branch
         agent_type = args.get("agent", "build")
+        mode = args.get("mode", "task")
+        if mode not in AGENT_MODES:
+            return _err(f"invalid mode: {mode!r}; must be one of {sorted(AGENT_MODES)}")
         fs = wt.agent_id_to_fs(agent_id)
         worktree_path = (rt.config.worktrees_root / fs).resolve()
 
@@ -593,6 +899,7 @@ def make_spawn(rt: Runtime) -> Callable[..., Awaitable[str]]:
             branch=branch,
             initial_prompt=prompt,
             phase="EXECUTING",
+            mode=mode,
         )
         rt.agents.add(agent)
 
@@ -611,6 +918,7 @@ def make_spawn(rt: Runtime) -> Callable[..., Awaitable[str]]:
                 "session_id": session_id,
                 "worktree_path": str(worktree_path),
                 "branch": branch,
+                "mode": mode,
                 "queued": True,
                 "blocked_by": blocked_by,
                 "note": (
@@ -637,6 +945,7 @@ def make_spawn(rt: Runtime) -> Callable[..., Awaitable[str]]:
             "session_id": session_id,
             "worktree_path": str(worktree_path),
             "branch": branch,
+            "mode": mode,
             "queued": True,
             "note": "first turn queued asynchronously; poll oc_status/oc_wait to track progress",
             "bootstrap": {"ok": boot.ok, "method": boot.method, "skill_updated": boot.skill_updated},
@@ -656,7 +965,11 @@ def make_resume_pr(rt: Runtime) -> Callable[..., Awaitable[str]]:
 
         project = rt.projects.get(project_label)
         if not project:
-            return _err(f"unknown project: {project_label}. Run oc_project_add first.")
+            return _err(
+                f"unknown project: {project_label!r}. "
+                f"For a brand-new project: oc_project_init label={project_label} path=<path> github_org=<org>. "
+                f"For an existing local repo: oc_project_add label={project_label} repo_path=<path>."
+            )
         repo_path = Path(project.repo_path)
         if not (repo_path / ".git").exists():
             return _err(f"project repo missing: {repo_path}")
@@ -1064,6 +1377,193 @@ def make_retry(rt: Runtime) -> Callable[..., Awaitable[str]]:
             "phase": agent.phase,
             "mode": "kick",
             "note": "retry counters cleared; next tick runs immediately",
+        })
+    return handler
+
+
+_PENDING_ASKS: dict[str, dict[str, Any]] = {}
+
+
+def _next_ask_id() -> str:
+    return f"ask_{int(time.time() * 1000):x}"
+
+
+async def _ask_extract_answer_after(
+    rt: Runtime, session_id: str, repo_path: Path, send_time_ms: float,
+) -> str | None:
+    try:
+        body = await rt.client.get_messages(session_id, repo_path)
+    except OpencodeError:
+        return None
+    items = body.get("items") or []
+    for item in reversed(items):
+        message = item.get("info") or item.get("message") or {}
+        if message.get("role") != "assistant":
+            continue
+        t = (message.get("time") or {})
+        completed = t.get("completed")
+        if not completed or completed <= send_time_ms:
+            continue
+        chunks: list[str] = []
+        for p in item.get("parts") or []:
+            if isinstance(p, dict) and p.get("type") == "text":
+                txt = p.get("text")
+                if isinstance(txt, str):
+                    chunks.append(txt)
+        if chunks:
+            return "\n".join(chunks).strip()
+    return None
+
+
+async def _ask_poll_loop(
+    rt: Runtime, session_id: str, repo_path: Path, send_time_ms: float,
+    *, deadline_ts: float, interval: float = 2.0,
+) -> str | None:
+    while time.time() < deadline_ts:
+        await asyncio.sleep(interval)
+        try:
+            status_map = await rt.client.list_session_status(repo_path)
+        except OpencodeError:
+            continue
+        is_idle = session_id not in status_map
+        if not is_idle:
+            continue
+        answer = await _ask_extract_answer_after(rt, session_id, repo_path, send_time_ms)
+        if answer:
+            return answer
+    return None
+
+
+async def _ask_continue_async(
+    rt: Runtime, ask_id: str, project_label: str, repo_path: Path,
+    session_id: str, prompt: str, send_time_ms: float,
+) -> None:
+    record = _PENDING_ASKS.get(ask_id)
+    if not record:
+        return
+    deadline = time.time() + 600.0
+    answer = await _ask_poll_loop(rt, session_id, repo_path, send_time_ms, deadline_ts=deadline, interval=3.0)
+    try:
+        await rt.client.delete_session(session_id, repo_path)
+    except OpencodeError as e:
+        logger.warning("oc_ask %s: delete_session failed: %s", ask_id, e)
+    _PENDING_ASKS.pop(ask_id, None)
+    if answer is None:
+        body = (
+            f"Question: {prompt[:500]}\n\n"
+            f"Timed out waiting for opencode after {600:.0f}s. Session deleted; "
+            f"re-run oc_ask if you still need the answer."
+        )
+    else:
+        body = f"Question: {prompt[:500]}\n\nAnswer:\n{answer[-4000:]}"
+    notify.fanout(
+        sinks=rt.config.notify_sinks,
+        title=f"oc_ask complete ({project_label})",
+        body=body,
+        meta={"kind": "ask_complete", "ask_id": ask_id, "project": project_label, "session_id": session_id},
+        dashboard_path=rt.config.notifications_file,
+        gateway_platform=rt.config.notify_gateway_platform,
+        gateway_chat_id=rt.config.notify_gateway_chat_id,
+    )
+
+
+def make_ask(rt: Runtime) -> Callable[..., Awaitable[str]]:
+    async def handler(args: dict, **_: Any) -> str:
+        try:
+            project_label = args["project"]
+            prompt = args["prompt"]
+        except KeyError as e:
+            return _err(f"missing required arg: {e.args[0]}")
+        timeout = float(args.get("timeout", 60.0))
+        if timeout <= 0:
+            return _err(f"timeout must be > 0, got {timeout}")
+        project = rt.projects.get(project_label)
+        if not project:
+            return _err(
+                f"unknown project: {project_label!r}. "
+                f"For a brand-new project: oc_project_init label={project_label} path=<path> github_org=<org>. "
+                f"For an existing local repo: oc_project_add label={project_label} repo_path=<path>."
+            )
+        repo_path = Path(project.repo_path)
+        if not (repo_path / ".git").exists():
+            return _err(f"project repo missing: {repo_path}")
+        try:
+            _ensure_server(rt)
+        except OpencodeError as e:
+            return _err(f"opencode server unavailable: {e}")
+        try:
+            session = await rt.client.create_session(repo_path, agent="plan")
+        except OpencodeError as e:
+            return _err(f"session create failed: {e}")
+        session_id = session.get("id") or session.get("sessionID") or ""
+        if not session_id:
+            return _err(f"opencode returned no session id; keys={list(session.keys())[:8]}")
+        send_time_ms = time.time() * 1000.0
+        try:
+            await rt.client.send_message_async(session_id, repo_path, prompt)
+        except OpencodeError as e:
+            try:
+                await rt.client.delete_session(session_id, repo_path)
+            except OpencodeError:
+                pass
+            return _err(f"send_message_async failed: {e}")
+        deadline = time.time() + timeout
+        answer = await _ask_poll_loop(rt, session_id, repo_path, send_time_ms, deadline_ts=deadline, interval=2.0)
+        if answer is not None:
+            try:
+                await rt.client.delete_session(session_id, repo_path)
+            except OpencodeError as e:
+                logger.warning("oc_ask: delete_session failed post-answer: %s", e)
+            return _ok({
+                "project": project_label,
+                "answer": answer,
+                "in_flight": False,
+                "session_id": session_id,
+                "elapsed_sec": round(time.time() - (send_time_ms / 1000.0), 1),
+            })
+        ask_id = _next_ask_id()
+        _PENDING_ASKS[ask_id] = {
+            "project": project_label,
+            "session_id": session_id,
+            "prompt": prompt,
+            "started_at": send_time_ms / 1000.0,
+        }
+        asyncio.create_task(_ask_continue_async(rt, ask_id, project_label, repo_path, session_id, prompt, send_time_ms))
+        return _ok({
+            "project": project_label,
+            "in_flight": True,
+            "ask_id": ask_id,
+            "session_id": session_id,
+            "note": f"still working after {timeout:.0f}s; will fire ask_complete notification when the answer arrives",
+        })
+    return handler
+
+
+def make_promote_to_investigation(rt: Runtime) -> Callable[..., Awaitable[str]]:
+    async def handler(args: dict, **_: Any) -> str:
+        agent_id = args.get("agent_id")
+        if not agent_id:
+            return _err("agent_id required")
+        agent = rt.agents.get(agent_id)
+        if not agent:
+            return _err(f"unknown agent: {agent_id}")
+        if agent.phase != "NEEDS_INTERVENTION":
+            return _err(
+                f"can only promote NEEDS_INTERVENTION agents; "
+                f"agent {agent_id} is in phase {agent.phase}"
+            )
+        last_text = ""
+        try:
+            last_text = await event_loop._fetch_last_assistant_text(agent) or ""
+        except Exception:
+            pass
+        await event_loop._enter_investigation_done(agent, last_text, source="promote")
+        after = rt.agents.get(agent_id)
+        return _ok({
+            "agent_id": agent_id,
+            "from_phase": "NEEDS_INTERVENTION",
+            "phase": after.phase if after else "INVESTIGATION_DONE",
+            "deliverable_chars": len((after.investigation_deliverable or "")) if after else 0,
         })
     return handler
 
@@ -1582,11 +2082,13 @@ def make_regen_cleanup(rt: Runtime) -> Callable[..., Awaitable[str]]:
 def all_tool_specs(rt: Runtime) -> list[dict[str, Any]]:
     return [
         {"name": "oc_project_add", "toolset": "hermes_opencode", "schema": PROJECT_ADD_SCHEMA, "handler": make_project_add(rt), "is_async": True, "emoji": "📁"},
+        {"name": "oc_project_init", "toolset": "hermes_opencode", "schema": PROJECT_INIT_SCHEMA, "handler": make_project_init(rt), "is_async": True, "emoji": "🌱"},
         {"name": "oc_project_list", "toolset": "hermes_opencode", "schema": PROJECT_LIST_SCHEMA, "handler": make_project_list(rt), "is_async": True, "emoji": "📋"},
         {"name": "oc_project_show", "toolset": "hermes_opencode", "schema": PROJECT_SHOW_SCHEMA, "handler": make_project_show(rt), "is_async": True, "emoji": "🔍"},
         {"name": "oc_project_remove", "toolset": "hermes_opencode", "schema": PROJECT_REMOVE_SCHEMA, "handler": make_project_remove(rt), "is_async": True, "emoji": "🗑️"},
         {"name": "oc_project_set_repo_path", "toolset": "hermes_opencode", "schema": PROJECT_SET_REPO_PATH_SCHEMA, "handler": make_project_set_repo_path(rt), "is_async": True, "emoji": "📍"},
         {"name": "oc_spawn", "toolset": "hermes_opencode", "schema": SPAWN_SCHEMA, "handler": make_spawn(rt), "is_async": True, "emoji": "🚀"},
+        {"name": "oc_ask", "toolset": "hermes_opencode", "schema": ASK_SCHEMA, "handler": make_ask(rt), "is_async": True, "emoji": "🔮"},
         {"name": "oc_resume_pr", "toolset": "hermes_opencode", "schema": RESUME_PR_SCHEMA, "handler": make_resume_pr(rt), "is_async": True, "emoji": "🔁"},
         {"name": "oc_send", "toolset": "hermes_opencode", "schema": SEND_SCHEMA, "handler": make_send(rt), "is_async": True, "emoji": "💬"},
         {"name": "oc_status", "toolset": "hermes_opencode", "schema": STATUS_SCHEMA, "handler": make_status(rt), "is_async": True, "emoji": "📊"},
@@ -1594,6 +2096,7 @@ def all_tool_specs(rt: Runtime) -> list[dict[str, Any]]:
         {"name": "oc_kill", "toolset": "hermes_opencode", "schema": KILL_SCHEMA, "handler": make_kill(rt), "is_async": True, "emoji": "🛑"},
         {"name": "oc_cancel", "toolset": "hermes_opencode", "schema": CANCEL_SCHEMA, "handler": make_cancel(rt), "is_async": True, "emoji": "🚫"},
         {"name": "oc_retry", "toolset": "hermes_opencode", "schema": RETRY_SCHEMA, "handler": make_retry(rt), "is_async": True, "emoji": "🔄"},
+        {"name": "oc_promote_to_investigation", "toolset": "hermes_opencode", "schema": PROMOTE_TO_INVESTIGATION_SCHEMA, "handler": make_promote_to_investigation(rt), "is_async": True, "emoji": "🔬"},
         {"name": "oc_output", "toolset": "hermes_opencode", "schema": OUTPUT_SCHEMA, "handler": make_output(rt), "is_async": True, "emoji": "📤"},
         {"name": "oc_answer", "toolset": "hermes_opencode", "schema": ANSWER_SCHEMA, "handler": make_answer(rt), "is_async": True, "emoji": "✉️"},
         {"name": "oc_review_now", "toolset": "hermes_opencode", "schema": REVIEW_NOW_SCHEMA, "handler": make_review_now(rt), "is_async": True, "emoji": "🔎"},

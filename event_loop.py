@@ -1294,7 +1294,13 @@ async def _pruner_loop() -> None:
             for agent in list(_runtime.agents.list()):
                 if agent.archived:
                     continue
-                done_ts = agent.done_at if agent.phase == "DONE" else (agent.cancelled_at if agent.phase == "CANCELLED" else None)
+                done_ts = None
+                if agent.phase == "DONE":
+                    done_ts = agent.done_at
+                elif agent.phase == "CANCELLED":
+                    done_ts = agent.cancelled_at
+                elif agent.phase == "INVESTIGATION_DONE":
+                    done_ts = agent.investigation_done_at
                 if done_ts and (now - done_ts) > ARCHIVE_AFTER_SEC:
                     _archive_done(agent)
                     _runtime.agents.update(agent.agent_id, archived=True, archived_at=now)
@@ -1506,9 +1512,10 @@ def _enter_no_diff_intervention(agent: Agent, last_text: str, *, source: str) ->
         f"{trigger}\n"
         f"\n"
         f"Resolve via one of:\n"
-        f"  @{agent.agent_id} <follow-up>  - send a new instruction; executor resumes\n"
-        f"  oc_cancel {agent.agent_id}     - finish without opening a PR\n"
-        f"  oc_retry {agent.agent_id}      - re-tick (only useful with new context)\n"
+        f"  @{agent.agent_id} <follow-up>           - send a new instruction; executor resumes\n"
+        f"  oc_promote_to_investigation {agent.agent_id} - accept as investigation_done (preserves the report)\n"
+        f"  oc_cancel {agent.agent_id}              - finish without opening a PR\n"
+        f"  oc_retry {agent.agent_id}               - re-tick (only useful with new context)\n"
     )
     if tail:
         body += f"\nLast assistant text (tail):\n{tail}"
@@ -1517,6 +1524,49 @@ def _enter_no_diff_intervention(agent: Agent, last_text: str, *, source: str) ->
 
 async def _phase_needs_intervention(agent: Agent) -> None:
     await asyncio.sleep(30.0)
+
+
+async def _phase_investigation_done(agent: Agent) -> None:
+    await asyncio.sleep(30.0)
+
+
+async def _enter_investigation_done(agent: Agent, deliverable: str, *, source: str) -> None:
+    if _runtime is None:
+        return
+    current = _runtime.agents.get(agent.agent_id)
+    if current is None or current.phase in TERMINAL_PHASES:
+        return
+    worktree = Path(current.worktree_path)
+    try:
+        await _cleanup_worktrees(current, worktree)
+    except Exception as e:
+        logger.warning("agent %s: investigation cleanup raised %s", agent.agent_id, e)
+    deliverable_clean = (deliverable or "").strip()
+    updated = _runtime.agents.update(
+        agent.agent_id,
+        phase="INVESTIGATION_DONE",
+        investigation_done_at=time.time(),
+        investigation_deliverable=deliverable_clean[:8000] or None,
+        idle_since=None,
+    )
+    body = _build_investigation_done_body(updated, deliverable_clean, source=source)
+    _notify_event(updated, "investigation_done", body)
+
+
+def _build_investigation_done_body(agent: Agent, deliverable: str, *, source: str) -> str:
+    trigger = {
+        "READY_FOR_REVIEW": "Executor emitted READY_FOR_REVIEW with no diff (investigation complete).",
+        "idle-debounce": "Executor session idle for 120s with no diff (investigation complete).",
+        "promote": "Promoted from NEEDS_INTERVENTION by operator.",
+    }.get(source, f"Investigation completed ({source}).")
+    body = (
+        f"Investigation task complete. No PR will be opened.\n"
+        f"\n"
+        f"{trigger}\n"
+    )
+    if deliverable:
+        body += f"\nDeliverable (final assistant text):\n{deliverable[-2000:]}"
+    return body
 
 
 def tail_recent_events(since_ts: float, limit: int = 50) -> list[dict]:
@@ -2156,6 +2206,15 @@ async def _phase_executing(agent: Agent) -> None:
         _reset_idle_since(agent)
         return
     last_text = await _fetch_last_assistant_text(agent)
+    if agent.mode == "investigation":
+        if await _awaiting_input_blocks_review(agent):
+            return
+        ready = bool(last_text and reviewer_mod.parse_ready_for_review(last_text))
+        if not ready and not _idle_debounce_elapsed(agent):
+            return
+        source = "READY_FOR_REVIEW" if ready else "idle-debounce"
+        await _enter_investigation_done(agent, last_text, source=source)
+        return
     if last_text and reviewer_mod.parse_ready_for_review(last_text):
         if not _has_diff(worktree):
             if await _awaiting_input_blocks_review(agent):
@@ -2435,6 +2494,7 @@ _PHASE_HANDLERS = {
     "EXECUTING": _phase_executing,
     "AWAITING_HUMAN": _phase_awaiting_human,
     "NEEDS_INTERVENTION": _phase_needs_intervention,
+    "INVESTIGATION_DONE": _phase_investigation_done,
     "IDLE_TASK_COMPLETE": _phase_idle_task_complete,
     "REVIEW_SPAWNING": _phase_review_spawning,
     "REVIEWING": _phase_reviewing,
