@@ -1073,23 +1073,31 @@ ANSWER_SCHEMA: dict[str, Any] = {
     "description": (
         "WHEN TO USE: The pre_llm_call context surfaces a pending "
         "question_id AND the human's current message reads like a reply "
-        "to it (matches a listed option label, says 'yes/no', picks one "
-        "of the choices in prose, or otherwise resolves the question). "
-        "Forward the user's reply via this tool instead of answering them "
-        "yourself. The plugin already nudges you when an answer is "
-        "likely; obey the nudge.\n"
+        "to it. Forward the user's reply via this tool instead of "
+        "answering them yourself. The plugin already nudges you when an "
+        "answer is likely; obey the nudge.\n"
         "\n"
-        "Replies to (or rejects) a pending opencode question raised by "
-        "an agent. The user's reply text is forwarded VERBATIM. Pass "
-        "`reject=true` to dismiss the question without answering."
+        "A single opencode `/question` Request can carry N sub-questions "
+        "in its `questions[]` array — the pre_llm_call block tells you "
+        "the count and renders each sub-question with a #idx label. The "
+        "executor will see 'Unanswered' for any sub-question slot you "
+        "leave empty or short. Use `multi_answers` for multi-sub-question "
+        "Requests so EVERY sub-question gets the user's intent.\n"
+        "\n"
+        "Pass `reject=true` to dismiss the question without answering."
     ),
     "parameters": {
         "type": "object",
         "additionalProperties": False,
         "properties": {
             "question_id": {"type": "string", "description": "Question id from /question or from the pre_llm_call injection."},
-            "answer": {"type": "string", "description": "Verbatim user reply text. Forwarded unmodified to opencode."},
-            "answers": {"type": "array", "items": {"type": "string"}, "description": "Alternative: list of selected option labels. Use this when the question listed structured options."},
+            "answer": {"type": "string", "description": "Single-sub-question Requests only: verbatim user reply text. Becomes [[answer]] on the wire."},
+            "answers": {"type": "array", "items": {"type": "string"}, "description": "Single-sub-question Requests only: list of selected option labels (multi-select) or [free_text]. Becomes [answers] on the wire."},
+            "multi_answers": {
+                "type": "array",
+                "items": {"type": "array", "items": {"type": "string"}},
+                "description": "REQUIRED for multi-sub-question Requests. One inner array per sub-question in the Request, IN ORDER. Each inner array holds the selected option labels (or [free_text] for custom answers) for that sub-question. Use [] for sub-questions the user did not address — but prefer ASKING the user the missing sub-questions over leaving slots empty.",
+            },
             "reject": {"type": "boolean", "default": False, "description": "Reject the question instead of answering."},
         },
         "required": ["question_id"],
@@ -1280,28 +1288,73 @@ def make_answer(rt: Runtime) -> Callable[..., Awaitable[str]]:
         if not agent:
             return _err(f"no live agent has a pending question with id={qid}")
         worktree = Path(agent.worktree_path)
-        try:
-            if args.get("reject"):
+
+        if args.get("reject"):
+            try:
                 ok = await rt.client.reject_question(qid, worktree)
-                action = "rejected"
-            else:
-                answers = args.get("answers")
-                if answers is None:
-                    answer = args.get("answer")
-                    if answer is None:
-                        return _err("provide answer (string) or answers (list of option labels)")
-                    answers = [answer]
-                ok = await rt.client.reply_question(qid, worktree, list(answers))
-                action = "replied"
+            except OpencodeError as e:
+                return _err(f"opencode error: {e}")
+            if not ok:
+                return _err("opencode rejected the answer")
+            await event_loop._resume_from_awaiting_human(
+                agent, reason=f"oc_answer rejected for question {qid}",
+            )
+            return _ok({"agent_id": agent.agent_id, "question_id": qid, "action": "rejected"})
+
+        payload_or_err = _build_reply_payload(qid, args)
+        if isinstance(payload_or_err, str):
+            return payload_or_err
+        payload = payload_or_err
+        try:
+            ok = await rt.client.reply_question(qid, worktree, payload)
         except OpencodeError as e:
             return _err(f"opencode error: {e}")
         if not ok:
             return _err("opencode rejected the answer")
         await event_loop._resume_from_awaiting_human(
-            agent, reason=f"oc_answer {action} for question {qid}",
+            agent, reason=f"oc_answer replied for question {qid}",
         )
-        return _ok({"agent_id": agent.agent_id, "question_id": qid, "action": action})
+        return _ok({"agent_id": agent.agent_id, "question_id": qid, "action": "replied"})
     return handler
+
+
+def _build_reply_payload(qid: str, args: dict) -> list[list[str]] | str:
+    multi = args.get("multi_answers")
+    if multi is not None:
+        if not isinstance(multi, list) or not all(isinstance(x, list) for x in multi):
+            return _err("multi_answers must be a list of lists of strings")
+        payload = [[str(x) for x in inner] for inner in multi]
+        expected = _expected_sub_question_count(qid)
+        if expected is not None and expected > 0 and len(payload) != expected:
+            return _err(
+                f"multi_answers length {len(payload)} does not match the Request's "
+                f"{expected} sub-questions (id={qid}); pad missing sub-questions with [] "
+                f"or ask the user the unaddressed sub-questions before forwarding"
+            )
+        return payload
+    answers = args.get("answers")
+    if answers is None:
+        answer = args.get("answer")
+        if answer is None:
+            return _err("provide answer / answers / multi_answers / reject=true")
+        answers = [answer]
+    expected = _expected_sub_question_count(qid)
+    if expected is not None and expected > 1:
+        return _err(
+            f"question_id={qid} has {expected} sub-questions; use multi_answers "
+            f"(one inner list per sub-question) instead of answer/answers, which "
+            f"would only fill the first sub-question and leave the rest 'Unanswered'"
+        )
+    return [[str(x) for x in answers]]
+
+
+def _expected_sub_question_count(qid: str) -> int | None:
+    questions, _ = event_loop.get_pending_snapshot()
+    for _agent_id, qs in questions.items():
+        for entry in qs:
+            if entry.get("id") == qid:
+                return len(entry.get("questions") or [])
+    return None
 
 
 def make_review_now(rt: Runtime) -> Callable[..., Awaitable[str]]:

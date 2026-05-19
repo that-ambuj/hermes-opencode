@@ -54,6 +54,19 @@ _DISPATCHER_DIRECTIVE = (
     "(summary) or `oc_output` (full text) if more detail is needed.\n"
     "  4. Stuck / failed agent -> `oc_retry`.\n"
     "\n"
+    "Multi-sub-question Requests (CRITICAL): one opencode /question "
+    "Request can carry N sub-questions. The pending-items block tells "
+    "you the count; each sub-question is rendered with a #idx label. "
+    "When the user's reply addresses such a Request, you MUST use "
+    "`oc_answer(question_id=<id>, multi_answers=[[..#1..], [..#2..], "
+    "...])` with one inner list per sub-question, IN ORDER. NEVER "
+    "answer a multi-sub-question Request with the plain `answer=` "
+    "field: that fills only sub-question #1 and surfaces 'Unanswered' "
+    "for the rest, which forces the executor to assume on the human's "
+    "behalf. If the user did not address every sub-question, ASK THEM "
+    "the remaining ones instead of guessing; the orchestrator cannot "
+    "fan out per-sub-question answers later.\n"
+    "\n"
     "Opencode has FULL authority over its task. It does its own "
     "planning, file exploration, design, and execution. You are a "
     "DISPATCHER, not a planner. Never fill in gaps on opencode's "
@@ -104,40 +117,64 @@ def _build_pending_items_block() -> str | None:
     if not questions and not permissions:
         return None
     lines: list[str] = ["[hermes-opencode] pending items awaiting the user:"]
+    saw_multi = False
     for agent_id, qs in questions.items():
         for entry in qs:
             qid = entry.get("id")
             inner = entry.get("questions") or []
-            for q in inner:
+            inner_count = len(inner)
+            if inner_count > 1:
+                saw_multi = True
+                lines.append(
+                    f"  • agent={agent_id}  question_id={qid}  "
+                    f"({inner_count} sub-questions; answer ALL via multi_answers)"
+                )
+            else:
+                lines.append(f"  • agent={agent_id}  question_id={qid}")
+            for idx, q in enumerate(inner, start=1):
                 body = (q.get("question") or "").strip()
+                header = (q.get("header") or "").strip()
                 opts = q.get("options") or []
                 opt_lines = [
-                    f"      - {o.get('label')!r}: {o.get('description', '')}"
+                    f"        - {o.get('label')!r}: {o.get('description', '')}"
                     for o in opts if isinstance(o, dict)
                 ]
-                multi = " (multi-select)" if q.get("multiple") else ""
+                multi_select = " (multi-select)" if q.get("multiple") else ""
                 custom = " (custom answer allowed)" if q.get("custom") is not False else ""
-                block = [
-                    f"  • agent={agent_id}  question_id={qid}{multi}{custom}",
-                    f"    {body}",
-                ]
+                sub_prefix = f"#{idx} " if inner_count > 1 else ""
+                head_str = f"{header}: " if header else ""
+                lines.append(f"    {sub_prefix}{head_str}{body}{multi_select}{custom}")
                 if opt_lines:
-                    block.append("    options:")
-                    block.extend(opt_lines)
-                lines.extend(block)
+                    lines.append("      options:")
+                    lines.extend(opt_lines)
     for agent_id, ps in permissions.items():
         for entry in ps:
             pid = entry.get("id")
             lines.append(
-                f"  • agent={agent_id}  permission_id={pid}  type={entry.get('permission')!r}  patterns={entry.get('patterns')}"
+                f"  • agent={agent_id}  permission_id={pid}  "
+                f"type={entry.get('permission')!r}  patterns={entry.get('patterns')}"
             )
-    lines.extend([
-        "",
-        "If the user's reply is an answer to one of these, call oc_answer(question_id=<id>, "
-        "answer=<verbatim user reply>) and do NOT respond yourself. For permission requests, "
-        "the reply must be one of: once | always | reject. If the user is changing topic, "
-        "answer normally.",
-    ])
+    lines.append("")
+    lines.append("Forwarding rules. Call oc_answer instead of responding yourself when the user's reply is an answer:")
+    lines.append("  • Single sub-question Request: oc_answer(question_id=<id>, answer=<verbatim user reply>)")
+    if saw_multi:
+        lines.append(
+            "  • MULTI sub-question Request: oc_answer(question_id=<id>, "
+            "multi_answers=[[<labels for #1>], [<labels for #2>], ...]). One inner "
+            "list per sub-question IN ORDER. Use the user's exact option labels; for "
+            "custom/free-text answers put the verbatim text in the inner list. If the "
+            "user has not addressed every sub-question, ASK them the unanswered ones "
+            "rather than guessing on their behalf. Empty slots become 'Unanswered' to "
+            "the executor and force it to assume."
+        )
+    lines.append("  • Reject a question entirely: oc_answer(question_id=<id>, reject=true)")
+    if permissions:
+        lines.append(
+            "  • Permission reply: the chat surface cannot currently reply to "
+            "permissions. Tell the user to answer via the opencode CLI/web UI, "
+            "or to abort the agent with oc_cancel if they want to back out."
+        )
+    lines.append("  • If the user is changing topic and NOT answering, respond normally.")
     return "\n".join(lines)
 
 
@@ -251,6 +288,8 @@ def _build_answer_nudge_block(user_message: str) -> str | None:
         for entry in qs:
             qid = entry.get("id") or ""
             inner = entry.get("questions") or []
+            if len(inner) > 1:
+                continue
             for q in inner:
                 opts = q.get("options") or []
                 labels = [
@@ -266,8 +305,9 @@ def _build_answer_nudge_block(user_message: str) -> str | None:
     if not matches and len(questions) == 1 and text in _YES_NO_TOKENS:
         first_agent = next(iter(questions))
         first_entry = questions[first_agent][0]
-        qid = first_entry.get("id") or ""
-        matches.append((first_agent, qid, "(yes/no)"))
+        if len(first_entry.get("questions") or []) == 1:
+            qid = first_entry.get("id") or ""
+            matches.append((first_agent, qid, "(yes/no)"))
     if not matches:
         return None
     if len(matches) > 1:

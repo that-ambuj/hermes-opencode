@@ -5,6 +5,168 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.20.3] - 2026-05-19
+
+Three fixes for the human-input surface, all motivated by one live
+incident on `BCK/analytics-perf` where a `/question` Request carried
+3 sub-questions but only the first reached the user, the rest were
+"answered" on the user's behalf by the chat LLM, and the user's
+follow-up reply was queued on `prompt_async` while the executor
+stayed stalled on a Deferred that never resolved.
+
+### Bug #1: only the first sub-question reached the user
+
+The opencode `/question` API is "one Request, N sub-questions":
+
+```ts
+class Request { id, sessionID, questions: Info[], tool? }
+```
+
+`event_loop._format_question_block(q)` was reading
+`(q.get("questions") or [{}])[0]` — index 0 only. Sub-questions
+2..N were silently dropped from the notification body. The chat
+LLM's pre-LLM `pending items` context DID iterate all sub-questions
+but emitted the same `question_id` on every line, so the LLM had
+no way to address them separately.
+
+Fix:
+
+- `_format_question_block` now formats every sub-question with a
+  `[<qid> #<idx>/<total>]` prefix and the per-sub-question options
+  bullet list. Single-sub-question Requests omit the index for
+  brevity (back-compat for notification body shape).
+- `__init__._build_pending_items_block` annotates Requests with
+  N > 1 as `(N sub-questions; answer ALL via multi_answers)`, lists
+  every sub-question under its parent `question_id` with `#1 .. #N`
+  labels, and emits multi_answers-shaped forwarding guidance only
+  when at least one multi-sub-question Request is pending.
+
+### Bug #1b: oc_answer could only fill the first sub-question
+
+opencode's reply payload shape is:
+
+```ts
+class Reply { answers: Array<Array<string>> }   // string[][]
+```
+
+One outer entry per sub-question; each inner array holds the
+selected option labels (or `[free_text]` for custom answers).
+Missing / short outer entries surface as `Unanswered` to the
+executor.
+
+The plugin was sending a flat `list[str]` payload, which opencode's
+Effect-schema decoder accepted but interpreted as "one sub-question
+answered, the rest Unanswered". The executor then either guessed
+based on its own defaults (matching the user's report:
+"answering the rest of them on user's behalf") or re-asked the
+same sub-question via a new Request.
+
+Fix:
+
+- `transport.OpencodeClient.reply_question` signature changed from
+  `answers: list[str]` to `answers: list[list[str]]`. The docstring
+  now pins the shape contract to prevent regressions.
+- `tools.ANSWER_SCHEMA` adds a new `multi_answers: Array<Array<string>>`
+  field. The chat LLM is instructed to use it for multi-sub-question
+  Requests.
+- `tools._build_reply_payload(qid, args)` is the single payload
+  constructor. It:
+  - shape-validates `multi_answers` (must be list of lists)
+  - cross-checks the outer length against the Request's
+    sub-question count via `_expected_sub_question_count(qid)`
+  - REFUSES `answer=` / `answers=` against a multi-sub-question
+    Request with a clear "use multi_answers" error, so the LLM
+    cannot silently drop sub-questions 2..N
+  - wraps single-sub-question `answer="yes"` /
+    `answers=["a", "b"]` into `[["yes"]]` / `[["a", "b"]]` for
+    back-compat with single-sub-question Requests
+- `__init__._build_answer_nudge_block(...)` now skips
+  multi-sub-question Requests. A single-label user message
+  matching an option on one sub-question of a 3-sub-question
+  Request was ambiguous; the auto-nudge would have routed the LLM
+  toward the broken `answer=` path. The chat LLM must compose
+  `multi_answers` explicitly for multi-sub-question Requests.
+- `_DISPATCHER_DIRECTIVE` gained a hard rule about
+  multi-sub-question Requests: never answer with `answer=`; ask
+  the user the un-addressed sub-questions instead of guessing.
+
+### Bug #3: new questions/permissions surfaced after an agent is already AWAITING_HUMAN were never re-notified
+
+`_phase_awaiting_human` polled `list_questions` / `list_permissions`
+on every tick but consulted them ONLY for the exit gate. If a new
+Q/P arrived while we were already awaiting human input on a
+different signal (e.g. prose-question classifier hit, or a prior
+Q/P that had not yet been resolved), the new Q/P was silently
+swallowed. The operator never saw it.
+
+Fix:
+
+- `_phase_awaiting_human` now calls `_maybe_notify_new_pending` on
+  every tick when the pending set is non-empty. The helper is
+  idempotent via the `_notified_questions` / `_notified_permissions`
+  per-agent id sets: ids already notified do not re-fire; newly
+  observed ids do.
+
+### Companion: SSE fast-path for question.asked / permission.asked
+
+Detection used to wait for the next per-phase poll (~0.5–5s lag).
+`_sse_consumer_loop` now subscribes to opencode's `question.asked`
+and `permission.asked` bus events. Matching events trigger
+`_sse_surface_pending(agent_id, session_id, worktree)` which polls
+the authoritative `list_*` endpoint (we never trust the bus
+payload shape directly), filters terminal-phase agents out, and
+routes through the same `_maybe_notify_new_pending` helper. Lag
+drops to sub-second.
+
+### Cleanup
+
+- `_format_permission_block` and `_build_pending_items_block` drop
+  the reference to a `/oc answer <pid> <once|always|reject>` slash
+  command that was never implemented. Operators are now directed
+  at the opencode CLI / web UI for permission replies. A future
+  `oc_permission` tool can be added on top of the already-present
+  `OpencodeClient.reply_permission` if chat-side permission reply
+  becomes routine.
+
+### Documentation
+
+[AGENTS.md](AGENTS.md) gains a new "Question / permission surface"
+section pinning the Request-with-N-sub-questions shape, the
+multi_answers payload contract, the AWAITING_HUMAN re-notify
+behavior, and the SSE fast-path. The previous v0.20.2 sections
+remain.
+
+### Tests
+
++17 new tests (470 → 487 total, all passing):
+
+- `TestFormatQuestionBlockAllInners`: single inner omits sub-index,
+  multi inner renders all `#idx/total` chunks with options, empty
+  inner list returns a safe stub.
+- `TestBuildPendingItemsBlockMultiSubQuestion`: multi-sub-question
+  renders `(N sub-questions; …)` + `#1..#N` rows + `multi_answers`
+  guidance; single-sub-question Request omits the multi guidance;
+  permission row no longer references the non-existent
+  `/oc answer` command.
+- `TestAnswerNudgeRefusesMultiSubQuestion`: label match on a
+  multi-sub-question Request does NOT auto-nudge; yes/no shortcut
+  is also gated to single-sub-question Requests.
+- `TestMakeAnswerMultiAnswers`: multi_answers forwarded as
+  `Array<Array<string>>`; outer-length mismatch is rejected
+  before the wire call; `answer=` against a multi-sub-question
+  Request is refused; `answer=` against a single-sub-question
+  Request wraps into `[["yes"]]`; `answers=["a", "b"]` wraps into
+  `[["a", "b"]]`; `multi_answers` of wrong shape (list of
+  strings) is rejected.
+- `TestPhaseAwaitingHumanHandler.test_new_qp_arriving_while_awaiting_fires_fresh_notification`:
+  a new question id appearing in the pending list while already
+  AWAITING_HUMAN fires exactly one `awaiting_human` event for the
+  new id only, and a subsequent tick with the same set does not
+  re-fire.
+- `TestSseSurfacePending`: `question.asked` / `permission.asked`
+  events trigger a notify on the matching session, terminal-phase
+  agents are skipped without calling list endpoints.
+
 ## [0.20.2] - 2026-05-19
 
 Two bugfixes that explained the BCK/p-list-tests "stuck in EXECUTING for

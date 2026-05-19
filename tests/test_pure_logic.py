@@ -2640,12 +2640,16 @@ class TestPhaseAwaitingHumanHandler:
         self._saved_notify = event_loop_mod._notify_event
         self._saved_check = sys.modules["_oco_test_pkg.awaiting_input"].check
         event_loop_mod._notify_event = lambda agent, kind, body="": self._notified.append((kind, body))
+        event_loop_mod._notified_questions.pop("bck/test", None)
+        event_loop_mod._notified_permissions.pop("bck/test", None)
 
     def teardown_method(self):
         plugin_mod._runtime = self._saved_pkg_runtime
         event_loop_mod._runtime = self._saved_evloop_runtime
         event_loop_mod._notify_event = self._saved_notify
         sys.modules["_oco_test_pkg.awaiting_input"].check = self._saved_check
+        event_loop_mod._notified_questions.pop("bck/test", None)
+        event_loop_mod._notified_permissions.pop("bck/test", None)
 
     def _setup(
         self,
@@ -2707,7 +2711,13 @@ class TestPhaseAwaitingHumanHandler:
             await event_loop_mod._phase_awaiting_human(agent)
         asyncio.run(_fast())
         assert agents.get("bck/test").phase == "AWAITING_HUMAN"
-        assert self._notified == []
+        kinds = [k for k, _ in self._notified]
+        assert kinds == ["awaiting_human"], kinds
+        body = self._notified[0][1]
+        assert "q1" in body and "choose?" in body, body
+        self._notified.clear()
+        asyncio.run(_fast())
+        assert self._notified == [], self._notified
 
     def test_pending_permission_stays_awaiting(self, tmp_path: Path):
         import asyncio
@@ -2717,6 +2727,40 @@ class TestPhaseAwaitingHumanHandler:
         agent = agents.get("bck/test")
         asyncio.run(event_loop_mod._phase_awaiting_human(agent))
         assert agents.get("bck/test").phase == "AWAITING_HUMAN"
+        kinds = [k for k, _ in self._notified]
+        assert kinds == ["awaiting_human"], kinds
+        assert "p1" in self._notified[0][1], self._notified[0][1]
+        self._notified.clear()
+        asyncio.run(event_loop_mod._phase_awaiting_human(agent))
+        assert self._notified == [], self._notified
+
+    def test_new_qp_arriving_while_awaiting_fires_fresh_notification(self, tmp_path: Path):
+        import asyncio
+        agents = self._setup(tmp_path, questions=[
+            {"sessionID": "exec-s", "id": "q-old", "questions": [{"question": "old?"}]},
+        ], permissions=[])
+        agent = agents.get("bck/test")
+        asyncio.run(event_loop_mod._phase_awaiting_human(agent))
+        assert [k for k, _ in self._notified] == ["awaiting_human"]
+        self._notified.clear()
+        new_questions = [
+            {"sessionID": "exec-s", "id": "q-old", "questions": [{"question": "old?"}]},
+            {"sessionID": "exec-s", "id": "q-new", "questions": [{"question": "new?"}]},
+        ]
+        agents_obj = agents
+        async def list_questions_new(self_inner, directory):
+            return new_questions
+        async def list_permissions_new(self_inner, directory):
+            return []
+        rt = event_loop_mod._runtime
+        rt.client.list_questions = list_questions_new.__get__(rt.client, type(rt.client))
+        rt.client.list_permissions = list_permissions_new.__get__(rt.client, type(rt.client))
+        asyncio.run(event_loop_mod._phase_awaiting_human(agents_obj.get("bck/test")))
+        kinds = [k for k, _ in self._notified]
+        assert kinds == ["awaiting_human"], kinds
+        body = self._notified[0][1]
+        assert "q-new" in body, body
+        assert "q-old" not in body, body
 
     def test_new_turn_classifier_still_awaiting_keeps_phase(self, tmp_path: Path):
         import asyncio
@@ -4614,3 +4658,367 @@ class TestConfigServeCrashFields:
     def test_serve_crashes_in_default_state_dir(self):
         cfg = config_mod.Config()
         assert cfg.serve_crashes_file.parent == cfg.notifications_file.parent
+
+
+class TestFormatQuestionBlockAllInners:
+    def test_single_inner_omits_subindex(self):
+        q = {
+            "id": "q1",
+            "questions": [
+                {"question": "Pick one.", "options": [
+                    {"label": "yes", "description": ""},
+                    {"label": "no", "description": ""},
+                ]},
+            ],
+        }
+        out = event_loop_mod._format_question_block(q)
+        assert out.startswith("[q1] Pick one.")
+        assert "#1/" not in out
+        assert "'yes'" in out and "'no'" in out
+
+    def test_multi_inner_renders_all_with_subindex(self):
+        q = {
+            "id": "que_X",
+            "questions": [
+                {"question": "Volume?", "header": "Seed volume", "options": [
+                    {"label": "Small", "description": "fast"},
+                    {"label": "Medium", "description": "balanced"},
+                ]},
+                {"question": "Scope?", "header": "Endpoint scope", "options": [
+                    {"label": "five", "description": "headline"},
+                    {"label": "seven", "description": "all public"},
+                ]},
+                {"question": "Driver?", "options": [
+                    {"label": "inproc", "description": "axum oneshot"},
+                ]},
+            ],
+        }
+        out = event_loop_mod._format_question_block(q)
+        for needle in (
+            "[que_X #1/3]", "[que_X #2/3]", "[que_X #3/3]",
+            "Seed volume: Volume?", "Endpoint scope: Scope?", "Driver?",
+            "'Small'", "'Medium'", "'five'", "'seven'", "'inproc'",
+        ):
+            assert needle in out, (needle, out)
+
+    def test_empty_inner_list(self):
+        out = event_loop_mod._format_question_block({"id": "q0", "questions": []})
+        assert out == "[q0] (no questions)"
+
+
+class TestBuildPendingItemsBlockMultiSubQuestion:
+    def setup_method(self):
+        self._saved_snapshot = event_loop_mod.get_pending_snapshot
+        self._saved_runtime = plugin_mod._runtime
+        plugin_mod._runtime = object()
+
+    def teardown_method(self):
+        event_loop_mod.get_pending_snapshot = self._saved_snapshot
+        plugin_mod._runtime = self._saved_runtime
+
+    def test_multi_sub_question_renders_subindices_and_guidance(self):
+        event_loop_mod.get_pending_snapshot = lambda: (
+            {"BCK/x": [{
+                "id": "que_M",
+                "sessionID": "s",
+                "questions": [
+                    {"question": "Seed?", "options": [{"label": "Small", "description": ""}]},
+                    {"question": "Scope?", "options": [{"label": "Five", "description": ""}]},
+                    {"question": "Driver?", "options": [{"label": "Inproc", "description": ""}]},
+                ],
+            }]},
+            {},
+        )
+        block = plugin_mod._build_pending_items_block()
+        assert block is not None
+        assert "question_id=que_M" in block
+        assert "(3 sub-questions" in block
+        for needle in ("#1 ", "#2 ", "#3 ", "Seed?", "Scope?", "Driver?",
+                       "'Small'", "'Five'", "'Inproc'"):
+            assert needle in block, (needle, block)
+        assert "multi_answers=[[<labels for #1>]" in block
+
+    def test_single_sub_question_no_subindex(self):
+        event_loop_mod.get_pending_snapshot = lambda: (
+            {"BCK/x": [{
+                "id": "que_S",
+                "sessionID": "s",
+                "questions": [
+                    {"question": "Just one?", "options": [{"label": "ok", "description": ""}]},
+                ],
+            }]},
+            {},
+        )
+        block = plugin_mod._build_pending_items_block()
+        assert block is not None
+        assert "question_id=que_S" in block
+        assert "sub-questions" not in block
+        assert "#1 " not in block
+        assert "multi_answers" not in block
+
+    def test_permission_row_drops_nonexistent_oc_answer_reference(self):
+        event_loop_mod.get_pending_snapshot = lambda: (
+            {},
+            {"BCK/x": [{
+                "id": "per_1", "sessionID": "s",
+                "permission": "edit", "patterns": ["src/**"],
+            }]},
+        )
+        block = plugin_mod._build_pending_items_block()
+        assert block is not None
+        assert "permission_id=per_1" in block
+        assert "/oc answer" not in block, block
+        assert "opencode CLI" in block
+
+
+class TestAnswerNudgeRefusesMultiSubQuestion:
+    def setup_method(self):
+        self._saved_runtime = plugin_mod._runtime
+        self._saved_snapshot = event_loop_mod.get_pending_snapshot
+
+    def teardown_method(self):
+        plugin_mod._runtime = self._saved_runtime
+        event_loop_mod.get_pending_snapshot = self._saved_snapshot
+
+    def test_label_match_on_multi_sub_question_does_not_nudge(self):
+        event_loop_mod.get_pending_snapshot = lambda: (
+            {"BCK/x": [{
+                "id": "que_M",
+                "questions": [
+                    {"question": "A?", "options": [{"label": "option-a", "description": ""}]},
+                    {"question": "B?", "options": [{"label": "option-b", "description": ""}]},
+                ],
+            }]},
+            {},
+        )
+        assert plugin_mod._build_answer_nudge_block("option-a") is None
+
+    def test_yes_no_shortcut_skipped_when_request_is_multi_sub_question(self):
+        event_loop_mod.get_pending_snapshot = lambda: (
+            {"BCK/x": [{
+                "id": "que_M",
+                "questions": [
+                    {"question": "A?", "options": [{"label": "yes", "description": ""}]},
+                    {"question": "B?", "options": [{"label": "no", "description": ""}]},
+                ],
+            }]},
+            {},
+        )
+        assert plugin_mod._build_answer_nudge_block("yes") is None
+
+
+class TestMakeAnswerMultiAnswers:
+    def setup_method(self):
+        self._tools_mod = sys.modules["_oco_test_pkg.tools"]
+        self._state_mod = sys.modules["_oco_test_pkg.state"]
+        self._saved_runtime = plugin_mod._runtime
+        self._saved_snapshot = event_loop_mod.get_pending_snapshot
+        self._saved_resume = event_loop_mod._resume_from_awaiting_human
+        async def _noop_resume(agent, reason=""):
+            return agent
+        event_loop_mod._resume_from_awaiting_human = _noop_resume
+
+    def teardown_method(self):
+        plugin_mod._runtime = self._saved_runtime
+        event_loop_mod.get_pending_snapshot = self._saved_snapshot
+        event_loop_mod._resume_from_awaiting_human = self._saved_resume
+
+    def _runtime_with_agent(self, tmp_path: Path, qid: str, inner_count: int) -> tuple:
+        cfg = config_mod.Config(
+            projects_file=tmp_path / "projects.json",
+            agents_file=tmp_path / "agents.json",
+            worktrees_root=tmp_path / "wt",
+            logs_dir=tmp_path / "logs",
+            notifications_file=tmp_path / "notifications.jsonl",
+        )
+        cfg.ensure_dirs()
+        agents = self._state_mod.AgentStore(cfg.agents_file)
+        agent = self._state_mod.Agent(
+            agent_id="bck/answer", project_label="bck",
+            worktree_path=str(tmp_path), session_id="s",
+            branch="bck/answer", initial_prompt="p",
+            phase="AWAITING_HUMAN",
+        )
+        agents.add(agent)
+        reply_calls: list = []
+        class FakeClient:
+            async def reply_question(self_inner, question_id, directory, answers):
+                reply_calls.append((question_id, answers))
+                return True
+            async def reject_question(self_inner, question_id, directory):
+                return True
+        rt = self._tools_mod.Runtime(config=cfg, client=FakeClient(), projects=None, agents=agents)
+        event_loop_mod.get_pending_snapshot = lambda: (
+            {"bck/answer": [{
+                "id": qid, "sessionID": "s",
+                "questions": [{"question": f"q{i}"} for i in range(inner_count)],
+            }]},
+            {},
+        )
+        return rt, reply_calls
+
+    def test_multi_answers_forwarded_as_array_of_arrays(self, tmp_path):
+        import asyncio, json
+        rt, reply_calls = self._runtime_with_agent(tmp_path, "que_M", inner_count=3)
+        plugin_mod._runtime = rt
+        handler = self._tools_mod.make_answer(rt)
+        result = asyncio.run(handler({
+            "question_id": "que_M",
+            "multi_answers": [["Medium"], ["Five"], ["Inproc"]],
+        }))
+        payload = json.loads(result)
+        assert payload["ok"] is True, payload
+        assert reply_calls == [("que_M", [["Medium"], ["Five"], ["Inproc"]])]
+
+    def test_multi_answers_count_mismatch_rejected_before_wire_call(self, tmp_path):
+        import asyncio, json
+        rt, reply_calls = self._runtime_with_agent(tmp_path, "que_M", inner_count=3)
+        plugin_mod._runtime = rt
+        handler = self._tools_mod.make_answer(rt)
+        result = asyncio.run(handler({
+            "question_id": "que_M",
+            "multi_answers": [["Medium"]],
+        }))
+        payload = json.loads(result)
+        assert payload["ok"] is False
+        assert "does not match" in payload["error"]
+        assert reply_calls == []
+
+    def test_single_answer_against_multi_sub_question_rejected(self, tmp_path):
+        import asyncio, json
+        rt, reply_calls = self._runtime_with_agent(tmp_path, "que_M", inner_count=3)
+        plugin_mod._runtime = rt
+        handler = self._tools_mod.make_answer(rt)
+        result = asyncio.run(handler({
+            "question_id": "que_M",
+            "answer": "Medium",
+        }))
+        payload = json.loads(result)
+        assert payload["ok"] is False
+        assert "use multi_answers" in payload["error"]
+        assert reply_calls == []
+
+    def test_single_answer_against_single_sub_question_wraps_correctly(self, tmp_path):
+        import asyncio, json
+        rt, reply_calls = self._runtime_with_agent(tmp_path, "que_S", inner_count=1)
+        plugin_mod._runtime = rt
+        handler = self._tools_mod.make_answer(rt)
+        result = asyncio.run(handler({
+            "question_id": "que_S",
+            "answer": "yes",
+        }))
+        payload = json.loads(result)
+        assert payload["ok"] is True, payload
+        assert reply_calls == [("que_S", [["yes"]])]
+
+    def test_answers_list_against_single_sub_question_wraps_correctly(self, tmp_path):
+        import asyncio, json
+        rt, reply_calls = self._runtime_with_agent(tmp_path, "que_S", inner_count=1)
+        plugin_mod._runtime = rt
+        handler = self._tools_mod.make_answer(rt)
+        result = asyncio.run(handler({
+            "question_id": "que_S",
+            "answers": ["a", "b"],
+        }))
+        payload = json.loads(result)
+        assert payload["ok"] is True
+        assert reply_calls == [("que_S", [["a", "b"]])]
+
+    def test_multi_answers_must_be_list_of_lists(self, tmp_path):
+        import asyncio, json
+        rt, reply_calls = self._runtime_with_agent(tmp_path, "que_S", inner_count=1)
+        plugin_mod._runtime = rt
+        handler = self._tools_mod.make_answer(rt)
+        result = asyncio.run(handler({
+            "question_id": "que_S",
+            "multi_answers": ["bad", "shape"],
+        }))
+        payload = json.loads(result)
+        assert payload["ok"] is False
+        assert "list of lists" in payload["error"]
+        assert reply_calls == []
+
+
+class TestSseSurfacePending:
+    def setup_method(self):
+        self._notified: list = []
+        self._saved_runtime = event_loop_mod._runtime
+        self._saved_notify = event_loop_mod._notify_event
+        event_loop_mod._notify_event = lambda agent, kind, body="": self._notified.append((kind, body))
+        event_loop_mod._notified_questions.pop("bck/sse", None)
+        event_loop_mod._notified_permissions.pop("bck/sse", None)
+
+    def teardown_method(self):
+        event_loop_mod._runtime = self._saved_runtime
+        event_loop_mod._notify_event = self._saved_notify
+        event_loop_mod._notified_questions.pop("bck/sse", None)
+        event_loop_mod._notified_permissions.pop("bck/sse", None)
+
+    def test_question_asked_event_fires_notification_for_matching_session(self, tmp_path):
+        import asyncio
+        cfg = config_mod.Config(
+            projects_file=tmp_path / "projects.json",
+            agents_file=tmp_path / "agents.json",
+            worktrees_root=tmp_path / "wt",
+            logs_dir=tmp_path / "logs",
+            notifications_file=tmp_path / "notifications.jsonl",
+        )
+        cfg.ensure_dirs()
+        agents = state_mod.AgentStore(cfg.agents_file)
+        agents.add(state_mod.Agent(
+            agent_id="bck/sse", project_label="bck",
+            worktree_path=str(tmp_path), session_id="s-sse",
+            branch="bck/sse", initial_prompt="p",
+            phase="EXECUTING",
+        ))
+        class FakeClient:
+            async def list_questions(self_inner, directory):
+                return [{"sessionID": "s-sse", "id": "q-fast", "questions": [{"question": "hello?"}]}]
+            async def list_permissions(self_inner, directory):
+                return []
+            async def get_messages(self_inner, session_id, directory, cursor=None):
+                return {"items": []}
+        tools_mod = sys.modules["_oco_test_pkg.tools"]
+        rt = tools_mod.Runtime(config=cfg, client=FakeClient(), projects=None, agents=agents)
+        event_loop_mod._runtime = rt
+        asyncio.run(event_loop_mod._sse_surface_pending("bck/sse", "s-sse", tmp_path))
+        kinds = [k for k, _ in self._notified]
+        assert kinds == ["awaiting_human"], kinds
+        assert "q-fast" in self._notified[0][1]
+        self._notified.clear()
+        asyncio.run(event_loop_mod._sse_surface_pending("bck/sse", "s-sse", tmp_path))
+        assert self._notified == []
+
+    def test_terminal_agent_skipped(self, tmp_path):
+        import asyncio
+        cfg = config_mod.Config(
+            projects_file=tmp_path / "projects.json",
+            agents_file=tmp_path / "agents.json",
+            worktrees_root=tmp_path / "wt",
+            logs_dir=tmp_path / "logs",
+            notifications_file=tmp_path / "notifications.jsonl",
+        )
+        cfg.ensure_dirs()
+        agents = state_mod.AgentStore(cfg.agents_file)
+        agents.add(state_mod.Agent(
+            agent_id="bck/sse", project_label="bck",
+            worktree_path=str(tmp_path), session_id="s-sse",
+            branch="bck/sse", initial_prompt="p",
+            phase="DONE",
+        ))
+        called: list = []
+        class FakeClient:
+            async def list_questions(self_inner, directory):
+                called.append("q")
+                return []
+            async def list_permissions(self_inner, directory):
+                called.append("p")
+                return []
+            async def get_messages(self_inner, session_id, directory, cursor=None):
+                return {"items": []}
+        tools_mod = sys.modules["_oco_test_pkg.tools"]
+        rt = tools_mod.Runtime(config=cfg, client=FakeClient(), projects=None, agents=agents)
+        event_loop_mod._runtime = rt
+        asyncio.run(event_loop_mod._sse_surface_pending("bck/sse", "s-sse", tmp_path))
+        assert called == []
+        assert self._notified == []

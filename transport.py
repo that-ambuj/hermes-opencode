@@ -339,7 +339,8 @@ class OpencodeClient:
             return data if isinstance(data, list) else []
 
     @_wrap_transport_errors
-    async def reply_question(self, question_id: str, directory: Path, answers: list[str]) -> bool:
+    async def reply_question(self, question_id: str, directory: Path, answers: list[list[str]]) -> bool:
+        """Outer list = one inner array per sub-question (in order); inner list = selected option labels or [free_text]. Missing/short outer surfaces "Unanswered" on the executor side."""
         async with self._client(directory) as c:
             r = await c.post(f"/question/{question_id}/reply", json={"answers": answers})
             return r.status_code in (200, 204)

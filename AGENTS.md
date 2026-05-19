@@ -395,6 +395,114 @@ When adding new build steps that might leave artifacts in the sister
 worktree, do NOT rely on the worktree teardown to clean them up —
 staging now defensively wipes them on next entry.
 
+## Question / permission surface (LOAD-BEARING, refactored v0.20.3)
+
+opencode's `/question` API is a Request-with-N-sub-questions shape, not
+"one question per Request". A single Request carries:
+
+```ts
+class Request { id, sessionID, questions: Info[], tool? }
+class Info { question, header, options: Option[], multiple?, custom? }
+```
+
+The reply payload mirrors that shape:
+`POST /question/:id/reply {"answers": Array<Array<string>>}` — one
+inner array per `questions[i]`, each holding the selected option labels
+(or `[free_text]` for custom answers). opencode renders missing /
+short slots as `Unanswered` to the executor.
+
+v0.20.2 had a latent bug where the plugin treated every Request as
+"single sub-question" and the notification + reply paths silently
+dropped sub-questions 2..N. The executor saw `Unanswered` for those
+slots and either guessed on the human's behalf or re-asked the same
+sub-question via a new Request. Symptoms the user saw: "only the
+first question reaches me", "the rest are answered without me", "my
+reply is queued but the agent stays stuck idle".
+
+v0.20.3 made the multi-sub-question shape first-class:
+
+- `event_loop._format_question_block(q)` renders EVERY sub-question
+  in the notification body with a `[<qid> #<idx>/<total>]` prefix and
+  the per-sub-question options bullet list. Single-sub-question
+  Requests omit the index for brevity.
+- `__init__._build_pending_items_block()` lists every sub-question
+  under its `question_id`, annotates Requests with N > 1 as
+  `(N sub-questions; answer ALL via multi_answers)`, and emits
+  forwarding-rule guidance the chat LLM follows.
+- The `oc_answer` tool schema (`tools.ANSWER_SCHEMA`) now accepts
+  `multi_answers: Array<Array<string>>` alongside the legacy `answer`
+  / `answers` shape. `tools._build_reply_payload(qid, args)` is the
+  one place that constructs the wire payload — it:
+  - shape-validates `multi_answers` (must be list of lists)
+  - cross-checks the outer length against the Request's
+    sub-question count via `_expected_sub_question_count(qid)`
+  - refuses `answer=` / `answers=` against a multi-sub-question
+    Request with an explicit "use multi_answers" error, so the LLM
+    cannot silently drop sub-questions 2..N
+  - wraps single-sub-question `answer="yes"` / `answers=["a","b"]`
+    into `[["yes"]]` / `[["a","b"]]` for back-compat
+- `__init__._build_answer_nudge_block(...)` skips multi-sub-question
+  Requests entirely. A user message matching ONE option label out of
+  multiple sub-questions is ambiguous — the chat LLM must compose
+  `multi_answers` explicitly rather than rely on the yes/no / label
+  auto-nudge that exists for single-sub-question Requests.
+- `_DISPATCHER_DIRECTIVE` carries a hard rule: never answer a
+  multi-sub-question Request with the plain `answer=` field; ask the
+  user the un-addressed sub-questions instead of guessing on their
+  behalf.
+
+When adding new tools that reply to `/question`, route through
+`transport.OpencodeClient.reply_question(qid, dir, answers)` whose
+signature is now `answers: list[list[str]]`. Do NOT bypass with a
+flat list.
+
+`_format_permission_block(p)` (notification body) and the
+`pending items` block both drop the v0.20.2 reference to a
+`/oc answer <pid>` slash command (it never existed) and instead point
+the operator at the opencode CLI/web UI. A future `oc_permission`
+tool can be added if chat-side permission reply becomes routine; the
+transport already exposes `OpencodeClient.reply_permission`.
+
+## Awaiting-human re-notify (LOAD-BEARING, v0.20.3+)
+
+Before v0.20.3, once an agent entered `AWAITING_HUMAN` the per-tick
+handler `_phase_awaiting_human` polled `list_questions` /
+`list_permissions` ONLY to decide when to exit. A NEW question or
+permission appearing while we were already awaiting human input on
+a different signal (e.g. a prose-question classifier hit, or a
+prior Q/P that had not yet been resolved) was silently swallowed —
+the user never saw the new Q/P.
+
+v0.20.3 calls `_maybe_notify_new_pending(agent, pending_q, pending_p,
+context_text=...)` from `_phase_awaiting_human` on every tick when
+the pending set is non-empty. The helper is idempotent via the
+`_notified_questions` / `_notified_permissions` per-agent id sets:
+ids already notified do not re-fire; ids newly observed do.
+
+## SSE fast-path for question.asked / permission.asked (v0.20.3+)
+
+`_sse_consumer_loop` subscribes to opencode's bus events
+`question.asked` and `permission.asked` (the bus event `properties`
+is the Request itself, so the `sessionID` field is on `props`
+directly, not under `props.info`). Matching events trigger
+`_sse_surface_pending(agent_id, session_id, worktree)` which:
+
+1. Filters out terminal-phase agents.
+2. Polls `list_questions` + `list_permissions` (authoritative shape).
+3. Calls `_update_snapshots` + `_maybe_notify_new_pending` so the
+   surface and dedup behave identically to the regular tick poll.
+
+Detection lag drops from one tick (0.5s base sleep + serialised
+phase work) to sub-second. The poll itself is still the source of
+truth for shape — we do not trust the bus payload directly for
+formatting because the bus schema can drift independently of the
+plugin's parser.
+
+When adding handlers for other bus events, never call
+`_notify_event` directly from the SSE loop; route through the same
+`_maybe_notify_new_pending` (or equivalent dedup'd helper) so
+re-notify rules and snapshot writers stay co-located.
+
 ## Rate limits and queue (LOAD-BEARING)
 
 When opencode's upstream provider rate-limits the executor (most common

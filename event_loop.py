@@ -229,14 +229,27 @@ def _maybe_notify_phase(agent: "Agent", kind: str, body: str = "") -> None:
 
 
 def _format_question_block(q: dict) -> str:
-    inner = (q.get("questions") or [{}])[0]
-    text = (inner.get("question") or "").strip() or "(no body)"
-    opts = inner.get("options") or []
-    bullets = [f"  - {o.get('label')!r}: {o.get('description', '')}" for o in opts if isinstance(o, dict)]
-    chunk = f"[{q.get('id')}] {text}"
-    if bullets:
-        chunk += "\n" + "\n".join(bullets)
-    return chunk
+    qid = q.get("id")
+    inners = q.get("questions") or []
+    if not inners:
+        return f"[{qid}] (no questions)"
+    total = len(inners)
+    chunks: list[str] = []
+    for idx, inner in enumerate(inners, start=1):
+        text = (inner.get("question") or "").strip() or "(no body)"
+        header = (inner.get("header") or "").strip()
+        opts = inner.get("options") or []
+        bullets = [
+            f"  - {o.get('label')!r}: {o.get('description', '')}"
+            for o in opts if isinstance(o, dict)
+        ]
+        prefix = f"[{qid}]" if total == 1 else f"[{qid} #{idx}/{total}]"
+        head = f"{header}: " if header else ""
+        chunk = f"{prefix} {head}{text}"
+        if bullets:
+            chunk += "\n" + "\n".join(bullets)
+        chunks.append(chunk)
+    return "\n\n".join(chunks)
 
 
 def _format_permission_block(p: dict) -> str:
@@ -246,7 +259,7 @@ def _format_permission_block(p: dict) -> str:
     detail = f"type={ptype!r}"
     if patterns:
         detail += f" patterns={patterns}"
-    return f"[{pid}] {detail}\n  Reply: /oc answer {pid} <once|always|reject>"
+    return f"[{pid}] {detail}\n  Reply via the opencode CLI/web UI (`opencode permission reply {pid} <once|always|reject>` or the running TUI prompt)."
 
 
 async def _resume_from_awaiting_human(agent: "Agent", reason: str = "human reply received") -> "Agent":
@@ -1670,10 +1683,34 @@ async def _sse_consumer_loop(agent_id: str, stop_event: asyncio.Event) -> None:
                         continue
                     buffers = _sse_text_buffers.setdefault(agent_id, {})
                     apply_snapshot(buffers, part_id, text)
+            elif etype == "question.asked" or etype == "permission.asked":
+                if props.get("sessionID") != session_id:
+                    continue
+                await _sse_surface_pending(agent_id, session_id, worktree)
     except asyncio.CancelledError:
         raise
     except Exception as e:
         logger.debug("sse consumer %s ended: %s", agent_id, e)
+
+
+async def _sse_surface_pending(agent_id: str, session_id: str, worktree: Path) -> None:
+    if _runtime is None:
+        return
+    agent_now = _runtime.agents.get(agent_id)
+    if agent_now is None or agent_now.phase in TERMINAL_PHASES:
+        return
+    try:
+        questions = await _runtime.client.list_questions(worktree)
+        permissions = await _runtime.client.list_permissions(worktree)
+    except OpencodeError:
+        return
+    pending_q = [q for q in questions if q.get("sessionID") == session_id]
+    pending_p = [p for p in permissions if p.get("sessionID") == session_id]
+    _update_snapshots(agent_id, pending_q, pending_p)
+    if not pending_q and not pending_p:
+        return
+    last_text = await _fetch_last_assistant_text(agent_now)
+    await _maybe_notify_new_pending(agent_now, pending_q, pending_p, context_text=last_text)
 
 
 async def _tick(agent: Agent) -> None:
@@ -1999,6 +2036,8 @@ async def _phase_awaiting_human(agent: Agent) -> None:
     pending_p = [p for p in permissions if p.get("sessionID") == agent.session_id]
     _update_snapshots(agent.agent_id, pending_q, pending_p)
     if pending_q or pending_p:
+        last_text = await _fetch_last_assistant_text(agent)
+        await _maybe_notify_new_pending(agent, pending_q, pending_p, context_text=last_text)
         await asyncio.sleep(5.0)
         return
 
