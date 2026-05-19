@@ -5022,3 +5022,178 @@ class TestSseSurfacePending:
         asyncio.run(event_loop_mod._sse_surface_pending("bck/sse", "s-sse", tmp_path))
         assert called == []
         assert self._notified == []
+
+
+class TestRefreshStatusViaPoll:
+    def setup_method(self):
+        self._orig_runtime = event_loop_mod._runtime
+
+    def teardown_method(self):
+        event_loop_mod._runtime = self._orig_runtime
+        event_loop_mod._session_status_cache.clear("bck/refresh-status")
+
+    def test_session_absent_from_map_means_idle(self, tmp_path):
+        import asyncio
+        from pathlib import Path as _Path
+        class _Client:
+            async def list_session_status(self_inner, directory):
+                return {}
+        class _RT: ...
+        rt = _RT()
+        rt.client = _Client()
+        event_loop_mod._runtime = rt
+        event_loop_mod._session_status_cache.clear("bck/refresh-status")
+        is_idle = asyncio.run(event_loop_mod._refresh_status_via_poll(
+            "bck/refresh-status", "ses_x", _Path("/tmp"),
+        ))
+        assert is_idle is True
+        status, source, _ts = event_loop_mod._session_status_cache.get_full("bck/refresh-status")
+        assert status == {"type": "idle"}
+        assert source == "status-poll"
+
+    def test_session_busy_in_map_is_not_idle(self, tmp_path):
+        import asyncio
+        from pathlib import Path as _Path
+        class _Client:
+            async def list_session_status(self_inner, directory):
+                return {"ses_x": {"type": "busy"}}
+        class _RT: ...
+        rt = _RT()
+        rt.client = _Client()
+        event_loop_mod._runtime = rt
+        event_loop_mod._session_status_cache.clear("bck/refresh-status")
+        is_idle = asyncio.run(event_loop_mod._refresh_status_via_poll(
+            "bck/refresh-status", "ses_x", _Path("/tmp"),
+        ))
+        assert is_idle is False
+        status, source, _ts = event_loop_mod._session_status_cache.get_full("bck/refresh-status")
+        assert status == {"type": "busy"}
+        assert source == "status-poll"
+
+    def test_retry_status_is_not_idle(self, tmp_path):
+        import asyncio
+        from pathlib import Path as _Path
+        class _Client:
+            async def list_session_status(self_inner, directory):
+                return {"ses_x": {"type": "retry", "attempt": 2, "message": "rate limited", "next": 30}}
+        class _RT: ...
+        rt = _RT()
+        rt.client = _Client()
+        event_loop_mod._runtime = rt
+        event_loop_mod._session_status_cache.clear("bck/refresh-status")
+        is_idle = asyncio.run(event_loop_mod._refresh_status_via_poll(
+            "bck/refresh-status", "ses_x", _Path("/tmp"),
+        ))
+        assert is_idle is False
+        status, source, _ts = event_loop_mod._session_status_cache.get_full("bck/refresh-status")
+        assert status["type"] == "retry"
+        assert source == "status-poll"
+
+
+class TestEnterNoDiffIntervention:
+    def setup_method(self):
+        self._orig_runtime = event_loop_mod._runtime
+        self._notified: list[tuple[str, str]] = []
+        self._orig_notify = event_loop_mod._notify_event
+        event_loop_mod._notify_event = lambda agent, kind, body=None, **kw: self._notified.append((kind, body or ""))
+
+    def teardown_method(self):
+        event_loop_mod._runtime = self._orig_runtime
+        event_loop_mod._notify_event = self._orig_notify
+
+    def _build_rt(self, tmp_path, phase="EXECUTING"):
+        cfg = config_mod.Config(
+            projects_file=tmp_path / "projects.json",
+            agents_file=tmp_path / "agents.json",
+            worktrees_root=tmp_path / "wt",
+            logs_dir=tmp_path / "logs",
+            notifications_file=tmp_path / "notifications.jsonl",
+        )
+        cfg.ensure_dirs()
+        agents = state_mod.AgentStore(cfg.agents_file)
+        agents.add(state_mod.Agent(
+            agent_id="bck/no-diff", project_label="bck",
+            worktree_path=str(tmp_path), session_id="ses_nodiff",
+            branch="bck/no-diff", initial_prompt="explain the 408 bug",
+            phase=phase,
+        ))
+        tools_mod = sys.modules["_oco_test_pkg.tools"]
+        rt = tools_mod.Runtime(config=cfg, client=None, projects=None, agents=agents)
+        event_loop_mod._runtime = rt
+        return rt, agents.get("bck/no-diff")
+
+    def test_transitions_executing_agent_to_needs_intervention(self, tmp_path):
+        rt, agent = self._build_rt(tmp_path)
+        event_loop_mod._enter_no_diff_intervention(
+            agent, "Here is the RCA report. The 408 comes from tower-http.", source="idle-debounce",
+        )
+        after = rt.agents.get("bck/no-diff")
+        assert after.phase == "NEEDS_INTERVENTION"
+        assert after.phase_before_intervention == "EXECUTING"
+        assert after.intervention_reason == "executor_idle_no_diff"
+        assert after.intervention_since is not None
+        assert after.last_error and "no committable changes" in after.last_error
+
+    def test_notification_fires_with_intervention_kind(self, tmp_path):
+        rt, agent = self._build_rt(tmp_path)
+        event_loop_mod._enter_no_diff_intervention(
+            agent, "Investigation done.", source="idle-debounce",
+        )
+        kinds = [k for k, _ in self._notified]
+        assert kinds == ["needs_intervention"]
+
+    def test_body_includes_actionable_followup_instructions(self, tmp_path):
+        rt, agent = self._build_rt(tmp_path)
+        event_loop_mod._enter_no_diff_intervention(
+            agent, "Last said something.", source="idle-debounce",
+        )
+        body = self._notified[0][1]
+        assert "@bck/no-diff" in body
+        assert "oc_cancel bck/no-diff" in body
+        assert "oc_retry bck/no-diff" in body
+        assert "no committable changes" in body
+
+    def test_body_source_marker_differs_by_trigger(self, tmp_path):
+        rt, agent = self._build_rt(tmp_path)
+        event_loop_mod._enter_no_diff_intervention(
+            agent, "x", source="READY_FOR_REVIEW",
+        )
+        rfr_body = self._notified[0][1]
+        self._notified.clear()
+        rt.agents.update("bck/no-diff", phase="EXECUTING", intervention_reason=None, intervention_since=None, phase_before_intervention=None)
+        agent2 = rt.agents.get("bck/no-diff")
+        event_loop_mod._enter_no_diff_intervention(
+            agent2, "y", source="idle-debounce",
+        )
+        debounce_body = self._notified[0][1]
+        assert "READY_FOR_REVIEW" in rfr_body
+        assert "120s idle debounce" in debounce_body
+        assert "READY_FOR_REVIEW" not in debounce_body
+
+    def test_body_includes_last_text_tail(self, tmp_path):
+        rt, agent = self._build_rt(tmp_path)
+        long_text = "head " + "x" * 2000 + " TAIL_MARKER_AT_END"
+        event_loop_mod._enter_no_diff_intervention(agent, long_text, source="idle-debounce")
+        body = self._notified[0][1]
+        assert "TAIL_MARKER_AT_END" in body
+        assert "head " not in body
+
+    def test_empty_last_text_skips_tail_section(self, tmp_path):
+        rt, agent = self._build_rt(tmp_path)
+        event_loop_mod._enter_no_diff_intervention(agent, "", source="idle-debounce")
+        body = self._notified[0][1]
+        assert "Last assistant text" not in body
+
+    def test_idempotent_on_already_intervened_agent(self, tmp_path):
+        rt, agent = self._build_rt(tmp_path, phase="NEEDS_INTERVENTION")
+        event_loop_mod._enter_no_diff_intervention(agent, "x", source="idle-debounce")
+        assert self._notified == []
+        after = rt.agents.get("bck/no-diff")
+        assert after.intervention_reason is None
+
+    def test_skips_terminal_agent(self, tmp_path):
+        rt, agent = self._build_rt(tmp_path, phase="DONE")
+        event_loop_mod._enter_no_diff_intervention(agent, "x", source="idle-debounce")
+        assert self._notified == []
+        after = rt.agents.get("bck/no-diff")
+        assert after.phase == "DONE"

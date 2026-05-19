@@ -1492,6 +1492,29 @@ def _enter_needs_intervention(agent: Agent, reason: str, body: str) -> None:
     _notify_event(updated, "needs_intervention", body)
 
 
+def _enter_no_diff_intervention(agent: Agent, last_text: str, *, source: str) -> None:
+    tail = (last_text or "").strip()[-600:]
+    trigger = (
+        "Triggered by READY_FOR_REVIEW sentinel with empty worktree."
+        if source == "READY_FOR_REVIEW"
+        else "Triggered by 120s idle debounce with empty worktree."
+    )
+    body = (
+        f"Executor session is idle with no committable changes.\n"
+        f"Looks like an investigation-only task (e.g. RCA, benchmark, explain, research).\n"
+        f"\n"
+        f"{trigger}\n"
+        f"\n"
+        f"Resolve via one of:\n"
+        f"  @{agent.agent_id} <follow-up>  - send a new instruction; executor resumes\n"
+        f"  oc_cancel {agent.agent_id}     - finish without opening a PR\n"
+        f"  oc_retry {agent.agent_id}      - re-tick (only useful with new context)\n"
+    )
+    if tail:
+        body += f"\nLast assistant text (tail):\n{tail}"
+    _enter_needs_intervention(agent, reason="executor_idle_no_diff", body=body)
+
+
 async def _phase_needs_intervention(agent: Agent) -> None:
     await asyncio.sleep(30.0)
 
@@ -2103,8 +2126,8 @@ async def _phase_executing(agent: Agent) -> None:
     worktree = Path(agent.worktree_path)
     became_idle = False
     try:
-        became_idle = await _wait_idle_through_cache(
-            agent.agent_id, agent.session_id, worktree, timeout=60.0,
+        became_idle = await _refresh_status_via_poll(
+            agent.agent_id, agent.session_id, worktree,
         )
     except OpencodeError:
         await asyncio.sleep(5.0)
@@ -2135,10 +2158,9 @@ async def _phase_executing(agent: Agent) -> None:
     last_text = await _fetch_last_assistant_text(agent)
     if last_text and reviewer_mod.parse_ready_for_review(last_text):
         if not _has_diff(worktree):
-            logger.warning(
-                "agent %s: READY_FOR_REVIEW emitted but worktree has no diff; ignoring",
-                agent.agent_id,
-            )
+            if await _awaiting_input_blocks_review(agent):
+                return
+            _enter_no_diff_intervention(agent, last_text, source="READY_FOR_REVIEW")
             return
         if await _awaiting_input_blocks_review(agent):
             return
@@ -2151,13 +2173,10 @@ async def _phase_executing(agent: Agent) -> None:
         return
     if not _idle_debounce_elapsed(agent):
         return
-    confirm = await _wait_idle_through_cache(
-        agent.agent_id, agent.session_id, worktree, timeout=2.0,
-    )
-    if not confirm:
-        _reset_idle_since(agent)
-        return
     if not _has_diff(worktree):
+        if await _awaiting_input_blocks_review(agent):
+            return
+        _enter_no_diff_intervention(agent, last_text, source="idle-debounce")
         return
     if await _awaiting_input_blocks_review(agent):
         return
@@ -2266,9 +2285,13 @@ async def _handle_review_text(agent: Agent, reviewer_text: str) -> None:
 async def _phase_executor_addressing(agent: Agent) -> None:
     assert _runtime is not None
     worktree = Path(agent.worktree_path)
-    became_idle = await _wait_idle_through_cache(
-        agent.agent_id, agent.session_id, worktree, timeout=60.0,
-    )
+    try:
+        became_idle = await _refresh_status_via_poll(
+            agent.agent_id, agent.session_id, worktree,
+        )
+    except OpencodeError:
+        await asyncio.sleep(5.0)
+        return
     if not became_idle:
         _reset_idle_since(agent)
         return
@@ -2440,6 +2463,14 @@ async def _wait_idle_through_cache(
     if became_idle:
         _session_status_cache.update(agent_id, {"type": "idle"}, source="poll")
     return became_idle
+
+
+async def _refresh_status_via_poll(agent_id: str, session_id: str, worktree: Path) -> bool:
+    assert _runtime is not None
+    status_map = await _runtime.client.list_session_status(worktree)
+    status = status_map.get(session_id) or {"type": "idle"}
+    _session_status_cache.update(agent_id, status, source="status-poll")
+    return status.get("type") == "idle"
 
 
 async def _session_status_is_idle(agent: "Agent") -> bool:

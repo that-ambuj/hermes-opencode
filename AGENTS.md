@@ -267,7 +267,7 @@ Critical idle-detection rule in `_phase_executing`:
 - the awaiting-input cascade does not block (see "Awaiting-input
   gate" below)
 
-All conditions must hold to transition out of `EXECUTING`. The
+All conditions must hold to transition to `IDLE_TASK_COMPLETE`. The
 120-second debounce exists because opencode may briefly report idle
 between tool calls, and the previous 30-second window produced
 premature reviews. The debounce is a wall-clock timestamp check on
@@ -275,6 +275,71 @@ premature reviews. The debounce is a wall-clock timestamp check on
 continues to run so rate-limit, abort, and question/permission
 arrivals are observed promptly. The READY_FOR_REVIEW sentinel
 bypasses the 120 s debounce entirely when present.
+
+### No-diff completion (LOAD-BEARING, v0.21.1+)
+
+If all the above hold EXCEPT the worktree has no uncommitted or
+unpushed changes (`_has_diff(worktree) == False`), the executor's
+session is genuinely idle but there is no committable work. This is
+the canonical "investigation-only task" shape: prompts like "RCA the
+408 bug", "benchmark this branch", "explain how X works" — the
+executor reads code, forms an opinion, writes a report as its final
+assistant message, and stops cleanly. Prior to v0.21.1 the no-diff
+branch in `_phase_executing` returned silently every tick and the
+agent stayed stuck in `EXECUTING` forever with no user-visible signal.
+
+v0.21.1 routes this case to `NEEDS_INTERVENTION` via
+`_enter_no_diff_intervention(agent, last_text, source=...)` which
+calls the existing `_enter_needs_intervention(agent, reason, body)`
+with `reason="executor_idle_no_diff"`. The notification body shows
+the last assistant text tail and lists the three operator actions
+that resolve it: `@<id> <follow-up>`, `oc_cancel <id>`, `oc_retry
+<id>`. The awaiting-input cascade is checked first so prose-question
+false-positives surface as `AWAITING_HUMAN` rather than getting
+swallowed by the intervention path.
+
+Both no-diff branches route here:
+- `READY_FOR_REVIEW` sentinel emitted with empty worktree
+  (`source="READY_FOR_REVIEW"`)
+- 120 s idle debounce elapsed with empty worktree
+  (`source="idle-debounce"`)
+
+When extending the state machine: if you add a new phase whose
+"done" condition includes "executor finished with no diff", route
+it through `_enter_no_diff_intervention(...)` or
+`_enter_needs_intervention(...)`. NEVER `return` silently from a
+no-diff branch — that's the original v0.20.x bug.
+
+### Polling backstop via `/session/status` (LOAD-BEARING, v0.21.1+)
+
+`_refresh_status_via_poll(agent_id, session_id, worktree)` calls
+`OpencodeClient.list_session_status(worktree)` and writes the result
+through to `SessionStatusCache` with `source="status-poll"`.
+Per opencode's [SessionStatus implementation](https://github.com/sst/opencode/blob/dev/packages/opencode/src/session/status.ts),
+the in-memory status map DELETES the entry on idle transition (only
+busy / retry stay), so an empty response means "all sessions idle"
+authoritatively. The reader rule:
+
+- `session_id IN status_map` → session is busy / retrying
+  (status_map value carries the type)
+- `session_id NOT IN status_map` → session is idle
+
+`_phase_executing` and `_phase_executor_addressing` call
+`_refresh_status_via_poll` at the top of every tick. This replaces
+the previous reliance on `_wait_idle_through_cache` (which calls
+`POST /api/session/:id/wait` — a server-side no-op
+[`function*() {}`](https://github.com/sst/opencode/blob/dev/packages/opencode/src/v2/session.ts)
+that returns 204 in 5ms regardless of actual status). The poll is
+the authoritative third writer to `SessionStatusCache`, sitting
+alongside the SSE consumer (`source="sse"`) and the legacy
+`_wait_idle_through_cache` (`source="poll"`, still triggered for
+back-compat from a few callers).
+
+The cache becomes truly accurate post-v0.21.1: SSE for sub-second
+transitions while connected, status-poll for the authoritative truth
+on every tick. The v0.20.2 BCK/p-list-tests scenario (cache stuck at
+busy across a serve flap) is now self-healing on the very next tick
+of any phase handler that calls `_refresh_status_via_poll`.
 
 ## Executor-driven PR open (LOAD-BEARING)
 

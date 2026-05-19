@@ -5,6 +5,94 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.21.1] - 2026-05-19
+
+Fix the EXECUTING-no-diff deadlock that left investigation-only agents
+(RCA, benchmark, "explain X") stuck in `EXECUTING` forever with zero
+user-visible signal. Adds an authoritative polling backstop on
+`/session/status` so the cache stays accurate even when the SSE
+consumer disconnects or the v2.wait endpoint no-ops.
+
+### Bug
+
+`_phase_executing` had two no-diff `return` statements (one after the
+`READY_FOR_REVIEW` sentinel branch, one after the 120 s idle-debounce
+branch). When the executor finished a task that produced no
+committable changes — a pure RCA report, a benchmark write-up, a
+"yes, the code is correct as-is" answer — the worktree stayed empty,
+both branches silently returned, and the agent ticked forever in
+`EXECUTING`. The state machine had no exit for "task done, nothing
+to commit", because every other recognized terminal condition (Q/P,
+abort, READY_FOR_REVIEW + diff, debounce + diff) required either a
+question or a diff. The `STUCK_WATCHED_PHASES` watchdog explicitly
+excludes `EXECUTING` (it's classified as "long-running by design"),
+so no `phase_stuck` notification ever fired.
+
+Live evidence: `BCK/customer-oauth` stuck for 3+ hours after a clean
+RCA report; `BCK/analytics-perf` cancelled manually 6 hours earlier
+with `cancellation_reason = "Exploration only — benchmark report
+complete, no PR needed"` (the user's own diagnosis of the same bug).
+
+### Fix
+
+`event_loop._enter_no_diff_intervention(agent, last_text, source=...)`
+transitions the agent to `NEEDS_INTERVENTION` via the existing
+`_enter_needs_intervention(...)` helper with
+`reason="executor_idle_no_diff"`. The notification body shows the
+last assistant text tail and lists the three operator actions that
+resolve it:
+
+```
+  @<agent_id> <follow-up>  - send a new instruction; executor resumes
+  oc_cancel <agent_id>     - finish without opening a PR
+  oc_retry <agent_id>      - re-tick (only useful with new context)
+```
+
+Both no-diff branches in `_phase_executing` route through the helper.
+The awaiting-input cascade is checked first so a prose-question
+false-positive surfaces as `AWAITING_HUMAN` (the established path)
+rather than getting eaten by the intervention path.
+
+### Polling backstop: `_refresh_status_via_poll`
+
+New helper that calls `OpencodeClient.list_session_status(worktree)`
+(the v0.21.0 SDK addition) and writes the result through to
+`SessionStatusCache` with `source="status-poll"`. Per opencode's
+own SessionStatus implementation, the in-memory map DELETES idle
+entries, so `session_id NOT IN status_map` is the canonical
+"this session is idle" indicator.
+
+`_phase_executing` and `_phase_executor_addressing` now call
+`_refresh_status_via_poll` at the top of every tick. Replaces the
+implicit reliance on `_wait_idle_through_cache` (which calls the
+v2.wait endpoint — a server-side `function*() {}` no-op that returns
+204 in 5ms regardless of actual status). The cache is now truly
+authoritative: SSE for sub-second transitions while connected,
+status-poll for the source of truth on every tick. The
+BCK/p-list-tests "cache stuck at busy across a serve flap" scenario
+that motivated v0.20.2 is now self-healing on the very next phase
+tick.
+
+### Tests
+
+498 passing (was 487; +11 new):
+
+- `TestRefreshStatusViaPoll` (3): session-absent-means-idle, busy
+  session writes busy to cache, retry status writes retry to cache.
+- `TestEnterNoDiffIntervention` (8): transitions to
+  NEEDS_INTERVENTION, fires the right notification kind, body
+  includes follow-up instructions, body source marker differs by
+  trigger, body includes last text tail, empty last text skips
+  tail section, idempotent on already-intervened agent, skips
+  terminal agent.
+
+### Documentation
+
+- `AGENTS.md` — two new subsections under "State machine":
+  "No-diff completion (LOAD-BEARING, v0.21.1+)" pins the
+  intervention contract; "Polling backstop via `/session/status`
+  (LOAD-BEARING, v0.21.1+)" pins the cache-writer rule.
+
 ## [0.21.0] - 2026-05-19
 
 Replace the hand-written `httpx` transport with the typed
